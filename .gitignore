@@ -1,0 +1,24 @@
+# Build & install
+build/
+dist/
+*.egg-info/
+.eggs/
+*.so
+*.pyd
+
+# Tooling / env
+.pixi/
+pixi.lock
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp

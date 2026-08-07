@@ -1,0 +1,35 @@
+# Package metadata + build frontend for pip/setuptools.
+# CUDA extensions: setup.py (torch.utils.cpp_extension).
+# Local env pins (exact CUDA torch): pixi.toml
+
+[build-system]
+requires = ["setuptools>=68", "wheel", "torch"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nami"
+version = "0.1.0"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+    "torch>=2.1",
+    "numpy>=1.24",
+]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+extend-exclude = [".pixi"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "N", "C4"]
