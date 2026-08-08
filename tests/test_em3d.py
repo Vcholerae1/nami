@@ -4,49 +4,11 @@ Self-contained tests (same approach as test_em2d_tm.py): correctness is
 verified via numerical gradients (``torch.autograd.gradcheck``), a
 finite-difference gradient-consistency check, and a loss-descent FWI smoke
 test.
-
-nami imports are deferred to inside the test functions so that merely
-importing this module never triggers compilation of the nami_em3d CUDA
-extension.
 """
-
 
 import torch
 
-
-def _ensure_extension_importable():
-    """Make ``nami_em3d`` importable when the build recipe only compiles it
-    into /tmp (``torch.utils.cpp_extension.load`` returns the module without
-    registering it on ``sys.path``).  No-op when the extension is already
-    installed/importable; does not compile anything itself.
-    """
-    import os
-    import sys
-
-    try:
-        import nami_em3d  # noqa: F401
-        return
-    except ModuleNotFoundError:
-        pass
-    candidates = ["/tmp/nami_agent_em3d"]
-    build = os.path.join(os.path.dirname(__file__), "..", "build")
-    if os.path.isdir(build):
-        candidates += [
-            os.path.join(build, d)
-            for d in sorted(os.listdir(build))
-            if d.startswith("lib.")
-        ]
-    for d in candidates:
-        if not os.path.isdir(d):
-            continue
-        for f in os.listdir(d):
-            if f.startswith("nami_em3d") and f.endswith((".so", ".pyd")):
-                if d not in sys.path:
-                    sys.path.insert(0, d)
-                return
-
-
-_ensure_extension_importable()
+from nami.em.em3d import em3d
 
 
 def build_case(
@@ -107,9 +69,7 @@ def build_case(
 
 
 def _run_nami(c, eps, sig, mu, amp, accuracy=2, **kwargs):
-    """Runs nami's em3d (import deferred: never compiled at import time)."""
-    from nami.em.em3d import em3d
-
+    """Runs nami's em3d."""
     dev = c["device"]
     return em3d(
         eps,
@@ -408,8 +368,6 @@ def test_components():
 
 
 def test_invalid_component():
-    from nami.em.em3d import em3d
-
     c = build_case(dtype=torch.float64, device="cuda:0", seed=1)
     dev = c["device"]
     try:
@@ -429,8 +387,6 @@ def test_invalid_component():
 
 def _run_nami_storage(c, eps, sig, mu, amp, storage="auto",
                       ckpt_steps=0):
-    from nami.em.em3d import em3d
-
     dev = c["device"]
     return em3d(
         eps,
@@ -473,9 +429,7 @@ def test_checkpoint_forward_and_gradient_parity():
         rel = (g - g_full).abs().max().item() / (
             g_full.abs().max().item() + 1e-300
         )
-        # em3d CUDA backward reduces in nondeterministic order, so even
-        # checkpoint_every=0 vs 0 differs by ~1 ULP of the largest term.
-        # 1e-12 keeps parity semantics while absorbing that noise.
+        # em3d CUDA reductions can differ by ~1 ULP of the largest term
         assert rel < 1e-12, f"ckpt_steps={ckpt} grad rel err {rel}"
 
 
@@ -510,8 +464,6 @@ def test_stride_parity():
     mu = c["mu"].to(dev, dtype)
     amp = c["amp"].to(dev, dtype)
 
-    from nami.em.em3d import em3d
-
     def nami_grad(i):
         e = eps.clone().requires_grad_(True)
         out = em3d(
@@ -533,3 +485,120 @@ def test_stride_parity():
 
 def _max_abs_diff(a, b):
     return (a - b).abs().max().item()
+
+
+def _multi_shot_survey(nz, ny, nx, nt, dtype):
+    """Two shots with nearby sources/receivers (short EM travel)."""
+    srcs = torch.tensor(
+        [
+            [[nz // 2, ny // 2, nx // 2]],
+            [[nz // 2, ny // 2 + 1, nx // 2 + 1]],
+        ]
+    )
+    recs = torch.tensor(
+        [
+            [
+                [nz // 2, ny // 2, nx // 2],
+                [nz // 2, ny // 2, nx // 2 + 1],
+                [nz // 2, ny // 2 + 1, nx // 2],
+            ],
+            [
+                [nz // 2, ny // 2 + 1, nx // 2 + 1],
+                [nz // 2, ny // 2 + 1, nx // 2],
+                [nz // 2, ny // 2, nx // 2 + 1],
+            ],
+        ]
+    )
+    amp = torch.zeros(2, 1, nt, dtype=dtype)
+    amp[0, 0, :3] = torch.tensor([1.0, -0.5, 0.2], dtype=dtype)
+    amp[1, 0, :3] = torch.tensor([0.7, 0.3, -0.1], dtype=dtype)
+    return srcs, recs, amp
+
+
+def test_multi_shot_shared_model():
+    """n_shots=2 shared models: forward matches singles; grad is sum."""
+    dtype = torch.float64
+    c = build_case(dtype=dtype, nz=10, ny=12, nx=12, nt=10, pml=3,
+                   device="cuda:0", seed=1)
+    dev = c["device"]
+    nz, ny, nx = c["eps"].shape
+    nt = c["nt"]
+    srcs, recs, amp = _multi_shot_survey(nz, ny, nx, nt, dtype)
+
+    def run(eps, sig, mu, shot=None):
+        sl = slice(None) if shot is None else slice(shot, shot + 1)
+        return em3d(
+            eps, sig, mu, c["dx"], c["dt"],
+            source_amplitudes=amp[sl].to(dev),
+            source_locations=srcs[sl].to(dev),
+            receiver_locations=recs[sl].to(dev),
+            accuracy=2, pml_width=c["pml"], nt=nt,
+        )
+
+    params = {k: c[k].to(dev, dtype) for k in ("eps", "sig", "mu")}
+    p = {k: v.clone().requires_grad_(True) for k, v in params.items()}
+    p0 = {k: v.clone().requires_grad_(True) for k, v in params.items()}
+    p1 = {k: v.clone().requires_grad_(True) for k, v in params.items()}
+    r = run(p["eps"], p["sig"], p["mu"])
+    r0 = run(p0["eps"], p0["sig"], p0["mu"], 0)
+    r1 = run(p1["eps"], p1["sig"], p1["mu"], 1)
+    assert r.shape == (nt, 2, 3)
+    assert (r[:, 0].detach() - r0[:, 0].detach()).abs().max().item() == 0.0
+    assert (r[:, 1].detach() - r1[:, 0].detach()).abs().max().item() == 0.0
+    names = ("eps", "sig", "mu")
+    gs = torch.autograd.grad(r.square().sum(), [p[k] for k in names])
+    g0s = torch.autograd.grad(r0.square().sum(), [p0[k] for k in names])
+    g1s = torch.autograd.grad(r1.square().sum(), [p1[k] for k in names])
+    for g, g0, g1, name in zip(gs, g0s, g1s, names, strict=True):
+        rel = (g - (g0 + g1)).abs().max().item() / (
+            (g0 + g1).abs().max().item() + 1e-300
+        )
+        assert rel < 1e-10, f"shared-model grad_{name} rel err {rel}"
+
+
+def test_multi_shot_batched_model():
+    """n_shots=2 batched models: shot i uses slice i."""
+    dtype = torch.float64
+    c0 = build_case(dtype=dtype, nz=10, ny=12, nx=12, nt=10, pml=3,
+                    device="cuda:0", seed=1)
+    c1 = build_case(dtype=dtype, nz=10, ny=12, nx=12, nt=10, pml=3,
+                    device="cuda:0", seed=2)
+    dev = c0["device"]
+    nz, ny, nx = c0["eps"].shape
+    nt = c0["nt"]
+    srcs, recs, amp = _multi_shot_survey(nz, ny, nx, nt, dtype)
+
+    def run(eps, sig, mu, shot=None):
+        sl = slice(None) if shot is None else slice(shot, shot + 1)
+        return em3d(
+            eps, sig, mu, c0["dx"], c0["dt"],
+            source_amplitudes=amp[sl].to(dev),
+            source_locations=srcs[sl].to(dev),
+            receiver_locations=recs[sl].to(dev),
+            accuracy=2, pml_width=c0["pml"], nt=nt,
+        )
+
+    eps_b = torch.stack([c0["eps"], c1["eps"]]).to(dev, dtype).requires_grad_(True)
+    sig_b = torch.stack([c0["sig"], c1["sig"]]).to(dev, dtype).requires_grad_(True)
+    mu_b = torch.stack([c0["mu"], c1["mu"]]).to(dev, dtype).requires_grad_(True)
+    eps0 = c0["eps"].to(dev, dtype).requires_grad_(True)
+    sig0 = c0["sig"].to(dev, dtype).requires_grad_(True)
+    mu0 = c0["mu"].to(dev, dtype).requires_grad_(True)
+    eps1 = c1["eps"].to(dev, dtype).requires_grad_(True)
+    sig1 = c1["sig"].to(dev, dtype).requires_grad_(True)
+    mu1 = c1["mu"].to(dev, dtype).requires_grad_(True)
+    r = run(eps_b, sig_b, mu_b)
+    r0 = run(eps0, sig0, mu0, 0)
+    r1 = run(eps1, sig1, mu1, 1)
+    assert r.shape == (nt, 2, 3)
+    assert (r[:, 0].detach() - r0[:, 0].detach()).abs().max().item() == 0.0
+    assert (r[:, 1].detach() - r1[:, 0].detach()).abs().max().item() == 0.0
+    gs = torch.autograd.grad(r.square().sum(), [eps_b, sig_b, mu_b])
+    g0s = torch.autograd.grad(r0.square().sum(), [eps0, sig0, mu0])
+    g1s = torch.autograd.grad(r1.square().sum(), [eps1, sig1, mu1])
+    for gb, g0, g1, name in zip(gs, g0s, g1s, ("eps", "sig", "mu"), strict=True):
+        rel0 = (gb[0] - g0).abs().max().item() / (g0.abs().max().item() + 1e-300)
+        rel1 = (gb[1] - g1).abs().max().item() / (g1.abs().max().item() + 1e-300)
+        assert rel0 < 1e-10 and rel1 < 1e-10, (
+            f"batched-model grad_{name} rel err ({rel0}, {rel1})"
+        )

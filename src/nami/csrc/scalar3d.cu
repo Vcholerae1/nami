@@ -555,7 +555,8 @@ void forward_step(
     int64_t pml_x0, int64_t pml_x1,
     int64_t v_batched, int64_t store, int64_t snap_off, int64_t fd_pad)
 {
-    const int n_shots = v.size(0), nz = v.size(1), ny = v.size(2), nx = v.size(3);
+    // n_shots from the wavefield (survey), not v: shared model is [1, nz, ny, nx].
+    const int n_shots = u_cur.size(0), nz = u_cur.size(1), ny = u_cur.size(2), nx = u_cur.size(3);
     CHECK_CONTIG(c1);
     CHECK_CONTIG(c2);
     if (v.scalar_type() == torch::kFloat32) {
@@ -635,7 +636,9 @@ void adjoint_step(
     int64_t pml_x0_b, int64_t pml_x1_b,
     int64_t v_batched, int64_t snap_off, int64_t fd_pad)
 {
-    const int n_shots = v.size(0), nz = v.size(1), ny = v.size(2), nx = v.size(3);
+    // n_shots from the adjoint wavefield (survey), not v (see forward_step).
+    const int n_shots = lam_next.size(0), nz = lam_next.size(1), ny = lam_next.size(2),
+              nx = lam_next.size(3);
     CHECK_CONTIG(c1);
     CHECK_CONTIG(c2);
     if (v.scalar_type() == torch::kFloat32) {

@@ -21,8 +21,9 @@ wavefield recorded at ``bg_receiver_locations``.
 import nami_born as _ext
 import torch
 
+from ..common.cfl import check_cfl
 from ..common.fd import diff1_coeffs, diff2_coeffs
-from ..common.pml import set_acoustic_pml_profiles
+from ..common.pml import set_acoustic_pml_profiles, set_pml_width
 from ..common.storage import (
     SnapshotStorage,
     check_sample_steps,
@@ -30,7 +31,6 @@ from ..common.storage import (
     storage_plan,
 )
 from ..common.survey import extract_survey_2d
-from .scalar2d import _set_pml_width
 
 # Checkpoint state layout for the Born wavefield (saved at t before step t):
 #   [0]  u[t % 3]         background field at time t
@@ -50,34 +50,6 @@ N_STREAMS = 2
 
 
 
-def _replicate_pad_2d(model, top, bottom, left, right, device, dtype):
-    """Replicate-pad ``[ny, nx]``/``[n, ny, nx]`` with a deterministic backward.
-
-    Produces exactly the values of ``F.pad(mode="replicate")`` (edge copies)
-    but builds the gradient from ``cat``/``expand`` (deterministic reductions)
-    instead of torch's atomicAdd-based ``replication_pad2d_backward`` CUDA
-    kernel, so gradients through the model padding are reproducible.
-    """
-    m = model.to(device=device, dtype=dtype)
-    if m.ndim == 2:
-        m = m[None]
-    if top or bottom:
-        m = torch.cat(
-            [m[:, :1].expand(-1, top, -1), m, m[:, -1:].expand(-1, bottom, -1)],
-            dim=1,
-        )
-    if left or right:
-        m = torch.cat(
-            [
-                m[:, :, :1].expand(-1, -1, left),
-                m,
-                m[:, :, -1:].expand(-1, -1, right),
-            ],
-            dim=2,
-        )
-    return m
-
-
 class Scalar2DBornFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -92,7 +64,9 @@ class Scalar2DBornFunc(torch.autograd.Function):
         profs,           # [ay, by, dbydy, ax, bx, dbxdx]
         c1, c2,          # FD coefficient arrays (regular grid)
         rdy, rdx, rdy2, rdx2, dt2,
-        nt, pml_y0, pml_y1, pml_x0, pml_x1,
+        nt,
+        pml_y0, pml_y1, pml_x0, pml_x1,          # forward PML
+        pml_y0_b, pml_y1_b, pml_x0_b, pml_x1_b,  # backward PML
         v_batched, scatter_batched, grad_stride, fd_pad,
         storage,         # SnapshotStorage (bg Laplacian) or None (forward-only)
         storage_sc,      # SnapshotStorage (scattered Laplacian) or None
@@ -105,7 +79,9 @@ class Scalar2DBornFunc(torch.autograd.Function):
         if device.type == "cuda":
             torch.cuda.set_device(device)
         dtype = v_p.dtype
-        n_shots, ny, nx = v_p.shape
+        # n_shots from survey, not model batch (shared [1, ny, nx] ok).
+        n_shots = int(src_i.shape[0])
+        ny, nx = v_p.shape[-2:]
         n_src = src_i.shape[1]
         n_rec = rec_i.shape[1]
         n_bg_rec = bg_rec_i.shape[1]
@@ -148,6 +124,10 @@ class Scalar2DBornFunc(torch.autograd.Function):
                 ckpt_state[k, 10].copy_(zeta_y_sc[t % 2])
                 ckpt_state[k, 11].copy_(zeta_x_sc[t % 2])
             store = 0 if segments else 1 if storage is not None else 0
+            snap_off = (
+                storage.snap_offset(t // grad_stride)
+                if store and storage is not None else 0
+            )
             ext.forward_step(
                 v_p, scatter_p,
                 u[t % 3], u[(t - 1) % 3], u_sc[t % 3], u_sc[(t - 1) % 3],
@@ -163,7 +143,7 @@ class Scalar2DBornFunc(torch.autograd.Function):
                 rdy, rdx, rdy2, rdx2, t, grad_stride, dt2,
                 n_shots, ny, nx,
                 pml_y0, pml_y1, pml_x0, pml_x1,
-                v_batched, scatter_batched, store, fd_pad,
+                v_batched, scatter_batched, store, snap_off, fd_pad,
             )
             if n_src > 0:
                 ext.inject(
@@ -181,11 +161,15 @@ class Scalar2DBornFunc(torch.autograd.Function):
             v_p, scatter_p, f_bg, f_sc, src_i, rec_i, bg_rec_i,
             w_store, wsc_store, c1, c2,
         )
+        ctx.n_shots = n_shots
         ctx.ny_nx = ny_nx
         ctx.rdy, ctx.rdx, ctx.rdy2, ctx.rdx2, ctx.dt2 = rdy, rdx, rdy2, rdx2, dt2
         ctx.nt = nt
         ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1 = (
             pml_y0, pml_y1, pml_x0, pml_x1,
+        )
+        ctx.pml_y0_b, ctx.pml_y1_b, ctx.pml_x0_b, ctx.pml_x1_b = (
+            pml_y0_b, pml_y1_b, pml_x0_b, pml_x1_b,
         )
         ctx.v_batched = v_batched
         ctx.scatter_batched = scatter_batched
@@ -207,14 +191,10 @@ class Scalar2DBornFunc(torch.autograd.Function):
                         rdy, rdx, rdy2, rdx2, grad_stride, dt2, pml_y0,
                         pml_y1, pml_x0, pml_x1, v_batched, scatter_batched,
                         ny, nx, fd_pad, ny_nx, s0, s1):
-        """Re-run forward steps [s0, s1), writing the w snapshots.
-
-        The 2D Born kernels index the snapshot buffer by ``t / grad_stride``
-        directly, so the replay passes the segment-local step number and the
-        snapshots land at local offsets inside the segment-sized store.
-        """
+        """Re-run forward steps [s0, s1), writing segment-local snapshots."""
+        shot_count = n_shots * ny * nx
         for t in range(s0, s1):
-            t_local = t - s0
+            snap_off = ((t - s0) // grad_stride) * shot_count
             ext.forward_step(
                 v_p, scatter_p,
                 u[t % 3], u[(t - 1) % 3], u_sc[t % 3], u_sc[(t - 1) % 3],
@@ -227,10 +207,10 @@ class Scalar2DBornFunc(torch.autograd.Function):
                 zeta_y_sc[(t + 1) % 2], zeta_x_sc[(t + 1) % 2],
                 ay, by, dbydy, ax, bx, dbxdx, w_store, wsc_store,
                 c1, c2,
-                rdy, rdx, rdy2, rdx2, t_local, grad_stride, dt2,
+                rdy, rdx, rdy2, rdx2, t, grad_stride, dt2,
                 n_shots, ny, nx,
                 pml_y0, pml_y1, pml_x0, pml_x1,
-                v_batched, scatter_batched, 1, fd_pad,
+                v_batched, scatter_batched, 1, snap_off, fd_pad,
             )
             if n_src > 0:
                 ext.inject(
@@ -251,11 +231,13 @@ class Scalar2DBornFunc(torch.autograd.Function):
                 "forward with an input requiring grad (and not under "
                 "torch.no_grad())."
             )
+        storage = ctx.storage
         device = v_p.device
         if device.type == "cuda":
             torch.cuda.set_device(device)
         dtype = v_p.dtype
-        n_shots, ny, nx = v_p.shape
+        n_shots = ctx.n_shots
+        ny, nx = v_p.shape[-2:]
         n_src, n_rec, n_bg_rec = src_i.shape[1], rec_i.shape[1], bg_rec_i.shape[1]
         nt = ctx.nt
         grad_stride = ctx.grad_stride
@@ -267,6 +249,7 @@ class Scalar2DBornFunc(torch.autograd.Function):
             grad_r_bg = torch.zeros(nt, n_shots, n_bg_rec, device=device, dtype=dtype)
         grad_f_bg = torch.zeros(nt, n_shots, n_src, device=device, dtype=dtype)
         grad_f_sc = torch.zeros(nt, n_shots, n_src, device=device, dtype=dtype)
+        # Per-shot grads; summed below when models are shared (not batched).
         grad_v = torch.zeros(n_shots, ny, nx, device=device, dtype=dtype)
         grad_scatter = torch.zeros(n_shots, ny, nx, device=device, dtype=dtype)
 
@@ -285,7 +268,9 @@ class Scalar2DBornFunc(torch.autograd.Function):
         zeta_x_sc = [torch.zeros_like(lam_bg[0]) for _ in range(2)]
 
         ay, by, dbydy, ax, bx, dbxdx = [p.contiguous() for p in ctx.profs]
-        scale = 1.0
+        # integral sampling: each snapshot represents
+        # `grad_stride` time steps of the model-gradient integral.
+        scale = float(grad_stride)
         segments = ctx.segments
         if segments:
             # Checkpointed backward: per segment, restore the wavefield
@@ -350,7 +335,7 @@ class Scalar2DBornFunc(torch.autograd.Function):
                             grad_f_bg, grad_f_sc, src_i, t, n_shots, n_src,
                             ny_nx,
                         )
-                    t_local = t - s0
+                    snap_off = ((t - s0) // grad_stride) * (n_shots * ny * nx)
                     ext.adjoint_step(
                         v_p, scatter_p,
                         lam_bg[(t + 1) % 3], lam_bg[(t + 2) % 3],
@@ -363,14 +348,15 @@ class Scalar2DBornFunc(torch.autograd.Function):
                         zeta_y[(t + 1) % 2], zeta_x[(t + 1) % 2],
                         psi_y_sc[(t + 1) % 2], psi_x_sc[(t + 1) % 2],
                         zeta_y_sc[(t + 1) % 2], zeta_x_sc[(t + 1) % 2],
-                    ay, by, dbydy, ax, bx, dbxdx, w_store, wsc_store,
-                    grad_v, grad_scatter,
-                    c1, c2,
-                    ctx.rdy, ctx.rdx, ctx.rdy2, ctx.rdx2,
-                    t_local, grad_stride, scale, ctx.dt2,
+                        ay, by, dbydy, ax, bx, dbxdx, w_store, wsc_store,
+                        grad_v, grad_scatter,
+                        c1, c2,
+                        ctx.rdy, ctx.rdx, ctx.rdy2, ctx.rdx2,
+                        t, grad_stride, scale, ctx.dt2,
                         n_shots, ny, nx,
                         ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
-                        ctx.v_batched, ctx.scatter_batched, ctx.fd_pad,
+                        ctx.pml_y0_b, ctx.pml_y1_b, ctx.pml_x0_b, ctx.pml_x1_b,
+                        ctx.v_batched, ctx.scatter_batched, snap_off, ctx.fd_pad,
                     )
                     if n_rec > 0 or n_bg_rec > 0:
                         ext.record_grad_r(
@@ -385,6 +371,7 @@ class Scalar2DBornFunc(torch.autograd.Function):
                         lam_bg[(t + 1) % 3], lam_sc[(t + 1) % 3],
                         grad_f_bg, grad_f_sc, src_i, t, n_shots, n_src, ny_nx,
                     )
+                snap_off = storage.snap_offset(t // grad_stride)
                 ext.adjoint_step(
                     v_p, scatter_p,
                     lam_bg[(t + 1) % 3], lam_bg[(t + 2) % 3],
@@ -404,7 +391,8 @@ class Scalar2DBornFunc(torch.autograd.Function):
                     t, grad_stride, scale, ctx.dt2,
                     n_shots, ny, nx,
                     ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
-                    ctx.v_batched, ctx.scatter_batched, ctx.fd_pad,
+                    ctx.pml_y0_b, ctx.pml_y1_b, ctx.pml_x0_b, ctx.pml_x1_b,
+                    ctx.v_batched, ctx.scatter_batched, snap_off, ctx.fd_pad,
                 )
                 if n_rec > 0 or n_bg_rec > 0:
                     ext.record_grad_r(
@@ -413,7 +401,11 @@ class Scalar2DBornFunc(torch.autograd.Function):
                         t, n_shots, n_bg_rec, n_rec, ny_nx,
                     )
 
-        # 29 forward() inputs: 4 grads + 25 x None
+        if not ctx.v_batched:
+            grad_v = grad_v.sum(0, keepdim=True)
+        if not ctx.scatter_batched:
+            grad_scatter = grad_scatter.sum(0, keepdim=True)
+        # 33 forward() inputs: 4 grads + 29 x None
         return (
             grad_v,
             grad_scatter,
@@ -421,7 +413,7 @@ class Scalar2DBornFunc(torch.autograd.Function):
             grad_f_sc,      # in scalar2d_born()
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
-            None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None,
         )
 
 
@@ -470,7 +462,7 @@ def scalar2d_born(
     if not isinstance(grid_spacing, (list, tuple)):
         grid_spacing = [float(grid_spacing)] * 2
     grid_spacing = [float(d) for d in grid_spacing]
-    pml_w = _set_pml_width(pml_width, 2)
+    pml_w = set_pml_width(pml_width, 2)
     fd_pad = [accuracy // 2] * 4
     device = v.device
     if device.type == "cuda":
@@ -500,21 +492,12 @@ def scalar2d_born(
         dtype,
         pad_modes=["replicate", "constant"],
     )
-    # deterministic replicate pad for the velocity model (see
-    # _replicate_pad_2d): same values as extract's F.pad, but a
-    # reproducible gradient through the model padding.
-    v_p = _replicate_pad_2d(
-        v,
-        fd_pad[0] + pml_w[0],
-        fd_pad[1] + pml_w[1],
-        fd_pad[2] + pml_w[2],
-        fd_pad[3] + pml_w[3],
-        device,
-        dtype,
-    )
+    # Shared models stay [1, ny, nx]; kernels use *_batched=0 and backward
+    # sums per-shot grads (elastic/EM style).
     ny, nx = v_p.shape[-2:]
     if max_vel is None:
         max_vel = float(v.detach().abs().max())
+    check_cfl(grid_spacing, dt, max_vel, "scalar2d_born")
     profs = set_acoustic_pml_profiles(
         pml_w, fd_pad, dt, grid_spacing, max_vel, pml_freq, (ny, nx), dtype,
         device, accuracy=accuracy,
@@ -539,9 +522,10 @@ def scalar2d_born(
         amp = source_amplitudes.to(device=device, dtype=dtype)[:, :, :nt_inner]
         src_mask = src_i != -1
         src_i_masked = src_i.masked_fill(~src_mask, 0)
-        v_flat = v_p.reshape(1, -1).expand(n_shots, -1)
+        # expand flat rows for gather only (not the full model into Func).
+        v_flat = v_p.reshape(-1, ny * nx).expand(n_shots, -1)
+        sc_flat = scatter_p.reshape(-1, ny * nx).expand(n_shots, -1)
         v_at_src = v_flat.gather(1, src_i_masked)
-        sc_flat = scatter_p.reshape(1, -1).expand(n_shots, -1)
         sc_at_src = sc_flat.gather(1, src_i_masked)
         f_bg = (
             -amp.permute(2, 0, 1) * (v_at_src.unsqueeze(0) ** 2 * dt * dt)
@@ -562,6 +546,14 @@ def scalar2d_born(
     dt2 = float(dt) * float(dt)
     pml_y0, pml_y1 = fd_pad[0] + pml_w[0], ny - fd_pad[1] - pml_w[1]
     pml_x0, pml_x1 = fd_pad[2] + pml_w[2], nx - fd_pad[3] - pml_w[3]
+    # the backward pass widens the PML region by one fd_pad (forward
+    # boundary + fd_pad, clamped to n - fd_pad): the transpose of the
+    # forward PML stencil reads one cell further into the interior, so the
+    # adjoint CPML branch must cover those cells.
+    pml_y0_b = min(pml_y0 + fd_pad[0], ny - fd_pad[0])
+    pml_y1_b = max(pml_y0_b, pml_y1 - fd_pad[1])
+    pml_x0_b = min(pml_x0 + fd_pad[2], nx - fd_pad[2])
+    pml_x1_b = max(pml_x0_b, pml_x1 - fd_pad[3])
     v_batched = 1 if (v.ndim == 3 and v.shape[0] == n_shots and v.shape[0] > 1) else 0
     scatter_batched = (
         1
@@ -598,7 +590,9 @@ def scalar2d_born(
         v_p, scatter_p, f_bg, f_sc, src_i, rec_i, bg_rec_i,
         profs, c1, c2,
         rdy, rdx, rdy2, rdx2, dt2,
-        nt_inner, pml_y0, pml_y1, pml_x0, pml_x1,
+        nt_inner,
+        pml_y0, pml_y1, pml_x0, pml_x1,
+        pml_y0_b, pml_y1_b, pml_x0_b, pml_x1_b,
         v_batched, scatter_batched, grad_stride, fd_pad[0],
         store_obj, store_sc_obj, ckpt_state, checkpoint_every, segments,
     )

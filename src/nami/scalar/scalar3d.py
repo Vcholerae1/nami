@@ -26,7 +26,7 @@ import torch
 
 from ..common.cfl import check_cfl
 from ..common.fd import diff1_coeffs, diff2_coeffs
-from ..common.pml import set_acoustic_pml_profiles
+from ..common.pml import set_acoustic_pml_profiles, set_pml_width
 from ..common.storage import (
     SnapshotStorage,
     check_sample_steps,
@@ -73,7 +73,10 @@ class Scalar3DFunc(torch.autograd.Function):
         if device.type == "cuda":
             torch.cuda.set_device(device)
         dtype = v_p.dtype
-        n_shots, nz, ny, nx = v_p.shape
+        # n_shots from survey (sources), not model batch: shared [1, nz, ny, nx]
+        # still runs n_shots wavefields (v_batched selects model slab 0).
+        n_shots = int(src_i.shape[0])
+        nz, ny, nx = v_p.shape[-3:]
         n_src = src_i.shape[1]
         n_rec = rec_i.shape[1]
 
@@ -193,8 +196,6 @@ class Scalar3DFunc(torch.autograd.Function):
         if device.type == "cuda":
             torch.cuda.set_device(device)
         dtype = v_p.dtype
-        # n_shots is the survey shot count: for a non-batched model shared by
-        # several shots, v_p is [1, nz, ny, nx] but n_shots > 1.
         n_shots = ctx.n_shots
         nz, ny, nx = v_p.shape[-3:]
         n_src, n_rec = src_i.shape[1], rec_i.shape[1]
@@ -205,6 +206,7 @@ class Scalar3DFunc(torch.autograd.Function):
         if grad_r is None:
             grad_r = torch.zeros(nt, n_shots, n_rec, device=device, dtype=dtype)
         grad_f = torch.zeros(nt, n_shots, n_src, device=device, dtype=dtype)
+        # Per-shot grads; summed below when the model is shared (not batched).
         grad_v = torch.zeros(n_shots, nz, ny, nx, device=device, dtype=dtype)
 
         lam = [
@@ -221,7 +223,9 @@ class Scalar3DFunc(torch.autograd.Function):
         az, bz, dbzdz, ay, by, dbydy, ax, bx, dbxdx = [
             p.contiguous() for p in ctx.profs
         ]
-        scale = 1.0
+        # integral sampling: each snapshot represents
+        # `grad_stride` time steps of the model-gradient integral.
+        scale = float(grad_stride)
         segments = ctx.segments
         if segments:
             # Checkpointed backward: per segment, restore the wavefield
@@ -335,12 +339,11 @@ class Scalar3DFunc(torch.autograd.Function):
                         nz_ny_nx,
                     )
 
-        # grad_v is per-shot [n_shots, nz, ny, nx]; for a model shared by
-        # several shots (v_p is an expand of a [1, ...] model) the autograd
-        # graph sums the per-shot gradients back through the expand node.
-        # The storage (and its temp files) is released when the autograd graph
-        # is garbage collected; it must outlive repeated
-        # backward calls, so it is not closed here.
+        # Shared model: sum per-shot grads to match v_p shape [1, nz, ny, nx]
+        # (same contract as elastic2d / em2d_tm). Batched model keeps
+        # [n_shots, ...].
+        if not ctx.v_batched:
+            grad_v = grad_v.sum(0, keepdim=True)
         # 34 forward() inputs: grad_v + grad_f + 32 x None
         return (
             grad_v,
@@ -392,7 +395,7 @@ def scalar3d(
     grid_spacing = [float(g) for g in grid_spacing]
     if len(grid_spacing) != 3:
         raise ValueError("grid_spacing must be a scalar or length 3 [dz, dy, dx].")
-    pml_w = _set_pml_width(pml_width, 3)
+    pml_w = set_pml_width(pml_width, 3)
     fd_pad = [accuracy // 2] * 6
     device = v.device
     if device.type == "cuda":
@@ -421,11 +424,8 @@ def scalar3d(
         device,
         dtype,
     )
-    # a model shared by several shots is replicated to [n_shots, ...]
-    # (the autograd graph then sums per-shot gradients back through the
-    # expand node). Without this, the kernels would propagate only shot 0.
-    if v_p.shape[0] == 1 and n_shots > 1:
-        v_p = v_p.expand(n_shots, -1, -1, -1)
+    # Shared models stay [1, nz, ny, nx]; kernels use v_batched=0 and
+    # backward sums per-shot grads (elastic/EM style).
     nz, ny, nx = v_p.shape[-3:]
     max_vel = float(v.detach().abs().max())
     check_cfl(grid_spacing, dt, max_vel, "scalar3d")
@@ -439,9 +439,7 @@ def scalar3d(
         amp = source_amplitudes.to(device=device, dtype=dtype)[:, :, :nt_inner]
         src_mask = src_i != -1
         src_i_masked = src_i.masked_fill(~src_mask, 0)
-        # per-shot v at each source (exact: [n_shots, nz*ny*nx] rows;
-        # flattening all shots into one row would gather shot 0's v for every
-        # shot and corrupt the source-scaling contribution to grad_v).
+        # expand flat rows for gather only (not the full model into Func).
         v_flat = v_p.reshape(-1, nz * ny * nx).expand(n_shots, -1)
         v_at_src = v_flat.gather(1, src_i_masked)
         f = (
@@ -513,12 +511,3 @@ def scalar3d(
     # so autograd users can call .backward() on `r` and get model grads via
     # the saved `v_p`; here we just return the receiver amplitudes).
     return r
-
-
-def _set_pml_width(pml_width, ndim):
-    if isinstance(pml_width, int):
-        return [pml_width] * (2 * ndim)
-    pml_width = list(pml_width)
-    if len(pml_width) != 2 * ndim:
-        raise ValueError(f"pml_width must be int or length {2 * ndim}.")
-    return pml_width

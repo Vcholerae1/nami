@@ -1,6 +1,7 @@
 """nami elastic2d Born: linearity vs the full elastic solve, autograd
 gradcheck, and a small forward/backward sanity check."""
 
+import pytest
 import torch
 
 from nami.elastic.elastic2d import elastic2d
@@ -384,3 +385,159 @@ def test_storage_false_is_forward_only():
     raise AssertionError(
         "storage='none' backward should raise RuntimeError"
     )
+
+
+def _multi_shot_survey(ny, nx, nt, dtype):
+    srcs = torch.tensor(
+        [
+            [[ny // 2, nx // 2], [ny // 2, nx // 2 + 1]],
+            [[ny // 2 + 1, nx // 2 + 1], [ny // 2 + 1, nx // 2]],
+        ]
+    )
+    recs = torch.tensor(
+        [
+            [
+                [ny // 2, nx // 2],
+                [ny // 2, nx // 2 + 1],
+                [ny // 2 + 1, nx // 2],
+            ],
+            [
+                [ny // 2 + 1, nx // 2 + 1],
+                [ny // 2 + 1, nx // 2],
+                [ny // 2, nx // 2 + 1],
+            ],
+        ]
+    )
+    amp = torch.zeros(2, 2, nt, dtype=dtype)
+    amp[0, 0, :3] = torch.tensor([1.0, -0.5, 0.2], dtype=dtype)
+    amp[0, 1, :3] = torch.tensor([0.5, 0.1, -0.2], dtype=dtype)
+    amp[1, 0, :3] = torch.tensor([0.7, 0.3, -0.1], dtype=dtype)
+    amp[1, 1, :3] = torch.tensor([-0.4, 0.2, 0.1], dtype=dtype)
+    return srcs, recs, amp
+
+
+def test_multi_shot_shared_model():
+    """n_shots=2 shared models: Born fwd matches singles; grads are sums."""
+    dtype = torch.float64
+    c = build_case(dtype=dtype, ny=20, nx=20, nt=10, pml=3, device="cuda:0", seed=1)
+    dev = c["device"]
+    ny, nx = c["lamb"].shape
+    nt = c["nt"]
+    srcs, recs, amp = _multi_shot_survey(ny, nx, nt, dtype)
+
+    def run(lamb, mu, buoy, dlamb, dmu, dbuoy, shot=None):
+        sl = slice(None) if shot is None else slice(shot, shot + 1)
+        return elastic2d_born(
+            lamb, mu, buoy, dlamb, dmu, dbuoy, c["dx"], c["dt"],
+            source_amplitudes=amp[sl].to(dev),
+            source_locations=srcs[sl].to(dev),
+            receiver_locations=recs[sl].to(dev),
+            accuracy=2, pml_width=c["pml"], nt=nt,
+        )
+
+    keys = ("lamb", "mu", "buoyancy", "dlamb", "dmu", "dbuoy")
+    params = {k: c[k].to(dev, dtype) for k in keys}
+    p = {k: v.clone().requires_grad_(True) for k, v in params.items()}
+    p0 = {k: v.clone().requires_grad_(True) for k, v in params.items()}
+    p1 = {k: v.clone().requires_grad_(True) for k, v in params.items()}
+    r = run(p["lamb"], p["mu"], p["buoyancy"], p["dlamb"], p["dmu"], p["dbuoy"])
+    r0 = run(
+        p0["lamb"], p0["mu"], p0["buoyancy"], p0["dlamb"], p0["dmu"], p0["dbuoy"], 0
+    )
+    r1 = run(
+        p1["lamb"], p1["mu"], p1["buoyancy"], p1["dlamb"], p1["dmu"], p1["dbuoy"], 1
+    )
+    assert r.shape == (nt, 2, 3)
+    assert (r[:, 0].detach() - r0[:, 0].detach()).abs().max().item() == 0.0
+    assert (r[:, 1].detach() - r1[:, 0].detach()).abs().max().item() == 0.0
+    gs = torch.autograd.grad(r.square().sum(), [p[k] for k in keys])
+    g0s = torch.autograd.grad(r0.square().sum(), [p0[k] for k in keys])
+    g1s = torch.autograd.grad(r1.square().sum(), [p1[k] for k in keys])
+    for g, g0, g1, name in zip(gs, g0s, g1s, keys, strict=True):
+        rel = (g - (g0 + g1)).abs().max().item() / (
+            (g0 + g1).abs().max().item() + 1e-300
+        )
+        # float64: measured worst rel err ~2.5e-16 over 7 runs.
+        assert rel < 1e-12, f"shared-model grad_{name} rel err {rel}"
+
+
+def test_multi_shot_batched_model():
+    """n_shots=2 batched models: shot i uses slice i."""
+    dtype = torch.float64
+    c0 = build_case(dtype=dtype, ny=20, nx=20, nt=10, pml=3, device="cuda:0", seed=1)
+    c1 = build_case(dtype=dtype, ny=20, nx=20, nt=10, pml=3, device="cuda:0", seed=2)
+    dev = c0["device"]
+    ny, nx = c0["lamb"].shape
+    nt = c0["nt"]
+    srcs, recs, amp = _multi_shot_survey(ny, nx, nt, dtype)
+    keys = ("lamb", "mu", "buoyancy", "dlamb", "dmu", "dbuoy")
+
+    def run(models, shot=None):
+        sl = slice(None) if shot is None else slice(shot, shot + 1)
+        return elastic2d_born(
+            *models, c0["dx"], c0["dt"],
+            source_amplitudes=amp[sl].to(dev),
+            source_locations=srcs[sl].to(dev),
+            receiver_locations=recs[sl].to(dev),
+            accuracy=2, pml_width=c0["pml"], nt=nt,
+        )
+
+    batch = [
+        torch.stack([c0[k], c1[k]]).to(dev, dtype).requires_grad_(True)
+        for k in keys
+    ]
+    m0 = [c0[k].to(dev, dtype).requires_grad_(True) for k in keys]
+    m1 = [c1[k].to(dev, dtype).requires_grad_(True) for k in keys]
+    r = run(batch)
+    r0, r1 = run(m0, 0), run(m1, 1)
+    assert r.shape == (nt, 2, 3)
+    assert (r[:, 0].detach() - r0[:, 0].detach()).abs().max().item() == 0.0
+    assert (r[:, 1].detach() - r1[:, 0].detach()).abs().max().item() == 0.0
+    gs = torch.autograd.grad(r.square().sum(), batch)
+    g0s = torch.autograd.grad(r0.square().sum(), m0)
+    g1s = torch.autograd.grad(r1.square().sum(), m1)
+    for gb, g0, g1, name in zip(gs, g0s, g1s, keys, strict=True):
+        rel0 = (gb[0] - g0).abs().max().item() / (g0.abs().max().item() + 1e-300)
+        rel1 = (gb[1] - g1).abs().max().item() / (g1.abs().max().item() + 1e-300)
+        # float64: measured worst rel err 0 (bit-identical) over 7 runs.
+        assert rel0 < 1e-12 and rel1 < 1e-12, (
+            f"batched-model grad_{name} rel err ({rel0}, {rel1})"
+        )
+
+
+def test_mixed_batch_models_raise():
+    """Mixed shared/batched models raise ValueError: the kernel selects the
+    model slab with one flag per group (background, scatter), so mixed
+    batch forms within a group would read a shared model out of bounds."""
+    dtype = torch.float64
+    c = build_case(dtype=dtype, ny=20, nx=20, nt=10, pml=3, device="cuda:0",
+                   seed=1)
+    dev = c["device"]
+    ny, nx = c["lamb"].shape
+    nt = c["nt"]
+    srcs, recs, amp = _multi_shot_survey(ny, nx, nt, dtype)
+
+    def run(lamb, mu, buoy, dlamb, dmu, dbuoy):
+        return elastic2d_born(
+            lamb, mu, buoy, dlamb, dmu, dbuoy, c["dx"], c["dt"],
+            source_amplitudes=amp.to(dev),
+            source_locations=srcs.to(dev),
+            receiver_locations=recs.to(dev),
+            accuracy=2, pml_width=c["pml"], nt=nt,
+        )
+
+    bg = [c[k].to(dev, dtype) for k in ("lamb", "mu", "buoyancy")]
+    sc = [c[k].to(dev, dtype) for k in ("dlamb", "dmu", "dbuoy")]
+
+    def batched(t):
+        return torch.stack([t, t]).clone()
+
+    # batched background lamb + shared mu/buoyancy
+    with pytest.raises(ValueError, match="all shared|all batched"):
+        run(batched(bg[0]), bg[1], bg[2], sc[0], sc[1], sc[2])
+    # batched scatter dlamb + shared dmu/dbuoyancy
+    with pytest.raises(ValueError, match="all shared|all batched"):
+        run(bg[0], bg[1], bg[2], batched(sc[0]), sc[1], sc[2])
+    # batched scatter + None siblings (None = shared zeros)
+    with pytest.raises(ValueError, match="all shared|all batched"):
+        run(bg[0], bg[1], bg[2], batched(sc[0]), None, None)

@@ -38,13 +38,14 @@ import torch
 
 from ..common.cfl import check_cfl
 from ..common.fd import check_accuracy, staggered_diff1_coeffs
+from ..common.pml import set_pml_width
 from ..common.storage import (
     SnapshotStorage,
     check_sample_steps,
     resolve_storage,
     storage_plan,
 )
-from ..common.survey import extract_survey_2d
+from ..common.survey import check_model_batching, extract_survey_2d
 
 # Checkpoint state layout for the elastic velocity-stress field (the buffers
 # are updated in place, so they ARE the wavefield state at time t):
@@ -194,6 +195,7 @@ class Elastic2DFunc(torch.autograd.Function):
         dtype = lamb.dtype
         n_shots, ny, nx, ny_nx = ctx.n_shots, ctx.ny, ctx.nx, ctx.ny_nx
         nt, grad_stride = ctx.nt, ctx.grad_stride
+        scale = float(grad_stride)
 
         if grad_r is None:
             grad_r = torch.zeros(nt, n_shots, ctx.n_rec, device=device, dtype=dtype)
@@ -279,7 +281,7 @@ class Elastic2DFunc(torch.autograd.Function):
                         ctx.c, grad_f, src_i, grad_r, rec_i,
                         ctx.fd_pad[0], ctx.fd_pad[1],
                         ctx.fd_pad[2], ctx.fd_pad[3],
-                        ctx.rdy, ctx.rdx, ctx.dtv, t, grad_stride, snap_off,
+                        ctx.rdy, ctx.rdx, ctx.dtv, scale, t, grad_stride, snap_off,
                         n_shots, ny, nx, ny_nx, ctx.n_src, ctx.n_rec,
                         ctx.model_batched,
                         ctx.pml[0], ctx.pml[1], ctx.pml[2], ctx.pml[3],
@@ -302,7 +304,7 @@ class Elastic2DFunc(torch.autograd.Function):
                     ayh, byh, ay, by, axh, bxh, ax, bx,
                     ctx.c, grad_f, src_i, grad_r, rec_i,
                     ctx.fd_pad[0], ctx.fd_pad[1], ctx.fd_pad[2], ctx.fd_pad[3],
-                    ctx.rdy, ctx.rdx, ctx.dtv, t, grad_stride, snap_off,
+                    ctx.rdy, ctx.rdx, ctx.dtv, scale, t, grad_stride, snap_off,
                     n_shots, ny, nx, ny_nx, ctx.n_src, ctx.n_rec,
                     ctx.model_batched,
                     ctx.pml[0], ctx.pml[1], ctx.pml[2], ctx.pml[3],
@@ -444,15 +446,6 @@ def _set_elastic_pml_profiles(
     return profiles
 
 
-def _set_pml_width(pml_width, ndim):
-    if isinstance(pml_width, int):
-        return [pml_width] * (2 * ndim)
-    pml_width = list(pml_width)
-    if len(pml_width) != 2 * ndim:
-        raise ValueError(f"pml_width must be int or length {2 * ndim}.")
-    return pml_width
-
-
 def elastic2d(
     lamb,
     mu,
@@ -510,7 +503,7 @@ def elastic2d(
     if not isinstance(grid_spacing, (list, tuple)):
         grid_spacing = [float(grid_spacing)] * 2
     grid_spacing = [float(g) for g in grid_spacing]
-    pml_width_list = _set_pml_width(pml_width, 2)
+    pml_width_list = set_pml_width(pml_width, 2)
     fd_pad = [accuracy // 2, accuracy // 2 - 1] * 2  # [1, 0, 1, 0]
     device = lamb.device
     if device.type == "cuda":
@@ -588,7 +581,14 @@ def elastic2d(
         nt_inner, N_STATE, grad_stride, N_STREAMS, storage_enabled,
         ckpt_steps=ckpt_steps,
     )
-    model_batched = 1 if (lamb_p.ndim == 3 and lamb_p.shape[0] > 1) else 0
+    # Batched flag from the *user* models (before pad).  One flag governs
+    # all three parameters, so they must share a batch form.
+    check_model_batching(
+        [lamb, mu, buoyancy], ("lamb", "mu", "buoyancy"), n_shots
+    )
+    model_batched = 1 if (
+        lamb.ndim == 3 and lamb.shape[0] == n_shots and n_shots > 1
+    ) else 0
 
     stores = None
     ckpt_state = None

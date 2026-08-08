@@ -115,7 +115,7 @@ __global__ void born_step_h_kernel(
     int n_shots, int ny, int nx,
     int pml_y0, int pml_y1, int pml_x0, int pml_x1,
     int fd_pad_y0, int fd_pad_x0,
-    int cq_batched, int dcq_batched, int store)
+    int cq_batched, int dcq_batched, int store, int64_t snap_off)
 {
     const int s = blockIdx.z;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -139,7 +139,7 @@ __global__ void born_step_h_kernel(
             ddey_dy = ddey_dy / kyh[y] + dm_ey_z[off];
         }
         if (store && t % interval == 0) {
-            const long soff = (((long)(t / interval) * n_shots + s) * ny + y) * nx + x;
+            const long soff = snap_off + ((long)s * ny + y) * nx + x;
             dey_dy_store[soff] = dey_dy;
             ddey_dy_store[soff] = ddey_dy;
         }
@@ -158,7 +158,7 @@ __global__ void born_step_h_kernel(
             ddey_dx = ddey_dx / kxh[x] + dm_ey_x[off];
         }
         if (store && t % interval == 0) {
-            const long soff = (((long)(t / interval) * n_shots + s) * ny + y) * nx + x;
+            const long soff = snap_off + ((long)s * ny + y) * nx + x;
             dey_dx_store[soff] = dey_dx;
             ddey_dx_store[soff] = ddey_dx;
         }
@@ -193,7 +193,8 @@ __global__ void born_step_e_kernel(
     int n_shots, int ny, int nx,
     int pml_y0, int pml_y1, int pml_x0, int pml_x1,
     int fd_pad_y0, int fd_pad_y1, int fd_pad_x0, int fd_pad_x1,
-    int ca_batched, int cb_batched, int dca_batched, int dcb_batched)
+    int ca_batched, int cb_batched, int dca_batched, int dcb_batched,
+    int store, int64_t snap_off)
 {
     const int s = blockIdx.z;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -205,7 +206,6 @@ __global__ void born_step_e_kernel(
         const int s_dca = dca_batched ? s : 0;
         const int s_dcb = dcb_batched ? s : 0;
         const long off = ((long)s * ny + y) * nx + x;
-        const long soff = (((long)(t / interval) * n_shots + s) * ny + y) * nx + x;
         T dhz_dx = diff_half_x(hz, off, c, rdx, fd_pad_x0);
         if (x < pml_x0 || x >= pml_x1) {
             m_hz_x[off] = bx[x] * m_hz_x[off] + ax[x] * dhz_dx;
@@ -230,7 +230,9 @@ __global__ void born_step_e_kernel(
         const T dcurl = ddHz_dx - ddHx_dy;
         const T ey_old = ey[off];
         const T dEy_old = dEy[off];
-        if (t % interval == 0) {
+        // snap_off + spatial (same layout as full-wave / born_step_h)
+        if (store && t % interval == 0) {
+            const long soff = snap_off + ((long)s * ny + y) * nx + x;
             ey_store[soff] = ey_old;
             curl_store[soff] = curl;
             dEy_store[soff] = dEy_old;
@@ -326,7 +328,7 @@ __global__ void born_coeff_grad_kernel(
     const T* __restrict__ dEy_store, const T* __restrict__ dcurl_store,
     T* __restrict__ grad_ca, T* __restrict__ grad_cb,
     T* __restrict__ grad_dca, T* __restrict__ grad_dcb,
-    int t, int interval, T scale,
+    int t, int interval, T scale, int64_t snap_off,
     int n_shots, int ny, int nx,
     int pml_y0, int pml_y1, int pml_x0, int pml_x1,
     int fd_pad_y0, int fd_pad_y1, int fd_pad_x0, int fd_pad_x1)
@@ -337,7 +339,7 @@ __global__ void born_coeff_grad_kernel(
     if (y >= fd_pad_y0 && x >= fd_pad_x0 && y < ny - fd_pad_y1 &&
         x < nx - fd_pad_x1) {
         const long off = ((long)s * ny + y) * nx + x;
-        const long soff = (((long)(t / interval) * n_shots + s) * ny + y) * nx + x;
+        const long soff = snap_off + ((long)s * ny + y) * nx + x;
         const T lam = lam_ey[off] * scale;
         const T lam_d = lam_dEy[off] * scale;
         const T ey_v = ey_store[soff];
@@ -570,7 +572,7 @@ __global__ void born_cq_grad_kernel(
     const T* __restrict__ dey_dy_store, const T* __restrict__ dey_dx_store,
     const T* __restrict__ ddey_dy_store, const T* __restrict__ ddey_dx_store,
     T* __restrict__ grad_cq, T* __restrict__ grad_dcq,
-    int t, int interval, T scale,
+    int t, int interval, T scale, int64_t snap_off,
     int n_shots, int ny, int nx,
     int pml_y0, int pml_y1, int pml_x0, int pml_x1,
     int fd_pad_y0, int fd_pad_y1, int fd_pad_x0, int fd_pad_x1)
@@ -581,7 +583,7 @@ __global__ void born_cq_grad_kernel(
     if (y >= fd_pad_y0 && x >= fd_pad_x0 && y < ny - fd_pad_y1 &&
         x < nx - fd_pad_x1) {
         const long off = ((long)s * ny + y) * nx + x;
-        const long soff = (((long)(t / interval) * n_shots + s) * ny + y) * nx + x;
+        const long soff = snap_off + ((long)s * ny + y) * nx + x;
         T term_cq = (T)0;
         T term_dcq = (T)0;
         if (y < ny - fd_pad_y0) {
@@ -681,7 +683,7 @@ __global__ void born_step_velocity_kernel(
     int fd_pad_y0, int fd_pad_y1, int fd_pad_x0, int fd_pad_x1,
     T rdy, T rdx, T dtv,
     int t, int interval, int n_shots, int ny, int nx,
-    int model_batched, int scatter_batched, int store)
+    int model_batched, int scatter_batched, int store, int64_t snap_off)
 {
     const int s = blockIdx.z;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -716,7 +718,7 @@ __global__ void born_step_velocity_kernel(
         dvy[off] += by_s[(long)y * nx + x] * dtv * dw_y
                   + dby_s[(long)y * nx + x] * dtv * w_y;
         if (store && t % interval == 0) {
-            const long soff = (((long)(t / interval) * n_shots + s) * ny + y) * nx + x;
+            const long soff = snap_off + ((long)s * ny + y) * nx + x;
             dvydb_store[soff] = dtv * w_y;
             ddvydb_store[soff] = dtv * dw_y;
         }
@@ -742,7 +744,7 @@ __global__ void born_step_velocity_kernel(
         dvx[off] += bx_s[(long)y * nx + x] * dtv * dw_x
                   + dbx_s[(long)y * nx + x] * dtv * w_x;
         if (store && t % interval == 0) {
-            const long soff = (((long)(t / interval) * n_shots + s) * ny + y) * nx + x;
+            const long soff = snap_off + ((long)s * ny + y) * nx + x;
             dvxdb_store[soff] = dtv * w_x;
             ddvxdb_store[soff] = dtv * dw_x;
         }
@@ -781,7 +783,7 @@ __global__ void born_step_stress_kernel(
     int fd_pad_y0, int fd_pad_y1, int fd_pad_x0, int fd_pad_x1,
     T rdy, T rdx, T dtv,
     int t, int interval, int n_shots, int ny, int nx,
-    int model_batched, int scatter_batched, int store)
+    int model_batched, int scatter_batched, int store, int64_t snap_off)
 {
     const int s = blockIdx.z;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -825,7 +827,7 @@ __global__ void born_step_stress_kernel(
         dsxx[off] += dtv * (lamb_v * dssum + (T)2 * mu_v * ddvxdx)
                    + dtv * (dlamb_v * ssum + (T)2 * dmu_v * dvxdx);
         if (store && t % interval == 0) {
-            const long soff = (((long)(t / interval) * n_shots + s) * ny + y) * nx + x;
+            const long soff = snap_off + ((long)s * ny + y) * nx + x;
             dvydy_store[soff] = dtv * dvydy;
             dvxdx_store[soff] = dtv * dvxdx;
             ddvydy_store[soff] = dtv * ddvydy;
@@ -853,7 +855,7 @@ __global__ void born_step_stress_kernel(
         dsxy[off] += dtv * mu_yx_s[(long)y * nx + x] * dw_sum
                    + dtv * dmu_yx_s[(long)y * nx + x] * w_sum;
         if (store && t % interval == 0) {
-            const long soff = (((long)(t / interval) * n_shots + s) * ny + y) * nx + x;
+            const long soff = snap_off + ((long)s * ny + y) * nx + x;
             dvxy_store[soff] = dtv * w_sum;
             ddvxy_store[soff] = dtv * dw_sum;
         }
@@ -976,8 +978,8 @@ __global__ void born_adjoint_velocity_kernel(
     const T* __restrict__ c,
     int fd_pad_y0, int fd_pad_y1, int fd_pad_x0, int fd_pad_x1,
     T rdy, T rdx, T dtv,
-    int t, int interval, int n_shots, int ny, int nx,
-    int model_batched, int scatter_batched)
+    int t, int interval, T scale, int n_shots, int ny, int nx,
+    int model_batched, int scatter_batched, int64_t snap_off)
 {
     const int s = blockIdx.z;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -1009,16 +1011,16 @@ __global__ void born_adjoint_velocity_kernel(
             const long off_m = off - (long)(k - 1) * nx;
             const long off_p = off + (long)k * nx;
             const int ym = y - (k - 1), yp = y + k;
-            const T lam_m = lamb_s[off_m];
-            const T l2m_m = lam_m + (T)2 * mu_s[off_m];
-            const T d2m_m = (T)2 * dmu_s[off_m] + dlamb_s[off_m];
+            const T lam_m = lamb_s[off_m - off_s];
+            const T l2m_m = lam_m + (T)2 * mu_s[off_m - off_s];
+            const T d2m_m = (T)2 * dmu_s[off_m - off_s] + dlamb_s[off_m - off_s];
             const T A_m = dtv * (l2m_m * l_syy[off_m] + lam_m * l_sxx[off_m]
-                              + d2m_m * l_dsyy[off_m] + dlamb_s[off_m] * l_dsxx[off_m]);
-            const T lam_p = lamb_s[off_p];
-            const T l2m_p = lam_p + (T)2 * mu_s[off_p];
-            const T d2m_p = (T)2 * dmu_s[off_p] + dlamb_s[off_p];
+                              + d2m_m * l_dsyy[off_m] + dlamb_s[off_m - off_s] * l_dsxx[off_m]);
+            const T lam_p = lamb_s[off_p - off_s];
+            const T l2m_p = lam_p + (T)2 * mu_s[off_p - off_s];
+            const T d2m_p = (T)2 * dmu_s[off_p - off_s] + dlamb_s[off_p - off_s];
             const T A_p = dtv * (l2m_p * l_syy[off_p] + lam_p * l_sxx[off_p]
-                              + d2m_p * l_dsyy[off_p] + dlamb_s[off_p] * l_dsxx[off_p]);
+                              + d2m_p * l_dsyy[off_p] + dlamb_s[off_p - off_s] * l_dsxx[off_p]);
             dy += c[k - 1] *
                   (((T)1 + by[ym]) * A_m + by[ym] * m_vyy[off_m] -
                    ((T)1 + by[yp]) * A_p - by[yp] * m_vyy[off_p]);
@@ -1029,11 +1031,11 @@ __global__ void born_adjoint_velocity_kernel(
             const long off_m = off - (long)(k - 1) * nx;
             const long off_p = off + (long)k * nx;
             const int ym = y - (k - 1), yp = y + k;
-            const T lam_m = lamb_s[off_m];
-            const T l2m_m = lam_m + (T)2 * mu_s[off_m];
+            const T lam_m = lamb_s[off_m - off_s];
+            const T l2m_m = lam_m + (T)2 * mu_s[off_m - off_s];
             const T A_dm = dtv * (l2m_m * l_dsyy[off_m] + lam_m * l_dsxx[off_m]);
-            const T lam_p = lamb_s[off_p];
-            const T l2m_p = lam_p + (T)2 * mu_s[off_p];
+            const T lam_p = lamb_s[off_p - off_s];
+            const T l2m_p = lam_p + (T)2 * mu_s[off_p - off_s];
             const T A_dp = dtv * (l2m_p * l_dsyy[off_p] + lam_p * l_dsxx[off_p]);
             ddy += c[k - 1] *
                    (((T)1 + by[ym]) * A_dm + by[ym] * dm_vyy[off_m] -
@@ -1046,10 +1048,10 @@ __global__ void born_adjoint_velocity_kernel(
             const long off_m = off - k;
             const long off_p = off + k - 1;
             const int xm = x - k, xp = x + k - 1;
-            const T B_m = dtv * (mu_yx_s[off_m] * l_sxy[off_m]
-                               + dmu_yx_s[off_m] * l_dsxy[off_m]);
-            const T B_p = dtv * (mu_yx_s[off_p] * l_sxy[off_p]
-                               + dmu_yx_s[off_p] * l_dsxy[off_p]);
+            const T B_m = dtv * (mu_yx_s[off_m - off_s] * l_sxy[off_m]
+                               + dmu_yx_s[off_m - off_s] * l_dsxy[off_m]);
+            const T B_p = dtv * (mu_yx_s[off_p - off_s] * l_sxy[off_p]
+                               + dmu_yx_s[off_p - off_s] * l_dsxy[off_p]);
             dx += c[k - 1] *
                   (((T)1 + bxh[xm]) * B_m + bxh[xm] * m_vyx[off_m] -
                    ((T)1 + bxh[xp]) * B_p - bxh[xp] * m_vyx[off_p]);
@@ -1060,8 +1062,8 @@ __global__ void born_adjoint_velocity_kernel(
             const long off_m = off - k;
             const long off_p = off + k - 1;
             const int xm = x - k, xp = x + k - 1;
-            const T B_dm = dtv * mu_yx_s[off_m] * l_dsxy[off_m];
-            const T B_dp = dtv * mu_yx_s[off_p] * l_dsxy[off_p];
+            const T B_dm = dtv * mu_yx_s[off_m - off_s] * l_dsxy[off_m];
+            const T B_dp = dtv * mu_yx_s[off_p - off_s] * l_dsxy[off_p];
             ddx += c[k - 1] *
                    (((T)1 + bxh[xm]) * B_dm + bxh[xm] * dm_vyx[off_m] -
                     ((T)1 + bxh[xp]) * B_dp - bxh[xp] * dm_vyx[off_p]);
@@ -1077,10 +1079,10 @@ __global__ void born_adjoint_velocity_kernel(
         dm_syyy_new[off] = b_y * dtv * ayh[y] * dvy_new + ayh[y] * dm_syyy_old[off];
         dm_syx_new[off] = b_y * dtv * ax[x] * dvy_new + ax[x] * dm_syx_old[off];
         if (t % interval == 0) {
-            const long soff = (((long)(t / interval) * n_shots + s) * ny + y) * nx + x;
-            grad_buoyancy_y[off] += vy_new * dvydb_store[soff]
-                                  + dvy_new * ddvydb_store[soff];
-            grad_dbuoyancy_y[off] += dvy_new * dvydb_store[soff];
+            const long soff = snap_off + ((long)s * ny + y) * nx + x;
+            grad_buoyancy_y[off] += scale * (vy_new * dvydb_store[soff]
+                                             + dvy_new * ddvydb_store[soff]);
+            grad_dbuoyancy_y[off] += scale * (dvy_new * dvydb_store[soff]);
         }
     }
     // vx: y in [fd_pad_y0, ny-fd_pad_y1), x in [fd_pad_x0, nx-fd_pad_x0)
@@ -1093,10 +1095,10 @@ __global__ void born_adjoint_velocity_kernel(
             const long off_m = off - (long)k * nx;
             const long off_p = off + (long)(k - 1) * nx;
             const int ym = y - k, yp = y + k - 1;
-            const T C_m = dtv * (mu_yx_s[off_m] * l_sxy[off_m]
-                               + dmu_yx_s[off_m] * l_dsxy[off_m]);
-            const T C_p = dtv * (mu_yx_s[off_p] * l_sxy[off_p]
-                               + dmu_yx_s[off_p] * l_dsxy[off_p]);
+            const T C_m = dtv * (mu_yx_s[off_m - off_s] * l_sxy[off_m]
+                               + dmu_yx_s[off_m - off_s] * l_dsxy[off_m]);
+            const T C_p = dtv * (mu_yx_s[off_p - off_s] * l_sxy[off_p]
+                               + dmu_yx_s[off_p - off_s] * l_dsxy[off_p]);
             dy += c[k - 1] *
                   (((T)1 + byh[ym]) * C_m + byh[ym] * m_vxy[off_m] -
                    ((T)1 + byh[yp]) * C_p - byh[yp] * m_vxy[off_p]);
@@ -1107,8 +1109,8 @@ __global__ void born_adjoint_velocity_kernel(
             const long off_m = off - (long)k * nx;
             const long off_p = off + (long)(k - 1) * nx;
             const int ym = y - k, yp = y + k - 1;
-            const T C_dm = dtv * mu_yx_s[off_m] * l_dsxy[off_m];
-            const T C_dp = dtv * mu_yx_s[off_p] * l_dsxy[off_p];
+            const T C_dm = dtv * mu_yx_s[off_m - off_s] * l_dsxy[off_m];
+            const T C_dp = dtv * mu_yx_s[off_p - off_s] * l_dsxy[off_p];
             ddy += c[k - 1] *
                    (((T)1 + byh[ym]) * C_dm + byh[ym] * dm_vxy[off_m] -
                     ((T)1 + byh[yp]) * C_dp - byh[yp] * dm_vxy[off_p]);
@@ -1120,16 +1122,16 @@ __global__ void born_adjoint_velocity_kernel(
             const long off_m = off - k + 1;
             const long off_p = off + k;
             const int xm = x - k + 1, xp = x + k;
-            const T lam_m = lamb_s[off_m];
-            const T l2m_m = lam_m + (T)2 * mu_s[off_m];
-            const T d2m_m = (T)2 * dmu_s[off_m] + dlamb_s[off_m];
+            const T lam_m = lamb_s[off_m - off_s];
+            const T l2m_m = lam_m + (T)2 * mu_s[off_m - off_s];
+            const T d2m_m = (T)2 * dmu_s[off_m - off_s] + dlamb_s[off_m - off_s];
             const T A_m = dtv * (l2m_m * l_sxx[off_m] + lam_m * l_syy[off_m]
-                              + d2m_m * l_dsxx[off_m] + dlamb_s[off_m] * l_dsyy[off_m]);
-            const T lam_p = lamb_s[off_p];
-            const T l2m_p = lam_p + (T)2 * mu_s[off_p];
-            const T d2m_p = (T)2 * dmu_s[off_p] + dlamb_s[off_p];
+                              + d2m_m * l_dsxx[off_m] + dlamb_s[off_m - off_s] * l_dsyy[off_m]);
+            const T lam_p = lamb_s[off_p - off_s];
+            const T l2m_p = lam_p + (T)2 * mu_s[off_p - off_s];
+            const T d2m_p = (T)2 * dmu_s[off_p - off_s] + dlamb_s[off_p - off_s];
             const T A_p = dtv * (l2m_p * l_sxx[off_p] + lam_p * l_syy[off_p]
-                              + d2m_p * l_dsxx[off_p] + dlamb_s[off_p] * l_dsyy[off_p]);
+                              + d2m_p * l_dsxx[off_p] + dlamb_s[off_p - off_s] * l_dsyy[off_p]);
             dx += c[k - 1] *
                   (((T)1 + bx[xm]) * A_m + bx[xm] * m_vxx[off_m] -
                    ((T)1 + bx[xp]) * A_p - bx[xp] * m_vxx[off_p]);
@@ -1140,11 +1142,11 @@ __global__ void born_adjoint_velocity_kernel(
             const long off_m = off - k + 1;
             const long off_p = off + k;
             const int xm = x - k + 1, xp = x + k;
-            const T lam_m = lamb_s[off_m];
-            const T l2m_m = lam_m + (T)2 * mu_s[off_m];
+            const T lam_m = lamb_s[off_m - off_s];
+            const T l2m_m = lam_m + (T)2 * mu_s[off_m - off_s];
             const T A_dm = dtv * (l2m_m * l_dsxx[off_m] + lam_m * l_dsyy[off_m]);
-            const T lam_p = lamb_s[off_p];
-            const T l2m_p = lam_p + (T)2 * mu_s[off_p];
+            const T lam_p = lamb_s[off_p - off_s];
+            const T l2m_p = lam_p + (T)2 * mu_s[off_p - off_s];
             const T A_dp = dtv * (l2m_p * l_dsxx[off_p] + lam_p * l_dsyy[off_p]);
             ddx += c[k - 1] *
                    (((T)1 + bx[xm]) * A_dm + bx[xm] * dm_vxx[off_m] -
@@ -1161,10 +1163,10 @@ __global__ void born_adjoint_velocity_kernel(
         dm_syxy_new[off] = b_x * dtv * ay[y] * dvx_new + ay[y] * dm_syxy_old[off];
         dm_syxx_new[off] = b_x * dtv * axh[x] * dvx_new + axh[x] * dm_syxx_old[off];
         if (t % interval == 0) {
-            const long soff = (((long)(t / interval) * n_shots + s) * ny + y) * nx + x;
-            grad_buoyancy_x[off] += vx_new * dvxdb_store[soff]
-                                  + dvx_new * ddvxdb_store[soff];
-            grad_dbuoyancy_x[off] += dvx_new * dvxdb_store[soff];
+            const long soff = snap_off + ((long)s * ny + y) * nx + x;
+            grad_buoyancy_x[off] += scale * (vx_new * dvxdb_store[soff]
+                                             + dvx_new * ddvxdb_store[soff]);
+            grad_dbuoyancy_x[off] += scale * (dvx_new * dvxdb_store[soff]);
         }
     }
 }
@@ -1205,8 +1207,8 @@ __global__ void born_adjoint_stress_kernel(
     const T* __restrict__ c,
     int fd_pad_y0, int fd_pad_y1, int fd_pad_x0, int fd_pad_x1,
     T rdy, T rdx, T dtv,
-    int t, int interval, int n_shots, int ny, int nx,
-    int model_batched, int scatter_batched)
+    int t, int interval, T scale, int n_shots, int ny, int nx,
+    int model_batched, int scatter_batched, int64_t snap_off)
 {
     const int s = blockIdx.z;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -1235,17 +1237,17 @@ __global__ void born_adjoint_stress_kernel(
         const T dsyy_v = l_dsyy[off];
         const T dsxx_v = l_dsxx[off];
         if (t % interval == 0) {
-            const long soff = (((long)(t / interval) * n_shots + s) * ny + y) * nx + x;
+            const long soff = snap_off + ((long)s * ny + y) * nx + x;
             const T dy_bg = dvydy_store[soff];
             const T dx_bg = dvxdx_store[soff];
             const T dy_sc = ddvydy_store[soff];
             const T dx_sc = ddvxdx_store[soff];
-            grad_lamb[off] += (dy_bg + dx_bg) * (syy_v + sxx_v)
-                            + (dy_sc + dx_sc) * (dsyy_v + dsxx_v);
-            grad_dlamb[off] += (dy_bg + dx_bg) * (dsyy_v + dsxx_v);
-            grad_mu[off] += (T)2 * (dy_bg * syy_v + dx_bg * sxx_v
-                                  + dy_sc * dsyy_v + dx_sc * dsxx_v);
-            grad_dmu[off] += (T)2 * (dy_bg * dsyy_v + dx_bg * dsxx_v);
+            grad_lamb[off] += scale * ((dy_bg + dx_bg) * (syy_v + sxx_v)
+                                     + (dy_sc + dx_sc) * (dsyy_v + dsxx_v));
+            grad_dlamb[off] += scale * ((dy_bg + dx_bg) * (dsyy_v + dsxx_v));
+            grad_mu[off] += scale * (T)2 * (dy_bg * syy_v + dx_bg * sxx_v
+                                          + dy_sc * dsyy_v + dx_sc * dsxx_v);
+            grad_dmu[off] += scale * (T)2 * (dy_bg * dsyy_v + dx_bg * dsxx_v);
         }
         const long yx = (long)y * nx + x;
         const T lam_v = lamb_s[yx];
@@ -1270,11 +1272,11 @@ __global__ void born_adjoint_stress_kernel(
             const long off_p = off + (long)(k - 1) * nx;
             const int ym = y - k, yp = y + k - 1;
             dy += c[k - 1] *
-                  (dtv * ((T)1 + byh[ym]) * by_s[off_m] * l_vy[off_m] +
-                       dtv * ((T)1 + byh[ym]) * dby_s[off_m] * l_dvy[off_m] +
+                  (dtv * ((T)1 + byh[ym]) * by_s[off_m - off_s] * l_vy[off_m] +
+                       dtv * ((T)1 + byh[ym]) * dby_s[off_m - off_s] * l_dvy[off_m] +
                        byh[ym] * m_syyy_old[off_m] -
-                   (dtv * ((T)1 + byh[yp]) * by_s[off_p] * l_vy[off_p] +
-                       dtv * ((T)1 + byh[yp]) * dby_s[off_p] * l_dvy[off_p] +
+                   (dtv * ((T)1 + byh[yp]) * by_s[off_p - off_s] * l_vy[off_p] +
+                       dtv * ((T)1 + byh[yp]) * dby_s[off_p - off_s] * l_dvy[off_p] +
                        byh[yp] * m_syyy_old[off_p]));
         }
         l_syy[off] += dy * rdy;
@@ -1285,9 +1287,9 @@ __global__ void born_adjoint_stress_kernel(
             const long off_p = off + (long)(k - 1) * nx;
             const int ym = y - k, yp = y + k - 1;
             ddy += c[k - 1] *
-                   (dtv * ((T)1 + byh[ym]) * by_s[off_m] * l_dvy[off_m] +
+                   (dtv * ((T)1 + byh[ym]) * by_s[off_m - off_s] * l_dvy[off_m] +
                        byh[ym] * dm_syyy_old[off_m] -
-                    (dtv * ((T)1 + byh[yp]) * by_s[off_p] * l_dvy[off_p] +
+                    (dtv * ((T)1 + byh[yp]) * by_s[off_p - off_s] * l_dvy[off_p] +
                        byh[yp] * dm_syyy_old[off_p]));
         }
         l_dsyy[off] += ddy * rdy;
@@ -1299,11 +1301,11 @@ __global__ void born_adjoint_stress_kernel(
             const long off_p = off + k - 1;
             const int xm = x - k, xp = x + k - 1;
             dx += c[k - 1] *
-                  (dtv * ((T)1 + bxh[xm]) * bx_s[off_m] * l_vx[off_m] +
-                       dtv * ((T)1 + bxh[xm]) * dbx_s[off_m] * l_dvx[off_m] +
+                  (dtv * ((T)1 + bxh[xm]) * bx_s[off_m - off_s] * l_vx[off_m] +
+                       dtv * ((T)1 + bxh[xm]) * dbx_s[off_m - off_s] * l_dvx[off_m] +
                        bxh[xm] * m_syxx_old[off_m] -
-                   (dtv * ((T)1 + bxh[xp]) * bx_s[off_p] * l_vx[off_p] +
-                       dtv * ((T)1 + bxh[xp]) * dbx_s[off_p] * l_dvx[off_p] +
+                   (dtv * ((T)1 + bxh[xp]) * bx_s[off_p - off_s] * l_vx[off_p] +
+                       dtv * ((T)1 + bxh[xp]) * dbx_s[off_p - off_s] * l_dvx[off_p] +
                        bxh[xp] * m_syxx_old[off_p]));
         }
         l_sxx[off] += dx * rdx;
@@ -1314,9 +1316,9 @@ __global__ void born_adjoint_stress_kernel(
             const long off_p = off + k - 1;
             const int xm = x - k, xp = x + k - 1;
             ddx += c[k - 1] *
-                   (dtv * ((T)1 + bxh[xm]) * bx_s[off_m] * l_dvx[off_m] +
+                   (dtv * ((T)1 + bxh[xm]) * bx_s[off_m - off_s] * l_dvx[off_m] +
                        bxh[xm] * dm_syxx_old[off_m] -
-                    (dtv * ((T)1 + bxh[xp]) * bx_s[off_p] * l_dvx[off_p] +
+                    (dtv * ((T)1 + bxh[xp]) * bx_s[off_p - off_s] * l_dvx[off_p] +
                        bxh[xp] * dm_syxx_old[off_p]));
         }
         l_dsxx[off] += ddx * rdx;
@@ -1328,10 +1330,10 @@ __global__ void born_adjoint_stress_kernel(
         const T sxy_v = l_sxy[off];
         const T dsxy_v = l_dsxy[off];
         if (t % interval == 0) {
-            const long soff = (((long)(t / interval) * n_shots + s) * ny + y) * nx + x;
-            grad_mu_yx[off] += dtv * sxy_v * dvxy_store[soff]
-                             + dtv * dsxy_v * ddvxy_store[soff];
-            grad_dmu_yx[off] += dtv * dsxy_v * dvxy_store[soff];
+            const long soff = snap_off + ((long)s * ny + y) * nx + x;
+            grad_mu_yx[off] += scale * (dtv * sxy_v * dvxy_store[soff]
+                                      + dtv * dsxy_v * ddvxy_store[soff]);
+            grad_dmu_yx[off] += scale * (dtv * dsxy_v * dvxy_store[soff]);
         }
         const long yx = (long)y * nx + x;
         const T mu_yx_v = mu_yx_s[yx];
@@ -1350,11 +1352,11 @@ __global__ void born_adjoint_stress_kernel(
             const long off_p = off + (long)k * nx;
             const int ym = y - (k - 1), yp = y + k;
             dy += c[k - 1] *
-                  (dtv * ((T)1 + by[ym]) * bx_s[off_m] * l_vx[off_m] +
-                       dtv * ((T)1 + by[ym]) * dbx_s[off_m] * l_dvx[off_m] +
+                  (dtv * ((T)1 + by[ym]) * bx_s[off_m - off_s] * l_vx[off_m] +
+                       dtv * ((T)1 + by[ym]) * dbx_s[off_m - off_s] * l_dvx[off_m] +
                        by[ym] * m_syxy_old[off_m] -
-                   (dtv * ((T)1 + by[yp]) * bx_s[off_p] * l_vx[off_p] +
-                       dtv * ((T)1 + by[yp]) * dbx_s[off_p] * l_dvx[off_p] +
+                   (dtv * ((T)1 + by[yp]) * bx_s[off_p - off_s] * l_vx[off_p] +
+                       dtv * ((T)1 + by[yp]) * dbx_s[off_p - off_s] * l_dvx[off_p] +
                        by[yp] * m_syxy_old[off_p]));
         }
         l_sxy[off] += dy * rdy;
@@ -1365,9 +1367,9 @@ __global__ void born_adjoint_stress_kernel(
             const long off_p = off + (long)k * nx;
             const int ym = y - (k - 1), yp = y + k;
             ddy += c[k - 1] *
-                   (dtv * ((T)1 + by[ym]) * bx_s[off_m] * l_dvx[off_m] +
+                   (dtv * ((T)1 + by[ym]) * bx_s[off_m - off_s] * l_dvx[off_m] +
                        by[ym] * dm_syxy_old[off_m] -
-                    (dtv * ((T)1 + by[yp]) * bx_s[off_p] * l_dvx[off_p] +
+                    (dtv * ((T)1 + by[yp]) * bx_s[off_p - off_s] * l_dvx[off_p] +
                        by[yp] * dm_syxy_old[off_p]));
         }
         l_dsxy[off] += ddy * rdy;
@@ -1379,11 +1381,11 @@ __global__ void born_adjoint_stress_kernel(
             const long off_p = off + k;
             const int xm = x - k + 1, xp = x + k;
             dx += c[k - 1] *
-                  (dtv * ((T)1 + bx[xm]) * by_s[off_m] * l_vy[off_m] +
-                       dtv * ((T)1 + bx[xm]) * dby_s[off_m] * l_dvy[off_m] +
+                  (dtv * ((T)1 + bx[xm]) * by_s[off_m - off_s] * l_vy[off_m] +
+                       dtv * ((T)1 + bx[xm]) * dby_s[off_m - off_s] * l_dvy[off_m] +
                        bx[xm] * m_syx_old[off_m] -
-                   (dtv * ((T)1 + bx[xp]) * by_s[off_p] * l_vy[off_p] +
-                       dtv * ((T)1 + bx[xp]) * dby_s[off_p] * l_dvy[off_p] +
+                   (dtv * ((T)1 + bx[xp]) * by_s[off_p - off_s] * l_vy[off_p] +
+                       dtv * ((T)1 + bx[xp]) * dby_s[off_p - off_s] * l_dvy[off_p] +
                        bx[xp] * m_syx_old[off_p]));
         }
         l_sxy[off] += dx * rdx;
@@ -1394,9 +1396,9 @@ __global__ void born_adjoint_stress_kernel(
             const long off_p = off + k;
             const int xm = x - k + 1, xp = x + k;
             ddx += c[k - 1] *
-                   (dtv * ((T)1 + bx[xm]) * by_s[off_m] * l_dvy[off_m] +
+                   (dtv * ((T)1 + bx[xm]) * by_s[off_m - off_s] * l_dvy[off_m] +
                        bx[xm] * dm_syx_old[off_m] -
-                    (dtv * ((T)1 + bx[xp]) * by_s[off_p] * l_dvy[off_p] +
+                    (dtv * ((T)1 + bx[xp]) * by_s[off_p - off_s] * l_dvy[off_p] +
                        bx[xp] * dm_syx_old[off_p]));
         }
         l_dsxy[off] += ddx * rdx;
@@ -1437,7 +1439,7 @@ void born_step_h(
     int64_t t, int64_t interval,
     int64_t pml_y0, int64_t pml_y1, int64_t pml_x0, int64_t pml_x1,
     int64_t fd_pad_y0, int64_t fd_pad_x0,
-    int64_t cq_batched, int64_t dcq_batched, int64_t store)
+    int64_t cq_batched, int64_t dcq_batched, int64_t store, int64_t snap_off)
 {
     const int n_shots = ey.size(0), ny = ey.size(1), nx = ey.size(2);
     CHECK_CONTIG(c);
@@ -1459,7 +1461,7 @@ void born_step_h(
             (int)t, (int)interval, n_shots, ny, nx,
             (int)pml_y0, (int)pml_y1, (int)pml_x0, (int)pml_x1,
             (int)fd_pad_y0, (int)fd_pad_x0,
-            (int)cq_batched, (int)dcq_batched, (int)store);
+            (int)cq_batched, (int)dcq_batched, (int)store, (int64_t)snap_off);
     });
 }
 
@@ -1480,7 +1482,7 @@ void born_step_e(
     int64_t pml_y0, int64_t pml_y1, int64_t pml_x0, int64_t pml_x1,
     int64_t fd_pad_y0, int64_t fd_pad_y1, int64_t fd_pad_x0, int64_t fd_pad_x1,
     int64_t ca_batched, int64_t cb_batched,
-    int64_t dca_batched, int64_t dcb_batched)
+    int64_t dca_batched, int64_t dcb_batched, int64_t store, int64_t snap_off)
 {
     const int n_shots = ey.size(0), ny = ey.size(1), nx = ey.size(2);
     CHECK_CONTIG(c);
@@ -1504,7 +1506,7 @@ void born_step_e(
             (int)pml_y0, (int)pml_y1, (int)pml_x0, (int)pml_x1,
             (int)fd_pad_y0, (int)fd_pad_y1, (int)fd_pad_x0, (int)fd_pad_x1,
             (int)ca_batched, (int)cb_batched,
-            (int)dca_batched, (int)dcb_batched);
+            (int)dca_batched, (int)dcb_batched, (int)store, (int64_t)snap_off);
     });
 }
 
@@ -1566,7 +1568,7 @@ void born_coeff_grad(
     torch::Tensor dEy_store, torch::Tensor dcurl_store,
     torch::Tensor grad_ca, torch::Tensor grad_cb,
     torch::Tensor grad_dca, torch::Tensor grad_dcb,
-    int64_t t, int64_t interval, double scale,
+    int64_t t, int64_t interval, double scale, int64_t snap_off,
     int64_t pml_y0, int64_t pml_y1, int64_t pml_x0, int64_t pml_x1,
     int64_t fd_pad_y0, int64_t fd_pad_y1, int64_t fd_pad_x0, int64_t fd_pad_x1)
 {
@@ -1578,7 +1580,7 @@ void born_coeff_grad(
             dEy_store.data_ptr<scalar_t>(), dcurl_store.data_ptr<scalar_t>(),
             grad_ca.data_ptr<scalar_t>(), grad_cb.data_ptr<scalar_t>(),
             grad_dca.data_ptr<scalar_t>(), grad_dcb.data_ptr<scalar_t>(),
-            (int)t, (int)interval, (scalar_t)scale, n_shots, ny, nx,
+            (int)t, (int)interval, (scalar_t)scale, (int64_t)snap_off, n_shots, ny, nx,
             (int)pml_y0, (int)pml_y1, (int)pml_x0, (int)pml_x1,
             (int)fd_pad_y0, (int)fd_pad_y1, (int)fd_pad_x0, (int)fd_pad_x1);
     });
@@ -1681,7 +1683,7 @@ void born_cq_grad(
     torch::Tensor dey_dy_store, torch::Tensor dey_dx_store,
     torch::Tensor ddey_dy_store, torch::Tensor ddey_dx_store,
     torch::Tensor grad_cq, torch::Tensor grad_dcq,
-    int64_t t, int64_t interval, double scale,
+    int64_t t, int64_t interval, double scale, int64_t snap_off,
     int64_t pml_y0, int64_t pml_y1, int64_t pml_x0, int64_t pml_x1,
     int64_t fd_pad_y0, int64_t fd_pad_y1, int64_t fd_pad_x0, int64_t fd_pad_x1)
 {
@@ -1693,7 +1695,7 @@ void born_cq_grad(
             dey_dy_store.data_ptr<scalar_t>(), dey_dx_store.data_ptr<scalar_t>(),
             ddey_dy_store.data_ptr<scalar_t>(), ddey_dx_store.data_ptr<scalar_t>(),
             grad_cq.data_ptr<scalar_t>(), grad_dcq.data_ptr<scalar_t>(),
-            (int)t, (int)interval, (scalar_t)scale, n_shots, ny, nx,
+            (int)t, (int)interval, (scalar_t)scale, (int64_t)snap_off, n_shots, ny, nx,
             (int)pml_y0, (int)pml_y1, (int)pml_x0, (int)pml_x1,
             (int)fd_pad_y0, (int)fd_pad_y1, (int)fd_pad_x0, (int)fd_pad_x1);
     });
@@ -1739,7 +1741,7 @@ void born_step_velocity(
     int64_t fd_pad_y0, int64_t fd_pad_y1, int64_t fd_pad_x0, int64_t fd_pad_x1,
     double rdy, double rdx, double dtv,
     int64_t t, int64_t interval,
-    int64_t model_batched, int64_t scatter_batched, int64_t store)
+    int64_t model_batched, int64_t scatter_batched, int64_t store, int64_t snap_off)
 {
     const int n_shots = vy.size(0), ny = vy.size(1), nx = vy.size(2);
     CHECK_CONTIG(c);
@@ -1765,7 +1767,7 @@ void born_step_velocity(
             (int)fd_pad_y0, (int)fd_pad_y1, (int)fd_pad_x0, (int)fd_pad_x1,
             (scalar_t)rdy, (scalar_t)rdx, (scalar_t)dtv,
             (int)t, (int)interval, n_shots, ny, nx,
-            (int)model_batched, (int)scatter_batched, (int)store);
+            (int)model_batched, (int)scatter_batched, (int)store, (int64_t)snap_off);
     });
 }
 
@@ -1788,7 +1790,7 @@ void born_step_stress(
     int64_t fd_pad_y0, int64_t fd_pad_y1, int64_t fd_pad_x0, int64_t fd_pad_x1,
     double rdy, double rdx, double dtv,
     int64_t t, int64_t interval,
-    int64_t model_batched, int64_t scatter_batched, int64_t store)
+    int64_t model_batched, int64_t scatter_batched, int64_t store, int64_t snap_off)
 {
     const int n_shots = vy.size(0), ny = vy.size(1), nx = vy.size(2);
     CHECK_CONTIG(c);
@@ -1816,7 +1818,7 @@ void born_step_stress(
             (int)fd_pad_y0, (int)fd_pad_y1, (int)fd_pad_x0, (int)fd_pad_x1,
             (scalar_t)rdy, (scalar_t)rdx, (scalar_t)dtv,
             (int)t, (int)interval, n_shots, ny, nx,
-            (int)model_batched, (int)scatter_batched, (int)store);
+            (int)model_batched, (int)scatter_batched, (int)store, (int64_t)snap_off);
     });
 }
 
@@ -1898,8 +1900,8 @@ void born_adjoint_velocity(
     torch::Tensor c,
     int64_t fd_pad_y0, int64_t fd_pad_y1, int64_t fd_pad_x0, int64_t fd_pad_x1,
     double rdy, double rdx, double dtv,
-    int64_t t, int64_t interval,
-    int64_t model_batched, int64_t scatter_batched)
+    int64_t t, int64_t interval, double scale,
+    int64_t model_batched, int64_t scatter_batched, int64_t snap_off)
 {
     const int n_shots = l_vy.size(0), ny = l_vy.size(1), nx = l_vy.size(2);
     CHECK_CONTIG(c);
@@ -1936,8 +1938,8 @@ void born_adjoint_velocity(
             c.data_ptr<scalar_t>(),
             (int)fd_pad_y0, (int)fd_pad_y1, (int)fd_pad_x0, (int)fd_pad_x1,
             (scalar_t)rdy, (scalar_t)rdx, (scalar_t)dtv,
-            (int)t, (int)interval, n_shots, ny, nx,
-            (int)model_batched, (int)scatter_batched);
+            (int)t, (int)interval, (scalar_t)scale, n_shots, ny, nx,
+            (int)model_batched, (int)scatter_batched, (int64_t)snap_off);
     });
 }
 
@@ -1967,8 +1969,8 @@ void born_adjoint_stress(
     torch::Tensor c,
     int64_t fd_pad_y0, int64_t fd_pad_y1, int64_t fd_pad_x0, int64_t fd_pad_x1,
     double rdy, double rdx, double dtv,
-    int64_t t, int64_t interval,
-    int64_t model_batched, int64_t scatter_batched)
+    int64_t t, int64_t interval, double scale,
+    int64_t model_batched, int64_t scatter_batched, int64_t snap_off)
 {
     const int n_shots = l_vy.size(0), ny = l_vy.size(1), nx = l_vy.size(2);
     CHECK_CONTIG(c);
@@ -2005,8 +2007,8 @@ void born_adjoint_stress(
             c.data_ptr<scalar_t>(),
             (int)fd_pad_y0, (int)fd_pad_y1, (int)fd_pad_x0, (int)fd_pad_x1,
             (scalar_t)rdy, (scalar_t)rdx, (scalar_t)dtv,
-            (int)t, (int)interval, n_shots, ny, nx,
-            (int)model_batched, (int)scatter_batched);
+            (int)t, (int)interval, (scalar_t)scale, n_shots, ny, nx,
+            (int)model_batched, (int)scatter_batched, (int64_t)snap_off);
     });
 }
 

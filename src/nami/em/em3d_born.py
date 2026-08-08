@@ -40,6 +40,7 @@ import torch
 
 from ..common.cfl import check_cfl
 from ..common.fd import check_accuracy, staggered_diff1_coeffs
+from ..common.pml import set_pml_width
 from ..common.storage import (
     SnapshotStorage,
     check_sample_steps,
@@ -47,14 +48,8 @@ from ..common.storage import (
     storage_plan,
 )
 from ..common.survey import extract_survey_3d
-from .em3d import (
-    EPS0,
-    MU0,
-    _compile_material_coefficients,
-    _normalize_component,
-    _set_em_pml_profiles_3d,
-    _set_pml_width,
-)
+from ._common import EPS0, MU0, _compile_material_coefficients
+from .em3d import _normalize_component, _set_em_pml_profiles_3d
 
 # Checkpoint state layout (saved at time t BEFORE step t): the em3d 18
 # followed by the scattered counterparts:
@@ -102,7 +97,8 @@ class BornEM3DFunc(torch.autograd.Function):
         if device.type == "cuda":
             torch.cuda.set_device(device)
         dtype = ca_p.dtype
-        n_shots, nz, ny, nx = ca_p.shape
+        n_shots = int(src_i.shape[0])
+        nz, ny, nx = ca_p.shape[-3:]
         n_src = src_i.shape[1]
         n_rec = rec_i.shape[1]
         n_bg_rec = bg_rec_i.shape[1]
@@ -470,7 +466,8 @@ class BornEM3DFunc(torch.autograd.Function):
         if device.type == "cuda":
             torch.cuda.set_device(device)
         dtype = ca_p.dtype
-        n_shots, nz, ny, nx = ca_p.shape
+        n_shots = int(src_i.shape[0])
+        nz, ny, nx = ca_p.shape[-3:]
         n_src, n_rec, n_bg_rec = (
             src_i.shape[1], rec_i.shape[1], bg_rec_i.shape[1],
         )
@@ -992,7 +989,7 @@ def em3d_born(
     if not isinstance(grid_spacing, (list, tuple)):
         grid_spacing = [float(grid_spacing)] * 3
     grid_spacing = [float(g) for g in grid_spacing]
-    pml_w = _set_pml_width(pml_width, 3)
+    pml_w = set_pml_width(pml_width, 3)
     fd_pad = [
         accuracy // 2, accuracy // 2 - 1,
         accuracy // 2, accuracy // 2 - 1,
@@ -1073,8 +1070,6 @@ def em3d_born(
     dcb_p = -cb_sq / dt * EPS0 * eps_sc_p - 0.5 * cb_sq * sig_sc_p
     if mu_scatter is not None:
         mu_sc_p = _pad_scatter(mu_scatter)
-        if mu_sc_p is None:
-            mu_sc_p = torch.zeros_like(mu_p)
         dcq_p = -cq_p * mu_sc_p / mu_p
     else:
         dcq_p = torch.zeros_like(cq_p)
@@ -1127,12 +1122,35 @@ def em3d_born(
     pml_z0, pml_z1 = fd_pad[0] + pml_w[0], nz - fd_pad[1] - pml_w[1]
     pml_y0, pml_y1 = fd_pad[2] + pml_w[2], ny - fd_pad[3] - pml_w[3]
     pml_x0, pml_x1 = fd_pad[4] + pml_w[4], nx - fd_pad[5] - pml_w[5]
-    ca_batched = 1 if ca_p.shape[0] == n_shots else 0
-    cb_batched = 1 if cb_p.shape[0] == n_shots else 0
-    cq_batched = 1 if cq_p.shape[0] == n_shots else 0
-    dca_batched = 1 if dca_p.shape[0] == n_shots else 0
-    dcb_batched = 1 if dcb_p.shape[0] == n_shots else 0
-    dcq_batched = 1 if dcq_p.shape[0] == n_shots else 0
+    # Batched flags from the *user* models (before pad), same contract as
+    # em3d / em2d_tm_born / scalar / elastic.
+    ca_batched = 1 if (
+        epsilon.ndim == 4 and epsilon.shape[0] == n_shots and n_shots > 1
+    ) else 0
+    cb_batched = 1 if (
+        sigma.ndim == 4 and sigma.shape[0] == n_shots and n_shots > 1
+    ) else 0
+    cq_batched = 1 if (
+        mu.ndim == 4 and mu.shape[0] == n_shots and n_shots > 1
+    ) else 0
+    dca_batched = 1 if (
+        epsilon_scatter is not None
+        and epsilon_scatter.ndim == 4
+        and epsilon_scatter.shape[0] == n_shots
+        and n_shots > 1
+    ) else 0
+    dcb_batched = 1 if (
+        sigma_scatter is not None
+        and sigma_scatter.ndim == 4
+        and sigma_scatter.shape[0] == n_shots
+        and n_shots > 1
+    ) else 0
+    dcq_batched = 1 if (
+        mu_scatter is not None
+        and mu_scatter.ndim == 4
+        and mu_scatter.shape[0] == n_shots
+        and n_shots > 1
+    ) else 0
 
     storage_mode = resolve_storage(storage)
     grad_stride = check_sample_steps(sample_steps)

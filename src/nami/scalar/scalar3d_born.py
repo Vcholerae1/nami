@@ -24,7 +24,7 @@ import torch
 
 from ..common.cfl import check_cfl
 from ..common.fd import diff1_coeffs, diff2_coeffs
-from ..common.pml import set_acoustic_pml_profiles
+from ..common.pml import set_acoustic_pml_profiles, set_pml_width
 from ..common.storage import (
     SnapshotStorage,
     check_sample_steps,
@@ -32,7 +32,6 @@ from ..common.storage import (
     storage_plan,
 )
 from ..common.survey import extract_survey_3d
-from .scalar3d import _set_pml_width
 
 # Checkpoint state layout for the Born wavefield (saved at t before step t):
 #   [0]  u[t % 3]         background field at time t
@@ -53,48 +52,6 @@ from .scalar3d import _set_pml_width
 #   [15] zeta_x_sc[t % 2] auxiliary memory (scattered, x)
 N_STATE = 16
 N_STREAMS = 2
-
-
-
-def _replicate_pad_3d(model, z0, z1, y0, y1, x0, x1, device, dtype):
-    """Replicate-pad ``[nz, ny, nx]``/``[n, nz, ny, nx]`` deterministically.
-
-    Produces exactly the values of ``F.pad(mode="replicate")`` (edge copies)
-    but builds the gradient from ``cat``/``expand`` (deterministic reductions)
-    instead of torch's atomicAdd-based ``replication_pad3d_backward`` CUDA
-    kernel, so gradients through the model padding are reproducible.
-    """
-    m = model.to(device=device, dtype=dtype)
-    if m.ndim == 3:
-        m = m[None]
-    if z0 or z1:
-        m = torch.cat(
-            [
-                m[:, :1].expand(-1, z0, -1, -1),
-                m,
-                m[:, -1:].expand(-1, z1, -1, -1),
-            ],
-            dim=1,
-        )
-    if y0 or y1:
-        m = torch.cat(
-            [
-                m[:, :, :1].expand(-1, -1, y0, -1),
-                m,
-                m[:, :, -1:].expand(-1, -1, y1, -1),
-            ],
-            dim=2,
-        )
-    if x0 or x1:
-        m = torch.cat(
-            [
-                m[:, :, :, :1].expand(-1, -1, -1, x0),
-                m,
-                m[:, :, :, -1:].expand(-1, -1, -1, x1),
-            ],
-            dim=3,
-        )
-    return m
 
 
 class Scalar3DBornFunc(torch.autograd.Function):
@@ -127,7 +84,9 @@ class Scalar3DBornFunc(torch.autograd.Function):
         if device.type == "cuda":
             torch.cuda.set_device(device)
         dtype = v_p.dtype
-        n_shots, nz, ny, nx = v_p.shape
+        # n_shots from survey, not model batch (shared [1, nz, ny, nx] ok).
+        n_shots = int(src_i.shape[0])
+        nz, ny, nx = v_p.shape[-3:]
         n_src = src_i.shape[1]
         n_rec = rec_i.shape[1]
         n_bg_rec = bg_rec_i.shape[1]
@@ -336,7 +295,9 @@ class Scalar3DBornFunc(torch.autograd.Function):
         az, bz, dbzdz, ay, by, dbydy, ax, bx, dbxdx = [
             p.contiguous() for p in ctx.profs
         ]
-        scale = 1.0
+        # integral sampling: each snapshot represents
+        # `grad_stride` time steps of the model-gradient integral.
+        scale = float(grad_stride)
         segments = ctx.segments
         if segments:
             # Checkpointed backward: per segment, restore the wavefield
@@ -485,6 +446,10 @@ class Scalar3DBornFunc(torch.autograd.Function):
                         t, n_shots, n_bg_rec, n_rec, nz_ny_nx,
                     )
 
+        if not ctx.v_batched:
+            grad_v = grad_v.sum(0, keepdim=True)
+        if not ctx.scatter_batched:
+            grad_scatter = grad_scatter.sum(0, keepdim=True)
         # 39 forward() inputs: 4 grads + 35 x None
         return (
             grad_v,
@@ -545,7 +510,7 @@ def scalar3d_born(
     grid_spacing = [float(g) for g in grid_spacing]
     if len(grid_spacing) != 3:
         raise ValueError("grid_spacing must be a scalar or length 3 [dz, dy, dx].")
-    pml_w = _set_pml_width(pml_width, 3)
+    pml_w = set_pml_width(pml_width, 3)
     fd_pad = [accuracy // 2] * 6
     device = v.device
     if device.type == "cuda":
@@ -575,27 +540,8 @@ def scalar3d_born(
         dtype,
         pad_modes=["replicate", "constant"],
     )
-    # deterministic replicate pad for the velocity model (see
-    # _replicate_pad_3d): same values as extract's F.pad, but a
-    # reproducible gradient through the model padding.
-    v_p = _replicate_pad_3d(
-        v,
-        fd_pad[0] + pml_w[0],
-        fd_pad[1] + pml_w[1],
-        fd_pad[2] + pml_w[2],
-        fd_pad[3] + pml_w[3],
-        fd_pad[4] + pml_w[4],
-        fd_pad[5] + pml_w[5],
-        device,
-        dtype,
-    )
-    # a model shared by several shots is replicated to [n_shots, ...]
-    # (the autograd graph then sums per-shot gradients back through the
-    # expand node). Without this, the kernels would propagate only shot 0.
-    if v_p.shape[0] == 1 and n_shots > 1:
-        v_p = v_p.expand(n_shots, -1, -1, -1)
-    if scatter_p.shape[0] == 1 and n_shots > 1:
-        scatter_p = scatter_p.expand(n_shots, -1, -1, -1)
+    # Shared models stay [1, nz, ny, nx]; kernels use *_batched=0 and
+    # backward sums per-shot grads (elastic/EM style).
     nz, ny, nx = v_p.shape[-3:]
     if max_vel is None:
         max_vel = float(v.detach().abs().max())
@@ -624,10 +570,7 @@ def scalar3d_born(
         amp = source_amplitudes.to(device=device, dtype=dtype)[:, :, :nt_inner]
         src_mask = src_i != -1
         src_i_masked = src_i.masked_fill(~src_mask, 0)
-        # per-shot v/scatter at each source (exact: [n_shots,
-        # nz*ny*nx] rows; flattening all shots into one row would gather
-        # shot 0's model for every shot and corrupt the source-scaling
-        # contribution to grad_v/grad_scatter).
+        # expand flat rows for gather only (not the full model into Func).
         v_flat = v_p.reshape(-1, nz * ny * nx).expand(n_shots, -1)
         sc_flat = scatter_p.reshape(-1, nz * ny * nx).expand(n_shots, -1)
         v_at_src = v_flat.gather(1, src_i_masked)

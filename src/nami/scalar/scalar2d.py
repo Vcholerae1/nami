@@ -18,7 +18,7 @@ import torch
 
 from ..common.cfl import check_cfl
 from ..common.fd import diff1_coeffs, diff2_coeffs
-from ..common.pml import set_acoustic_pml_profiles
+from ..common.pml import set_acoustic_pml_profiles, set_pml_width
 from ..common.storage import (
     SnapshotStorage,
     check_sample_steps,
@@ -48,7 +48,9 @@ class Scalar2DFunc(torch.autograd.Function):
         profs,           # [ay, by, dbydy, ax, bx, dbxdx]
         c1, c2,          # FD coefficient arrays (regular grid)
         rdy, rdx, rdy2, rdx2, dt2,
-        nt, pml_y0, pml_y1, pml_x0, pml_x1,
+        nt,
+        pml_y0, pml_y1, pml_x0, pml_x1,          # forward PML
+        pml_y0_b, pml_y1_b, pml_x0_b, pml_x1_b,  # backward PML
         v_batched, grad_stride, fd_pad,
         storage,         # SnapshotStorage or None (forward-only)
         ckpt_state,      # [n_ckpt, N_STATE, n_shots, ny, nx] or None
@@ -60,7 +62,10 @@ class Scalar2DFunc(torch.autograd.Function):
         if device.type == "cuda":
             torch.cuda.set_device(device)
         dtype = v_p.dtype
-        n_shots, ny, nx = v_p.shape
+        # n_shots from survey (sources), not model batch: shared [1, ny, nx]
+        # still runs n_shots wavefields (v_batched selects model slab 0).
+        n_shots = int(src_i.shape[0])
+        ny, nx = v_p.shape[-2:]
         n_src = src_i.shape[1]
         n_rec = rec_i.shape[1]
 
@@ -109,11 +114,15 @@ class Scalar2DFunc(torch.autograd.Function):
 
         ctx.ext = ext
         ctx.save_for_backward(v_p, f, src_i, rec_i, w_store, c1, c2)
+        ctx.n_shots = n_shots
         ctx.ny_nx = ny_nx
         ctx.rdy, ctx.rdx, ctx.rdy2, ctx.rdx2, ctx.dt2 = rdy, rdx, rdy2, rdx2, dt2
         ctx.nt = nt
         ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1 = (
             pml_y0, pml_y1, pml_x0, pml_x1,
+        )
+        ctx.pml_y0_b, ctx.pml_y1_b, ctx.pml_x0_b, ctx.pml_x1_b = (
+            pml_y0_b, pml_y1_b, pml_x0_b, pml_x1_b,
         )
         ctx.v_batched = v_batched
         ctx.grad_stride = grad_stride
@@ -160,7 +169,8 @@ class Scalar2DFunc(torch.autograd.Function):
         if device.type == "cuda":
             torch.cuda.set_device(device)
         dtype = v_p.dtype
-        n_shots, ny, nx = v_p.shape
+        n_shots = ctx.n_shots
+        ny, nx = v_p.shape[-2:]
         n_src, n_rec = src_i.shape[1], rec_i.shape[1]
         nt = ctx.nt
         grad_stride = ctx.grad_stride
@@ -169,6 +179,7 @@ class Scalar2DFunc(torch.autograd.Function):
         if grad_r is None:
             grad_r = torch.zeros(nt, n_shots, n_rec, device=device, dtype=dtype)
         grad_f = torch.zeros(nt, n_shots, n_src, device=device, dtype=dtype)
+        # Per-shot grads; summed below when the model is shared (not batched).
         grad_v = torch.zeros(n_shots, ny, nx, device=device, dtype=dtype)
 
         lam = [
@@ -181,7 +192,9 @@ class Scalar2DFunc(torch.autograd.Function):
         zeta_x = [torch.zeros_like(lam[0]) for _ in range(2)]
 
         ay, by, dbydy, ax, bx, dbxdx = [p.contiguous() for p in ctx.profs]
-        scale = 1.0
+        # integral sampling: each snapshot represents
+        # `grad_stride` time steps of the model-gradient integral.
+        scale = float(grad_stride)
         segments = ctx.segments
         if segments:
             # Checkpointed backward: per segment, restore the wavefield
@@ -237,6 +250,7 @@ class Scalar2DFunc(torch.autograd.Function):
                         ctx.rdy, ctx.rdx, ctx.rdy2, ctx.rdx2, t, grad_stride,
                         scale, ctx.dt2,
                         ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
+                        ctx.pml_y0_b, ctx.pml_y1_b, ctx.pml_x0_b, ctx.pml_x1_b,
                         ctx.v_batched, snap_off, ctx.fd_pad,
                     )
                     if n_rec > 0:
@@ -260,6 +274,7 @@ class Scalar2DFunc(torch.autograd.Function):
                     ctx.rdy, ctx.rdx, ctx.rdy2, ctx.rdx2, t, grad_stride, scale,
                     ctx.dt2,
                     ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
+                    ctx.pml_y0_b, ctx.pml_y1_b, ctx.pml_x0_b, ctx.pml_x1_b,
                     ctx.v_batched, snap_off, ctx.fd_pad,
                 )
                 if n_rec > 0:
@@ -267,15 +282,18 @@ class Scalar2DFunc(torch.autograd.Function):
                         lam[t % 3], grad_r, rec_i, t, n_shots, n_rec, ny_nx
                     )
 
-        # The storage is released when the autograd graph is garbage
-        # collected; it must outlive repeated backward calls, so it is not
-        # closed here.
+        # Shared model: sum per-shot grads to match v_p shape [1, ny, nx]
+        # (same contract as elastic2d / em2d_tm). Batched model keeps
+        # [n_shots, ...].
+        if not ctx.v_batched:
+            grad_v = grad_v.sum(0, keepdim=True)
+        # 28 forward() inputs: grad_v + grad_f + 26 x None
         return (
             grad_v,
             grad_f,      # grad w.r.t. pre-scaled f; scaled to amp in scalar2d()
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
-            None, None,
+            None, None, None, None, None, None,
         )
 
 
@@ -316,7 +334,7 @@ def scalar2d(
     if not isinstance(dx, (list, tuple)):
         dx = [float(dx)] * 2
     dx = [float(d) for d in dx]
-    pml_w = _set_pml_width(pml_width, 2)
+    pml_w = set_pml_width(pml_width, 2)
     fd_pad = [accuracy // 2] * 4
     device = v.device
     if device.type == "cuda":
@@ -345,6 +363,9 @@ def scalar2d(
         device,
         dtype,
     )
+    # Shared [ny, nx] / [1, ny, nx] models stay rank-1 in the batch dim;
+    # kernels index slab 0 (v_batched=0) while wavefields are n_shots-wide.
+    # Per-shot model grads are summed in backward (elastic/EM style).
     ny, nx = v_p.shape[-2:]
     max_vel = float(v.detach().abs().max())
     check_cfl(dx, dt, max_vel, "scalar2d")
@@ -357,7 +378,9 @@ def scalar2d(
         amp = source_amplitudes.to(device=device, dtype=dtype)[:, :, :nt_inner]
         src_mask = src_i != -1
         src_i_masked = src_i.masked_fill(~src_mask, 0)
-        v_flat = v_p.reshape(1, -1).expand(n_shots, -1)
+        # per-shot v at each source: expand the flat rows for gather only
+        # (not the full model into the Function).
+        v_flat = v_p.reshape(-1, ny * nx).expand(n_shots, -1)
         v_at_src = v_flat.gather(1, src_i_masked)
         f = (
             -amp.permute(2, 0, 1) * (v_at_src.unsqueeze(0) ** 2 * dt * dt)
@@ -373,6 +396,14 @@ def scalar2d(
     dt2 = float(dt) * float(dt)
     pml_y0, pml_y1 = fd_pad[0] + pml_w[0], ny - fd_pad[1] - pml_w[1]
     pml_x0, pml_x1 = fd_pad[2] + pml_w[2], nx - fd_pad[3] - pml_w[3]
+    # the backward pass widens the PML region by one fd_pad (forward
+    # boundary + fd_pad, clamped to n - fd_pad): the transpose of the
+    # forward PML stencil reads one cell further into the interior, so the
+    # adjoint CPML branch must cover those cells.
+    pml_y0_b = min(pml_y0 + fd_pad[0], ny - fd_pad[0])
+    pml_y1_b = max(pml_y0_b, pml_y1 - fd_pad[1])
+    pml_x0_b = min(pml_x0 + fd_pad[2], nx - fd_pad[2])
+    pml_x1_b = max(pml_x0_b, pml_x1 - fd_pad[3])
     v_batched = 1 if (v.ndim == 3 and v.shape[0] == n_shots and v.shape[0] > 1) else 0
 
     storage_mode = resolve_storage(storage)
@@ -399,7 +430,9 @@ def scalar2d(
     r = Scalar2DFunc.apply(
         v_p, f, src_i, rec_i, profs, c1, c2,
         rdy, rdx, rdy2, rdx2, dt2,
-        nt_inner, pml_y0, pml_y1, pml_x0, pml_x1,
+        nt_inner,
+        pml_y0, pml_y1, pml_x0, pml_x1,
+        pml_y0_b, pml_y1_b, pml_x0_b, pml_x1_b,
         v_batched, grad_stride, fd_pad[0],
         store_obj, ckpt_state, checkpoint_every, segments,
     )
@@ -408,12 +441,3 @@ def scalar2d(
     # so autograd users can call .backward() on `r` and get model grads via
     # the saved `v_p`; here we just return the receiver amplitudes).
     return r
-
-
-def _set_pml_width(pml_width, ndim):
-    if isinstance(pml_width, int):
-        return [pml_width] * (2 * ndim)
-    pml_width = list(pml_width)
-    if len(pml_width) != 2 * ndim:
-        raise ValueError(f"pml_width must be int or length {2 * ndim}.")
-    return pml_width

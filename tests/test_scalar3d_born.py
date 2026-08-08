@@ -237,3 +237,154 @@ def test_checkpoint_forward_and_gradient_parity():
             g_full.abs().max().item() + 1e-300
         )
         assert rel == 0.0, f"ckpt_steps={ckpt} grad rel err {rel}"
+
+
+def _multi_shot_survey(nz, ny, nx, nt, dtype):
+    srcs = torch.tensor(
+        [
+            [[nz // 2, ny // 2, nx // 2 - 2]],
+            [[nz // 2, ny // 2 - 2, nx // 2 + 2]],
+        ]
+    )
+    recs = torch.tensor(
+        [
+            [
+                [nz // 2, ny // 2, nx // 2 + 2],
+                [nz // 2, ny // 2 + 2, nx // 2],
+            ],
+            [
+                [nz // 2, ny // 2 - 3, nx // 2],
+                [nz // 2, ny // 2, nx // 2 - 3],
+            ],
+        ]
+    )
+    bg_recs = torch.tensor(
+        [
+            [
+                [nz // 2 - 2, ny // 2 - 2, nx // 2 - 2],
+                [nz // 2 + 2, ny // 2 + 2, nx // 2 + 2],
+            ],
+            [
+                [nz // 2 + 1, ny // 2 - 3, nx // 2 + 1],
+                [nz // 2 - 1, ny // 2 + 3, nx // 2 - 1],
+            ],
+        ]
+    )
+    amp = torch.zeros(2, 1, nt, dtype=dtype)
+    amp[0, 0, :3] = torch.tensor([1.0, -0.5, 0.2], dtype=dtype)
+    amp[1, 0, :3] = torch.tensor([0.7, 0.3, -0.1], dtype=dtype)
+    return srcs, recs, bg_recs, amp
+
+
+def test_multi_shot_shared_model():
+    """n_shots=2 shared v/scatter: Born fwd matches singles; grads are sums."""
+    dtype = torch.float64
+    c = build_case(
+        dtype=dtype, nz=10, ny=12, nx=12, nt=10, pml=3, device="cuda:0", seed=1
+    )
+    # Override near-PML defaults with interior multi-shot survey.
+    dev = c["device"]
+    nz, ny, nx = c["v"].shape
+    nt = c["nt"]
+    srcs, recs, bg_recs, amp = _multi_shot_survey(nz, ny, nx, nt, dtype)
+
+    def run(v, scatter, shot=None):
+        sl = slice(None) if shot is None else slice(shot, shot + 1)
+        return scalar3d_born(
+            v, scatter, c["grid_spacing"], c["dt"],
+            source_amplitudes=amp[sl].to(dev),
+            source_locations=srcs[sl].to(dev),
+            receiver_locations=recs[sl].to(dev),
+            bg_receiver_locations=bg_recs[sl].to(dev),
+            accuracy=2, pml_width=c["pml"], pml_freq=25.0, nt=nt,
+        )
+
+    v = c["v"].to(dev, dtype).requires_grad_(True)
+    sc = c["scatter"].to(dev, dtype).requires_grad_(True)
+    v0 = c["v"].to(dev, dtype).requires_grad_(True)
+    sc0 = c["scatter"].to(dev, dtype).requires_grad_(True)
+    v1 = c["v"].to(dev, dtype).requires_grad_(True)
+    sc1 = c["scatter"].to(dev, dtype).requires_grad_(True)
+    r, r_bg = run(v, sc)
+    r0, r0_bg = run(v0, sc0, 0)
+    r1, r1_bg = run(v1, sc1, 1)
+    assert r.shape == (nt, 2, 2) and r_bg.shape == (nt, 2, 2)
+    assert (r[:, 0].detach() - r0[:, 0].detach()).abs().max().item() == 0.0
+    assert (r[:, 1].detach() - r1[:, 0].detach()).abs().max().item() == 0.0
+    assert (r_bg[:, 0].detach() - r0_bg[:, 0].detach()).abs().max().item() == 0.0
+    assert (r_bg[:, 1].detach() - r1_bg[:, 0].detach()).abs().max().item() == 0.0
+    loss = r.square().sum() + r_bg.square().sum()
+    g_v, g_sc = torch.autograd.grad(loss, [v, sc])
+    g0_v, g0_sc = torch.autograd.grad(
+        r0.square().sum() + r0_bg.square().sum(), [v0, sc0]
+    )
+    g1_v, g1_sc = torch.autograd.grad(
+        r1.square().sum() + r1_bg.square().sum(), [v1, sc1]
+    )
+    for g, g0, g1, name in ((g_v, g0_v, g1_v, "v"), (g_sc, g0_sc, g1_sc, "scatter")):
+        rel = (g - (g0 + g1)).abs().max().item() / (
+            (g0 + g1).abs().max().item() + 1e-300
+        )
+        assert rel < 1e-12, f"shared-model grad_{name} rel err {rel}"
+
+
+def test_multi_shot_batched_model():
+    """n_shots=2 batched v/scatter: shot i uses slice i."""
+    dtype = torch.float64
+    c0 = build_case(
+        dtype=dtype, nz=10, ny=12, nx=12, nt=10, pml=3, device="cuda:0", seed=1
+    )
+    c1 = build_case(
+        dtype=dtype, nz=10, ny=12, nx=12, nt=10, pml=3, device="cuda:0", seed=2
+    )
+    dev = c0["device"]
+    nz, ny, nx = c0["v"].shape
+    nt = c0["nt"]
+    srcs, recs, bg_recs, amp = _multi_shot_survey(nz, ny, nx, nt, dtype)
+
+    def run(v, scatter, shot=None):
+        sl = slice(None) if shot is None else slice(shot, shot + 1)
+        return scalar3d_born(
+            v, scatter, c0["grid_spacing"], c0["dt"],
+            source_amplitudes=amp[sl].to(dev),
+            source_locations=srcs[sl].to(dev),
+            receiver_locations=recs[sl].to(dev),
+            bg_receiver_locations=bg_recs[sl].to(dev),
+            accuracy=2, pml_width=c0["pml"], pml_freq=25.0, nt=nt,
+        )
+
+    v_b = torch.stack([c0["v"], c1["v"]]).to(dev, dtype).requires_grad_(True)
+    sc_b = torch.stack([c0["scatter"], c1["scatter"]]).to(dev, dtype)
+    sc_b.requires_grad_(True)
+    v0 = c0["v"].to(dev, dtype).requires_grad_(True)
+    sc0 = c0["scatter"].to(dev, dtype).requires_grad_(True)
+    v1 = c1["v"].to(dev, dtype).requires_grad_(True)
+    sc1 = c1["scatter"].to(dev, dtype).requires_grad_(True)
+    r, r_bg = run(v_b, sc_b)
+    r0, r0_bg = run(v0, sc0, 0)
+    r1, r1_bg = run(v1, sc1, 1)
+    assert r.shape == (nt, 2, 2) and r_bg.shape == (nt, 2, 2)
+    for out, ref, name in (
+        (r[:, 0], r0[:, 0], "shot 0 fwd r"),
+        (r[:, 1], r1[:, 0], "shot 1 fwd r"),
+        (r_bg[:, 0], r0_bg[:, 0], "shot 0 fwd r_bg"),
+        (r_bg[:, 1], r1_bg[:, 0], "shot 1 fwd r_bg"),
+    ):
+        assert (out.detach() - ref.detach()).abs().max().item() == 0.0, name
+    loss = r.square().sum() + r_bg.square().sum()
+    g_v, g_sc = torch.autograd.grad(loss, [v_b, sc_b])
+    g0_v, g0_sc = torch.autograd.grad(
+        r0.square().sum() + r0_bg.square().sum(), [v0, sc0]
+    )
+    g1_v, g1_sc = torch.autograd.grad(
+        r1.square().sum() + r1_bg.square().sum(), [v1, sc1]
+    )
+    for gb, g0, g1, name in (
+        (g_v, g0_v, g1_v, "v"),
+        (g_sc, g0_sc, g1_sc, "scatter"),
+    ):
+        rel0 = (gb[0] - g0).abs().max().item() / (g0.abs().max().item() + 1e-300)
+        rel1 = (gb[1] - g1).abs().max().item() / (g1.abs().max().item() + 1e-300)
+        assert rel0 < 1e-12 and rel1 < 1e-12, (
+            f"batched-model grad_{name} rel err ({rel0}, {rel1})"
+        )

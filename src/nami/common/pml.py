@@ -12,6 +12,16 @@ import torch
 from .fd import DIFF1, check_accuracy
 
 
+def set_pml_width(pml_width: int | Sequence[int], ndim: int) -> list[int]:
+    """Normalise ``pml_width`` to a per-side list of length ``2 * ndim``."""
+    if isinstance(pml_width, int):
+        return [pml_width] * (2 * ndim)
+    pml_width = list(pml_width)
+    if len(pml_width) != 2 * ndim:
+        raise ValueError(f"pml_width must be int or length {2 * ndim}.")
+    return pml_width
+
+
 def set_acoustic_pml_profiles(
     pml_width: Sequence[int],
     fd_pad: Sequence[int],

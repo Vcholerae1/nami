@@ -3,11 +3,57 @@
 Survey conventions: models are edge-padded by ``(fd_pad + pml_width)``
 on each side and locations become flat indices into the padded grid
 (-1 = "ignored").
+
+``"replicate"`` padding is built with ``cat``/``expand`` instead of
+``F.pad``: same values, but a deterministic backward (torch's
+``replication_pad*_backward`` CUDA kernels accumulate with atomicAdd in a
+nondeterministic order, which makes model gradients irreproducible at the
+ULP level).
 """
 
 from collections.abc import Sequence
 
 import torch
+
+
+def is_shot_batched(model, n_shots, spatial_ndim=2):
+    """True if ``model`` is an explicit per-shot batch.
+
+    A tensor is shot-batched when its leading dim is ``n_shots > 1`` and
+    ``ndim == spatial_ndim + 1``.  ``None`` and shared shapes
+    (``[…spatial]`` or ``[1, …spatial]``) are not batched.
+    """
+    if model is None:
+        return False
+    return (
+        model.ndim == spatial_ndim + 1
+        and model.shape[0] == n_shots
+        and n_shots > 1
+    )
+
+
+def check_model_batching(models, names, n_shots, spatial_ndim=2):
+    """Require a uniform shot-batch form within a multi-parameter group.
+
+    Some kernels take a single ``*_batched`` flag for several models (e.g.
+    elastic ``lamb``/``mu``/``buoyancy``).  Mixing a batched tensor with a
+    shared one would index the shared slab at ``s ≥ 1`` (OOB).  ``None``
+    counts as shared (defaults to zeros of the background form).
+
+    Call this on the *user* tensors before pad, never on padded buffers.
+    """
+    flags = [is_shot_batched(m, n_shots, spatial_ndim) for m in models]
+    if any(flags) and not all(flags):
+        parts = []
+        for name, m in zip(names, models, strict=True):
+            if m is None:
+                parts.append(f"{name} None (shared zeros)")
+            else:
+                parts.append(f"{name} {tuple(m.shape)}")
+        raise ValueError(
+            "models must be all shared ([spatial]/[1, spatial] or None) "
+            f"or all batched ([n_shots, spatial]); got {', '.join(parts)}."
+        )
 
 
 def extract_survey_2d(
@@ -28,11 +74,19 @@ def extract_survey_2d(
     (``"replicate"`` or ``"constant"``) for each model; it defaults to
     ``"replicate"`` for all (matching the scatter padding, which is
     constant/zero).
+
+    Batched models must have batch size 1 (shared) or ``n_shots``; any
+    other batch size raises ``ValueError``.
     """
     spatial = tuple(models[0].shape[-2:])
-    for m in models:
+    for i, m in enumerate(models):
         if tuple(m.shape[-2:]) != spatial:
             raise ValueError("All models must have the same spatial shape.")
+        if m.ndim == 3 and m.shape[0] not in (1, n_shots):
+            raise ValueError(
+                f"models[{i}] batch size must be 1 (shared) or n_shots "
+                f"({n_shots}), got shape {tuple(m.shape)}."
+            )
 
     pad = [f + p for f, p in zip(fd_pad, pml_width, strict=False)]
     top, bottom, left, right = pad
@@ -74,13 +128,35 @@ def _pad_model_2d(
     """Pads a [ny, nx] or [1, ny, nx] model by [top, bottom, left, right].
 
     ``mode`` is ``"replicate"`` (edge replication) or ``"constant"``
-    (zero-filled, matching the scatter padding).
+    (zero-filled, matching the scatter padding).  ``"replicate"`` uses
+    ``cat``/``expand`` (deterministic backward); other modes fall through
+    to ``F.pad``.
     """
     if model.ndim not in (2, 3):
         raise ValueError(f"model must be 2D or 3D, got {model.ndim}D.")
     if model.ndim == 2:
         model = model[None]
     top, bottom, left, right = pad
+    if mode == "replicate":
+        if top or bottom:
+            model = torch.cat(
+                [
+                    model[:, :1].expand(-1, top, -1),
+                    model,
+                    model[:, -1:].expand(-1, bottom, -1),
+                ],
+                dim=1,
+            )
+        if left or right:
+            model = torch.cat(
+                [
+                    model[:, :, :1].expand(-1, -1, left),
+                    model,
+                    model[:, :, -1:].expand(-1, -1, right),
+                ],
+                dim=2,
+            )
+        return model
     if top or bottom:
         model = torch.nn.functional.pad(model, (0, 0, top, bottom), mode=mode)
     if left or right:
@@ -105,9 +181,14 @@ def extract_survey_3d(
     padded grid's row-major layout ``z * (ny*nx) + y * nx + x``.
     """
     spatial = tuple(models[0].shape[-3:])
-    for m in models:
+    for i, m in enumerate(models):
         if tuple(m.shape[-3:]) != spatial:
             raise ValueError("All models must have the same spatial shape.")
+        if m.ndim == 4 and m.shape[0] not in (1, n_shots):
+            raise ValueError(
+                f"models[{i}] batch size must be 1 (shared) or n_shots "
+                f"({n_shots}), got shape {tuple(m.shape)}."
+            )
 
     pad = [f + p for f, p in zip(fd_pad, pml_width, strict=False)]
     p0, p1, p2, p3, p4, p5 = pad
@@ -161,12 +242,41 @@ def _pad_model_3d(
 
     ``pad`` is ``[z0, z1, y0, y1, x0, x1]`` (matching the 3D survey
     convention); ``torch.nn.functional.pad`` wants the reverse order.
+    ``"replicate"`` uses ``cat``/``expand`` (deterministic backward);
+    other modes fall through to ``F.pad``.
     """
     if model.ndim not in (3, 4):
         raise ValueError(f"model must be 3D or batched 4D, got {model.ndim}D.")
     if model.ndim == 3:
         model = model[None]
     z0, z1, y0, y1, x0, x1 = pad
-    return torch.nn.functional.pad(
-        model, (x0, x1, y0, y1, z0, z1), mode=mode
-    )
+    if mode == "replicate":
+        if z0 or z1:
+            model = torch.cat(
+                [
+                    model[:, :1].expand(-1, z0, -1, -1),
+                    model,
+                    model[:, -1:].expand(-1, z1, -1, -1),
+                ],
+                dim=1,
+            )
+        if y0 or y1:
+            model = torch.cat(
+                [
+                    model[:, :, :1].expand(-1, -1, y0, -1),
+                    model,
+                    model[:, :, -1:].expand(-1, -1, y1, -1),
+                ],
+                dim=2,
+            )
+        if x0 or x1:
+            model = torch.cat(
+                [
+                    model[:, :, :, :1].expand(-1, -1, -1, x0),
+                    model,
+                    model[:, :, :, -1:].expand(-1, -1, -1, x1),
+                ],
+                dim=3,
+            )
+        return model
+    return torch.nn.functional.pad(model, (x0, x1, y0, y1, z0, z1), mode=mode)

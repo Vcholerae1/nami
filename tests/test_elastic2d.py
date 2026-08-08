@@ -8,6 +8,7 @@ the nami_elastic2d CUDA extension.
 
 import math
 
+import pytest
 import torch
 
 
@@ -264,11 +265,7 @@ def test_checkpoint_forward_and_gradient_parity():
         rel = (g - g_full).abs().max().item() / (
             g_full.abs().max().item() + 1e-300
         )
-        # Forward is bit-identical; the gradient can differ at the ULP level
-        # because torch's F.pad(mode="replicate") backward has a
-        # data-dependent CUDA race at the padded edge (reproducible in pure
-        # torch, unrelated to checkpointing). Observed max ~1e-39.
-        assert rel < 1e-30, f"ckpt_steps={ckpt} grad rel err {rel}"
+        assert rel == 0.0, f"ckpt_steps={ckpt} grad rel err {rel}"
 
 
 def test_checkpoint_parity_with_sampling_interval():
@@ -298,9 +295,7 @@ def test_checkpoint_parity_with_sampling_interval():
         rel = (g - g_full).abs().max().item() / (
             g_full.abs().max().item() + 1e-300
         )
-        # See test_checkpoint_forward_and_gradient_parity: F.pad replicate
-        # backward ULP nondeterminism, not a checkpointing issue.
-        assert rel < 1e-30, f"ckpt_steps={ckpt} grad rel err {rel}"
+        assert rel == 0.0, f"ckpt_steps={ckpt} grad rel err {rel}"
 
 
 def test_checkpoint_auto_selection():
@@ -323,7 +318,7 @@ def test_checkpoint_auto_selection():
     rel = (g_auto - g_full).abs().max().item() / (
         g_full.abs().max().item() + 1e-300
     )
-    assert rel < 1e-30, f"auto grad rel err {rel}"
+    assert rel == 0.0, f"auto grad rel err {rel}"
 
 
 def test_storage_false_is_forward_only():
@@ -378,3 +373,153 @@ def test_storage_sampling_interval_consistency():
     rel = (g1 - g2).abs().max().item() / (g1.abs().max().item() + 1e-300)
     print(f"sample_steps=2 model-grad rel err: {rel:.3e}")
     assert rel < 0.2, f"sample_steps=2 grad rel err {rel}"
+
+
+def _multi_shot_survey(ny, nx, nt, dtype):
+    """Two shots with distinct source/receiver locations and amplitudes."""
+    srcs = torch.tensor([[[ny // 2, nx // 2 - 4]], [[ny // 2 - 3, nx // 2 + 4]]])
+    recs = torch.tensor(
+        [
+            [[ny // 2, nx // 2 + 3], [ny // 2 + 3, nx // 2]],
+            [[ny // 2 - 4, nx // 2], [ny // 2, nx // 2 - 5]],
+        ]
+    )
+    amp = torch.zeros(2, 1, nt, dtype=dtype)
+    amp[0, 0, :3] = torch.tensor([1.0, -0.5, 0.2], dtype=dtype)
+    amp[1, 0, :3] = torch.tensor([0.7, 0.3, -0.1], dtype=dtype)
+    return srcs, recs, amp
+
+
+def test_multi_shot_shared_model():
+    """n_shots=2 with shared [ny, nx] models: forward matches single-shot runs
+    and shared-model gradients are the sums of the single-shot gradients."""
+    from nami.elastic.elastic2d import elastic2d
+
+    dtype = torch.float64
+    c = build_case(
+        dtype=dtype, ny=24, nx=28, nt=12, pml=4, device="cuda:0", seed=1,
+        rec_offsets=(1, 1, 1),
+    )
+    dev = c["device"]
+    ny, nx = c["lamb"].shape
+    nt = c["nt"]
+    srcs, recs, amp = _multi_shot_survey(ny, nx, nt, dtype)
+
+    def run(lamb, mu, buoy, shot=None):
+        sl = slice(None) if shot is None else slice(shot, shot + 1)
+        return elastic2d(
+            lamb, mu, buoy, c["dx"], c["dt"],
+            source_amplitudes=amp[sl].to(dev),
+            source_locations=srcs[sl].to(dev),
+            receiver_locations=recs[sl].to(dev),
+            accuracy=2, pml_width=c["pml"], pml_freq=25.0, nt=nt,
+        )
+
+    params = {
+        "lamb": c["lamb"].to(dev, dtype),
+        "mu": c["mu"].to(dev, dtype),
+        "buoy": c["buoy"].to(dev, dtype),
+    }
+    p = {k: v.clone().requires_grad_(True) for k, v in params.items()}
+    p0 = {k: v.clone().requires_grad_(True) for k, v in params.items()}
+    p1 = {k: v.clone().requires_grad_(True) for k, v in params.items()}
+    r = run(p["lamb"], p["mu"], p["buoy"])
+    r0 = run(p0["lamb"], p0["mu"], p0["buoy"], 0)
+    r1 = run(p1["lamb"], p1["mu"], p1["buoy"], 1)
+    assert r.shape == (nt, 2, 2)
+    assert (r[:, 0].detach() - r0[:, 0].detach()).abs().max().item() == 0.0
+    assert (r[:, 1].detach() - r1[:, 0].detach()).abs().max().item() == 0.0
+    names = ("lamb", "mu", "buoy")
+    gs = torch.autograd.grad(r.square().sum(), [p[k] for k in names])
+    g0s = torch.autograd.grad(r0.square().sum(), [p0[k] for k in names])
+    g1s = torch.autograd.grad(r1.square().sum(), [p1[k] for k in names])
+    for g, g0, g1, name in zip(gs, g0s, g1s, names, strict=True):
+        rel = (g - (g0 + g1)).abs().max().item() / (
+            (g0 + g1).abs().max().item() + 1e-300
+        )
+        print(f"elastic multi-shot shared-model grad_{name} rel err {rel:.3e}")
+        assert rel < 1e-12, f"shared-model grad_{name} rel err {rel}"
+
+
+def test_multi_shot_batched_model():
+    """n_shots=2 with batched [2, ny, nx] models: shot i uses slice i."""
+    from nami.elastic.elastic2d import elastic2d
+
+    dtype = torch.float64
+    c0 = build_case(
+        dtype=dtype, ny=24, nx=28, nt=12, pml=4, device="cuda:0", seed=1,
+        rec_offsets=(1, 1, 1),
+    )
+    c1 = build_case(
+        dtype=dtype, ny=24, nx=28, nt=12, pml=4, device="cuda:0", seed=2,
+        rec_offsets=(1, 1, 1),
+    )
+    dev = c0["device"]
+    ny, nx = c0["lamb"].shape
+    nt = c0["nt"]
+    srcs, recs, amp = _multi_shot_survey(ny, nx, nt, dtype)
+
+    def run(lamb, mu, buoy, shot=None):
+        sl = slice(None) if shot is None else slice(shot, shot + 1)
+        return elastic2d(
+            lamb, mu, buoy, c0["dx"], c0["dt"],
+            source_amplitudes=amp[sl].to(dev),
+            source_locations=srcs[sl].to(dev),
+            receiver_locations=recs[sl].to(dev),
+            accuracy=2, pml_width=c0["pml"], pml_freq=25.0, nt=nt,
+        )
+
+    lamb_b = torch.stack([c0["lamb"], c1["lamb"]]).to(dev, dtype).requires_grad_(True)
+    mu_b = torch.stack([c0["mu"], c1["mu"]]).to(dev, dtype).requires_grad_(True)
+    buoy_b = torch.stack([c0["buoy"], c1["buoy"]]).to(dev, dtype).requires_grad_(True)
+    lamb0 = c0["lamb"].to(dev, dtype).requires_grad_(True)
+    mu0 = c0["mu"].to(dev, dtype).requires_grad_(True)
+    buoy0 = c0["buoy"].to(dev, dtype).requires_grad_(True)
+    lamb1 = c1["lamb"].to(dev, dtype).requires_grad_(True)
+    mu1 = c1["mu"].to(dev, dtype).requires_grad_(True)
+    buoy1 = c1["buoy"].to(dev, dtype).requires_grad_(True)
+    r = run(lamb_b, mu_b, buoy_b)
+    r0 = run(lamb0, mu0, buoy0, 0)
+    r1 = run(lamb1, mu1, buoy1, 1)
+    assert r.shape == (nt, 2, 2)
+    assert (r[:, 0].detach() - r0[:, 0].detach()).abs().max().item() == 0.0
+    assert (r[:, 1].detach() - r1[:, 0].detach()).abs().max().item() == 0.0
+    gs = torch.autograd.grad(r.square().sum(), [lamb_b, mu_b, buoy_b])
+    g0s = torch.autograd.grad(r0.square().sum(), [lamb0, mu0, buoy0])
+    g1s = torch.autograd.grad(r1.square().sum(), [lamb1, mu1, buoy1])
+    for gb, g0, g1, name in zip(gs, g0s, g1s, ("lamb", "mu", "buoy"), strict=True):
+        rel0 = (gb[0] - g0).abs().max().item() / (g0.abs().max().item() + 1e-300)
+        rel1 = (gb[1] - g1).abs().max().item() / (g1.abs().max().item() + 1e-300)
+        print(f"elastic multi-shot batched-model grad_{name} rel err "
+              f"({rel0:.3e}, {rel1:.3e})")
+        assert rel0 < 1e-12 and rel1 < 1e-12, (
+            f"batched-model grad_{name} rel err ({rel0}, {rel1})"
+        )
+
+
+def test_mixed_batch_models_raise():
+    """A batched lamb with shared mu/buoyancy raises ValueError: the kernel
+    selects the model slab with one flag for all three models, so mixed
+    batch forms would read a shared model out of bounds."""
+    from nami.elastic.elastic2d import elastic2d
+
+    dtype = torch.float64
+    c = build_case(
+        dtype=dtype, ny=24, nx=28, nt=12, pml=4, device="cuda:0", seed=1,
+        rec_offsets=(1, 1, 1),
+    )
+    dev = c["device"]
+    ny, nx = c["lamb"].shape
+    nt = c["nt"]
+    srcs, recs, amp = _multi_shot_survey(ny, nx, nt, dtype)
+    lamb_b = torch.stack([c["lamb"], c["lamb"]]).to(dev, dtype)
+    mu = c["mu"].to(dev, dtype)
+    buoy = c["buoy"].to(dev, dtype)
+    with pytest.raises(ValueError, match="all shared|all batched"):
+        elastic2d(
+            lamb_b, mu, buoy, c["dx"], c["dt"],
+            source_amplitudes=amp.to(dev),
+            source_locations=srcs.to(dev),
+            receiver_locations=recs.to(dev),
+            accuracy=2, pml_width=c["pml"], pml_freq=25.0, nt=nt,
+        )

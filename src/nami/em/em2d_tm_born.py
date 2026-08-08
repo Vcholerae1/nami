@@ -28,18 +28,16 @@ import nami_born_em_el as _ext
 import torch
 
 from ..common.fd import check_accuracy, staggered_diff1_coeffs
+from ..common.pml import set_pml_width
 from ..common.storage import (
+    SnapshotStorage,
     check_sample_steps,
     resolve_storage,
     storage_plan,
 )
 from ..common.survey import extract_survey_2d
-from .em2d_tm import (
-    EPS0,
-    _compile_material_coefficients,
-    _set_em_pml_profiles,
-    _set_pml_width,
-)
+from ._common import EPS0, _compile_material_coefficients
+from .em2d_tm import _set_em_pml_profiles
 
 # Checkpoint state layout (saved at time t before step t):
 #   [0] ey        background pre-update E field
@@ -74,7 +72,7 @@ class BornEMFunc(torch.autograd.Function):
         ca_batched, cb_batched, cq_batched,
         dca_batched, dcb_batched, dcq_batched,
         grad_stride,
-        storage,         # bool: snapshot storage enabled (backward-able)
+        storage,         # list of 8 SnapshotStorage or None
         ckpt_state,      # [n_ckpt, N_STATE, n_shots, ny, nx] or None
         checkpoint_every,  # 0 = full storage; N = checkpoint every N steps
         segments,        # [(s0, s1)] replay segments; [] = full storage
@@ -84,13 +82,14 @@ class BornEMFunc(torch.autograd.Function):
         if device.type == "cuda":
             torch.cuda.set_device(device)
         dtype = ca_p.dtype
-        n_shots, ny, nx = ca_p.shape
+        # n_shots from survey (sources); shared [1, ny, nx] models still run
+        # n_shots wavefields (*_batched selects model slab 0).
+        n_shots = int(src_i.shape[0])
+        ny, nx = ca_p.shape[-2:]
         n_src = src_i.shape[1]
         n_rec = rec_i.shape[1]
-        # The born kernels index the snapshot streams by t/grad_stride directly
-        # (no snap_off), so the streams always need full capacity.
-        n_snap = (nt + grad_stride - 1) // grad_stride
         ny_nx = ny * nx
+        shot_count = n_shots * ny_nx
 
         z = lambda *shape: torch.zeros(shape, device=device, dtype=dtype)  # noqa: E731
         ey, d_ey = z(n_shots, ny, nx), z(n_shots, ny, nx)
@@ -101,14 +100,17 @@ class BornEMFunc(torch.autograd.Function):
         dm_ey_z, dm_ey_x = z(n_shots, ny, nx), z(n_shots, ny, nx)
         dm_hx_z, dm_hz_x = z(n_shots, ny, nx), z(n_shots, ny, nx)
         r = z(nt, n_shots, n_rec)
-        ey_store = z(n_snap, n_shots, ny, nx)
-        curl_store = z(n_snap, n_shots, ny, nx)
-        d_ey_store = z(n_snap, n_shots, ny, nx)
-        dcurl_store = z(n_snap, n_shots, ny, nx)
-        dey_dy_store = z(n_snap, n_shots, ny, nx)
-        dey_dx_store = z(n_snap, n_shots, ny, nx)
-        ddey_dy_store = z(n_snap, n_shots, ny, nx)
-        ddey_dx_store = z(n_snap, n_shots, ny, nx)
+        if storage is not None:
+            (ey_store, curl_store, d_ey_store, dcurl_store,
+             dey_dy_store, dey_dx_store, ddey_dy_store, ddey_dx_store) = [
+                st.snap for st in storage
+            ]
+        else:
+            dummy = z(n_shots, ny, nx)
+            (ey_store, curl_store, d_ey_store, dcurl_store,
+             dey_dy_store, dey_dx_store, ddey_dy_store, ddey_dx_store) = (
+                dummy,
+            ) * 8
 
         ay, ayh, ax, axh, by, byh, bx, bxh, ky, kyh, kx, kxh = [
             p.contiguous() for p in profs
@@ -133,6 +135,12 @@ class BornEMFunc(torch.autograd.Function):
                 ckpt_state[k, 11].copy_(m_hz_x)
                 ckpt_state[k, 12].copy_(dm_hx_z)
                 ckpt_state[k, 13].copy_(dm_hz_x)
+            # Checkpointed forward skips global snapshot writes; replay
+            # regenerates segment-local snaps via snap_off.
+            store = 0 if segments else (1 if storage is not None else 0)
+            snap_off = (
+                storage[0].snap_offset(t // grad_stride) if store else 0
+            )
             ext.born_step_h(
                 cq_p, dcq_p, ey, d_ey, hx, hz, d_hx, d_hz,
                 m_ey_z, m_ey_x, dm_ey_z, dm_ey_x,
@@ -141,7 +149,7 @@ class BornEMFunc(torch.autograd.Function):
                 rdy, rdx, t, grad_stride,
                 pml_y0, pml_y1, pml_x0, pml_x1,
                 fd_pad[0], fd_pad[2],
-                cq_batched, dcq_batched, 1,
+                cq_batched, dcq_batched, store, snap_off,
             )
             ext.born_step_e(
                 ca_p, cb_p, dca_p, dcb_p,
@@ -153,6 +161,7 @@ class BornEMFunc(torch.autograd.Function):
                 pml_y0, pml_y1, pml_x0, pml_x1,
                 fd_pad[0], fd_pad[1], fd_pad[2], fd_pad[3],
                 ca_batched, cb_batched, dca_batched, dcb_batched,
+                store, snap_off,
             )
             if n_src > 0:
                 ext.born_inject(ey, d_ey, f_bg, f_sc, src_i, t, n_shots, n_src, ny_nx)
@@ -162,14 +171,16 @@ class BornEMFunc(torch.autograd.Function):
         ctx.save_for_backward(
             ca_p, cb_p, cq_p, dca_p, dcb_p, dcq_p, f_bg, f_sc,
             src_i, rec_i,
-            ey_store, curl_store, d_ey_store, dcurl_store,
-            dey_dy_store, dey_dx_store, ddey_dy_store, ddey_dx_store,
         )
         ctx.profs = profs
         ctx.c = c
         ctx.fd_pad = fd_pad
         ctx.rdy, ctx.rdx = rdy, rdx
         ctx.nt = nt
+        ctx.n_shots = n_shots
+        ctx.ny, ctx.nx, ctx.ny_nx = ny, nx, ny_nx
+        ctx.shot_count = shot_count
+        ctx.n_src, ctx.n_rec = n_src, n_rec
         ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1 = (
             pml_y0, pml_y1, pml_x0, pml_x1,
         )
@@ -197,14 +208,10 @@ class BornEMFunc(torch.autograd.Function):
                         ddey_dx_store,
                         ayh, byh, axh, bxh, kyh, kxh,
                         ay, by, ax, bx, ky, kx,
-                        ny_nx, s0, s1):
-        """Re-run forward steps [s0, s1), regenerating the snapshots.
-
-        The born kernels index the snapshot streams by t/grad_stride (global
-        offsets), so the regenerated snapshots land at the same offsets the
-        adjoint reads them from.
-        """
+                        ny_nx, shot_count, s0, s1):
+        """Re-run forward steps [s0, s1), writing segment-local snapshots."""
         for t in range(s0, s1):
+            snap_off = ((t - s0) // ctx.grad_stride) * shot_count
             ext.born_step_h(
                 cq_p, dcq_p, ey_f, d_ey_f, hx_f, hz_f, d_hx_f, d_hz_f,
                 m_ey_z_f, m_ey_x_f, dm_ey_z_f, dm_ey_x_f,
@@ -213,7 +220,7 @@ class BornEMFunc(torch.autograd.Function):
                 ctx.rdy, ctx.rdx, t, ctx.grad_stride,
                 ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
                 ctx.fd_pad[0], ctx.fd_pad[2],
-                ctx.cq_batched, ctx.dcq_batched, 1,
+                ctx.cq_batched, ctx.dcq_batched, 1, snap_off,
             )
             ext.born_step_e(
                 ca_p, cb_p, dca_p, dcb_p,
@@ -225,7 +232,7 @@ class BornEMFunc(torch.autograd.Function):
                 ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
                 ctx.fd_pad[0], ctx.fd_pad[1], ctx.fd_pad[2], ctx.fd_pad[3],
                 ctx.ca_batched, ctx.cb_batched,
-                ctx.dca_batched, ctx.dcb_batched,
+                ctx.dca_batched, ctx.dcb_batched, 1, snap_off,
             )
             if n_src > 0:
                 ext.born_inject(
@@ -235,22 +242,29 @@ class BornEMFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_r):
         ext = _ext
-        (ca_p, cb_p, cq_p, dca_p, dcb_p, dcq_p, f_bg, f_sc, src_i, rec_i,
-         ey_store, curl_store, d_ey_store, dcurl_store,
-         dey_dy_store, dey_dx_store, ddey_dy_store, ddey_dx_store) = ctx.saved_tensors
-        if not ctx.storage:
+        (ca_p, cb_p, cq_p, dca_p, dcb_p, dcq_p, f_bg, f_sc, src_i, rec_i) = (
+            ctx.saved_tensors
+        )
+        if ctx.storage is None:
             raise RuntimeError(
                 "em2d_tm_born backward() requires snapshot storage: run the "
                 "forward with an input requiring grad (and not under "
                 "torch.no_grad())."
             )
+        storage = ctx.storage
+        (ey_store, curl_store, d_ey_store, dcurl_store,
+         dey_dy_store, dey_dx_store, ddey_dy_store, ddey_dx_store) = [
+            st.snap for st in storage
+        ]
         device = ca_p.device
         if device.type == "cuda":
             torch.cuda.set_device(device)
         dtype = ca_p.dtype
-        n_shots, ny, nx = ca_p.shape
-        n_src, n_rec = src_i.shape[1], rec_i.shape[1]
-        nt, ny_nx = ctx.nt, ny * nx
+        n_shots = ctx.n_shots
+        ny, nx, ny_nx = ctx.ny, ctx.nx, ctx.ny_nx
+        n_src, n_rec = ctx.n_src, ctx.n_rec
+        nt = ctx.nt
+        shot_count = ctx.shot_count
 
         if grad_r is None:
             grad_r = torch.zeros(nt, n_shots, n_rec, device=device, dtype=dtype)
@@ -280,14 +294,17 @@ class BornEMFunc(torch.autograd.Function):
         ay, ayh, ax, axh, by, byh, bx, bxh, ky, kyh, kx, kxh = [
             p.contiguous() for p in ctx.profs
         ]
-        scale = 1.0
         grad_stride = ctx.grad_stride
+        # integral sampling: each snapshot represents
+        # `grad_stride` time steps of the model-gradient integral.
+        scale = float(grad_stride)
         segments = ctx.segments
         if segments:
             # Checkpointed backward: per segment, restore the wavefield
             # state, replay the forward steps to regenerate the snapshots,
             # then run the adjoint steps.  The adjoint state (lambda +
             # memory variables) carries across segments.
+            # Snapshots use snap_off (same layout as em2d_tm full-wave).
             ey_f, d_ey_f = z(n_shots, ny, nx), z(n_shots, ny, nx)
             hx_f, hz_f = z(n_shots, ny, nx), z(n_shots, ny, nx)
             d_hx_f, d_hz_f = z(n_shots, ny, nx), z(n_shots, ny, nx)
@@ -332,9 +349,10 @@ class BornEMFunc(torch.autograd.Function):
                     dey_dy_store, dey_dx_store, ddey_dy_store, ddey_dx_store,
                     ayh, byh, axh, bxh, kyh, kxh,
                     ay, by, ax, bx, ky, kx,
-                    ny_nx, s0, s1,
+                    ny_nx, shot_count, s0, s1,
                 )
                 for t in range(s1 - 1, s0 - 1, -1):
+                    snap_off = ((t - s0) // grad_stride) * shot_count
                     if n_rec > 0:
                         ext.born_record_grad_r(
                             lam_d_ey, grad_r, rec_i, t, n_shots, n_rec, ny_nx,
@@ -349,7 +367,7 @@ class BornEMFunc(torch.autograd.Function):
                             lam_ey, lam_d_ey, ey_store, curl_store,
                             d_ey_store, dcurl_store,
                             grad_ca, grad_cb, grad_dca, grad_dcb,
-                            t, grad_stride, scale,
+                            t, grad_stride, scale, snap_off,
                             ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
                             *ctx.fd_pad,
                         )
@@ -387,7 +405,7 @@ class BornEMFunc(torch.autograd.Function):
                             dey_dy_store, dey_dx_store, ddey_dy_store,
                             ddey_dx_store,
                             grad_cq, grad_dcq,
-                            t, grad_stride, scale,
+                            t, grad_stride, scale, snap_off,
                             ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
                             *ctx.fd_pad,
                         )
@@ -398,6 +416,7 @@ class BornEMFunc(torch.autograd.Function):
                     )
         else:
             for t in range(nt - 1, -1, -1):
+                snap_off = storage[0].snap_offset(t // grad_stride)
                 if n_rec > 0:
                     ext.born_record_grad_r(
                         lam_d_ey, grad_r, rec_i, t, n_shots, n_rec, ny_nx,
@@ -412,7 +431,7 @@ class BornEMFunc(torch.autograd.Function):
                         lam_ey, lam_d_ey, ey_store, curl_store,
                         d_ey_store, dcurl_store,
                         grad_ca, grad_cb, grad_dca, grad_dcb,
-                        t, grad_stride, scale,
+                        t, grad_stride, scale, snap_off,
                         ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
                         *ctx.fd_pad,
                     )
@@ -450,7 +469,7 @@ class BornEMFunc(torch.autograd.Function):
                         dey_dy_store, dey_dx_store, ddey_dy_store,
                         ddey_dx_store,
                         grad_cq, grad_dcq,
-                        t, grad_stride, scale,
+                        t, grad_stride, scale, snap_off,
                         ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
                         *ctx.fd_pad,
                     )
@@ -529,7 +548,7 @@ def em2d_tm_born(
     if not isinstance(grid_spacing, (list, tuple)):
         grid_spacing = [float(grid_spacing)] * 2
     grid_spacing = [float(g) for g in grid_spacing]
-    pml_w = _set_pml_width(pml_width, 2)
+    pml_w = set_pml_width(pml_width, 2)
     fd_pad = [accuracy // 2, accuracy // 2 - 1, accuracy // 2, accuracy // 2 - 1]
     device = epsilon.device
     if device.type == "cuda":
@@ -585,8 +604,6 @@ def em2d_tm_born(
     dcb_p = -cb_sq / dt * EPS0 * eps_sc_p - 0.5 * cb_sq * sig_sc_p
     if mu_scatter is not None:
         mu_sc_p = _pad_scatter(mu_scatter)
-        if mu_sc_p is None:
-            mu_sc_p = torch.zeros_like(mu_p)
         dcq_p = -cq_p * mu_sc_p / mu_p
     else:
         dcq_p = torch.zeros_like(cq_p)
@@ -628,12 +645,36 @@ def em2d_tm_born(
     rdy, rdx = 1.0 / grid_spacing[0], 1.0 / grid_spacing[1]
     pml_y0, pml_y1 = fd_pad[0] + pml_w[0], ny - fd_pad[1] - pml_w[1]
     pml_x0, pml_x1 = fd_pad[2] + pml_w[2], nx - fd_pad[3] - pml_w[3]
-    ca_batched = 1 if ca_p.shape[0] == n_shots else 0
-    cb_batched = 1 if cb_p.shape[0] == n_shots else 0
-    cq_batched = 1 if cq_p.shape[0] == n_shots else 0
-    dca_batched = 1 if dca_p.shape[0] == n_shots else 0
-    dcb_batched = 1 if dcb_p.shape[0] == n_shots else 0
-    dcq_batched = 1 if dcq_p.shape[0] == n_shots else 0
+    # Batched flags from the *user* models (before pad), same contract as
+    # em2d_tm / scalar / elastic: shared models stay rank-1 and kernels
+    # index slab 0; per-shot grads are summed in backward.
+    ca_batched = 1 if (
+        epsilon.ndim == 3 and epsilon.shape[0] == n_shots and n_shots > 1
+    ) else 0
+    cb_batched = 1 if (
+        sigma.ndim == 3 and sigma.shape[0] == n_shots and n_shots > 1
+    ) else 0
+    cq_batched = 1 if (
+        mu.ndim == 3 and mu.shape[0] == n_shots and n_shots > 1
+    ) else 0
+    dca_batched = 1 if (
+        epsilon_scatter is not None
+        and epsilon_scatter.ndim == 3
+        and epsilon_scatter.shape[0] == n_shots
+        and n_shots > 1
+    ) else 0
+    dcb_batched = 1 if (
+        sigma_scatter is not None
+        and sigma_scatter.ndim == 3
+        and sigma_scatter.shape[0] == n_shots
+        and n_shots > 1
+    ) else 0
+    dcq_batched = 1 if (
+        mu_scatter is not None
+        and mu_scatter.ndim == 3
+        and mu_scatter.shape[0] == n_shots
+        and n_shots > 1
+    ) else 0
 
     storage_mode = resolve_storage(storage)
     grad_stride = check_sample_steps(sample_steps)
@@ -645,15 +686,21 @@ def em2d_tm_born(
             source_amplitudes,
         )
     )
-    checkpoint_every, segments, _, n_ckpt = storage_plan(
+    checkpoint_every, segments, n_snap, n_ckpt = storage_plan(
         nt_inner, N_STATE, grad_stride, N_STREAMS, storage_enabled,
         ckpt_steps=ckpt_steps,
     )
+    stores = None
     ckpt_state = None
-    if n_ckpt > 0:
-        ckpt_state = torch.zeros(
-            n_ckpt, N_STATE, n_shots, ny, nx, device=device, dtype=dtype,
-        )
+    if storage_enabled:
+        stores = [
+            SnapshotStorage(_ext, n_snap, n_shots, ny, nx, dtype, device)
+            for _ in range(N_STREAMS)
+        ]
+        if n_ckpt > 0:
+            ckpt_state = torch.zeros(
+                n_ckpt, N_STATE, n_shots, ny, nx, device=device, dtype=dtype,
+            )
 
     r = BornEMFunc.apply(
         ca_p, cb_p, cq_p, dca_p, dcb_p, dcq_p, f_bg, f_sc,
@@ -663,6 +710,6 @@ def em2d_tm_born(
         ca_batched, cb_batched, cq_batched,
         dca_batched, dcb_batched, dcq_batched,
         grad_stride,
-        storage_enabled, ckpt_state, checkpoint_every, segments,
+        stores, ckpt_state, checkpoint_every, segments,
     )
     return r

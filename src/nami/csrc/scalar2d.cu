@@ -204,13 +204,14 @@ __global__ void step_adjoint_interior_kernel(
     T rdy, T rdx, T rdy2, T rdx2,
     int t, int interval, T scale, T dt2,
     int n_shots, int ny, int nx,
-    int pml_y0, int pml_y1, int pml_x0, int pml_x1,
+    // backward (widened) PML boundaries, not the forward ones
+    int pml_y0_b, int pml_y1_b, int pml_x0_b, int pml_x1_b,
     int v_batched, int64_t snap_off, int fd_pad)
 {
     const int s = blockIdx.z;
-    const int y = pml_y0 + blockIdx.y * blockDim.y + threadIdx.y;
-    const int x = pml_x0 + blockIdx.x * blockDim.x + threadIdx.x;
-    if (y >= 1 && x >= 1 && y < ny - 1 && x < nx - 1 && y < pml_y1 && x < pml_x1) {
+    const int y = pml_y0_b + blockIdx.y * blockDim.y + threadIdx.y;
+    const int x = pml_x0_b + blockIdx.x * blockDim.x + threadIdx.x;
+    if (y >= 1 && x >= 1 && y < ny - 1 && x < nx - 1 && y < pml_y1_b && x < pml_x1_b) {
         const int s_v = v_batched ? s : 0;
         const T* vs = v + (long)s_v * ny * nx;
         const long off = ((long)s * ny + y) * nx + x;
@@ -261,14 +262,15 @@ __global__ void step_adjoint_frame_kernel(
     T rdy, T rdx, T rdy2, T rdx2,
     int t, int interval, T scale, T dt2,
     int n_shots, int ny, int nx,
-    int pml_y0, int pml_y1, int pml_x0, int pml_x1,
+    // backward (widened) PML boundaries, not the forward ones
+    int pml_y0_b, int pml_y1_b, int pml_x0_b, int pml_x1_b,
     int v_batched, int64_t snap_off, int fd_pad)
 {
     const int s = blockIdx.z;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     // strictly interior cells are handled by step_adjoint_interior_kernel
-    if (y >= pml_y0 && y < pml_y1 && x >= pml_x0 && x < pml_x1)
+    if (y >= pml_y0_b && y < pml_y1_b && x >= pml_x0_b && x < pml_x1_b)
         return;
     if (y >= fd_pad && x >= fd_pad && y < ny - fd_pad && x < nx - fd_pad) {
         const int s_v = v_batched ? s : 0;
@@ -279,7 +281,7 @@ __global__ void step_adjoint_frame_kernel(
         T w_sum = (T)0;
 
         // y: transpose of the CPML-modified Laplacian acting on lam_next
-        if (y < pml_y0 || y >= pml_y1) {
+        if (y < pml_y0_b || y >= pml_y1_b) {
             T t1_sum = (T)0;
             T t2_sum = c2[0] * (((T)1 + by[y]) * (((T)1 + by[y]) * v2dt2 * lam_next[off] + by[y] * zeta_y[off]));
             T p_sum = (T)0;
@@ -315,7 +317,7 @@ __global__ void step_adjoint_frame_kernel(
             w_sum += wy * rdy2;
         }
         // x: same structure
-        if (x < pml_x0 || x >= pml_x1) {
+        if (x < pml_x0_b || x >= pml_x1_b) {
             T t1_sum = (T)0;
             T t2_sum = c2[0] * (((T)1 + bx[x]) * (((T)1 + bx[x]) * v2dt2 * lam_next[off] + bx[x] * zeta_x[off]));
             T p_sum = (T)0;
@@ -395,11 +397,11 @@ __global__ void record_grad_r_kernel(
         TORCH_CHECK(cudaGetLastError() == cudaSuccess, "nami scalar2d kernel failed"); \
     }
 
-#define LAUNCH_STEP_INTERIOR(KERN, T, ...)                                     \
+#define LAUNCH_STEP_INTERIOR(KERN, T, Y0, Y1, X0, X1, ...)                     \
     {                                                                          \
         dim3 block(16, 16);                                                    \
-        dim3 grid((pml_x1 - pml_x0 + 15) / 16, (pml_y1 - pml_y0 + 15) / 16, n_shots); \
-        if ((pml_y1 - pml_y0) > 0 && (pml_x1 - pml_x0) > 0)                    \
+        dim3 grid(((X1) - (X0) + 15) / 16, ((Y1) - (Y0) + 15) / 16, n_shots); \
+        if (((Y1) - (Y0)) > 0 && ((X1) - (X0)) > 0)                           \
             KERN<T><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(__VA_ARGS__); \
         TORCH_CHECK(cudaGetLastError() == cudaSuccess, "nami scalar2d interior kernel failed"); \
     }
@@ -418,11 +420,14 @@ void forward_step(
     int64_t pml_y0, int64_t pml_y1, int64_t pml_x0, int64_t pml_x1,
     int64_t v_batched, int64_t store, int64_t snap_off, int64_t fd_pad)
 {
-    const int n_shots = v.size(0), ny = v.size(1), nx = v.size(2);
+    // n_shots from the wavefield (survey), not v: a shared model is [1, ny, nx]
+    // while wavefields are [n_shots, ny, nx] (v_batched selects model slab 0).
+    const int n_shots = u_cur.size(0), ny = u_cur.size(1), nx = u_cur.size(2);
     CHECK_CONTIG(c1);
     CHECK_CONTIG(c2);
     if (v.scalar_type() == torch::kFloat32) {
         LAUNCH_STEP_INTERIOR(step_forward_interior_kernel, float,
+            pml_y0, pml_y1, pml_x0, pml_x1,
             v.data_ptr<float>(), u_cur.data_ptr<float>(), u_prev.data_ptr<float>(),
             u_new.data_ptr<float>(), w_store.data_ptr<float>(),
             c1.data_ptr<float>(), c2.data_ptr<float>(),
@@ -445,6 +450,7 @@ void forward_step(
             (int)v_batched, (int)store, (int64_t)snap_off, (int)fd_pad);
     } else {
         LAUNCH_STEP_INTERIOR(step_forward_interior_kernel, double,
+            pml_y0, pml_y1, pml_x0, pml_x1,
             v.data_ptr<double>(), u_cur.data_ptr<double>(), u_prev.data_ptr<double>(),
             u_new.data_ptr<double>(), w_store.data_ptr<double>(),
             c1.data_ptr<double>(), c2.data_ptr<double>(),
@@ -480,20 +486,30 @@ void adjoint_step(
     torch::Tensor c1, torch::Tensor c2,
     double rdy, double rdx, double rdy2, double rdx2,
     int64_t t, int64_t interval, double scale, double dt2,
-    int64_t pml_y0, int64_t pml_y1, int64_t pml_x0, int64_t pml_x1,
+    // forward PML boundaries (fd_pad + pml_width); unused by the adjoint
+    // launches, which run on the widened backward boundaries below — kept
+    // only to preserve the positional calling convention of the Python side
+    [[maybe_unused]] int64_t pml_y0, [[maybe_unused]] int64_t pml_y1,
+    [[maybe_unused]] int64_t pml_x0, [[maybe_unused]] int64_t pml_x1,
+    // backward PML boundaries (forward + fd_pad): the adjoint widens
+    // the PML region by one fd_pad because the transpose of the
+    // forward PML stencil reads one cell further into the interior.
+    int64_t pml_y0_b, int64_t pml_y1_b, int64_t pml_x0_b, int64_t pml_x1_b,
     int64_t v_batched, int64_t snap_off, int64_t fd_pad)
 {
-    const int n_shots = v.size(0), ny = v.size(1), nx = v.size(2);
+    // n_shots from the adjoint wavefield (survey), not v (see forward_step).
+    const int n_shots = lam_next.size(0), ny = lam_next.size(1), nx = lam_next.size(2);
     CHECK_CONTIG(c1);
     CHECK_CONTIG(c2);
     if (v.scalar_type() == torch::kFloat32) {
         LAUNCH_STEP_INTERIOR(step_adjoint_interior_kernel, float,
+            pml_y0_b, pml_y1_b, pml_x0_b, pml_x1_b,
             v.data_ptr<float>(), lam_next.data_ptr<float>(), lam_next2.data_ptr<float>(), lam_new.data_ptr<float>(),
             w_store.data_ptr<float>(), grad_v.data_ptr<float>(),
             c1.data_ptr<float>(), c2.data_ptr<float>(),
             (float)rdy, (float)rdx, (float)rdy2, (float)rdx2,
             (int)t, (int)interval, (float)scale, (float)dt2,
-            n_shots, ny, nx, (int)pml_y0, (int)pml_y1, (int)pml_x0, (int)pml_x1,
+            n_shots, ny, nx, (int)pml_y0_b, (int)pml_y1_b, (int)pml_x0_b, (int)pml_x1_b,
             (int)v_batched, (int64_t)snap_off, (int)fd_pad);
         LAUNCH_STEP(step_adjoint_frame_kernel, float,
             v.data_ptr<float>(), lam_next.data_ptr<float>(), lam_next2.data_ptr<float>(), lam_new.data_ptr<float>(),
@@ -506,16 +522,17 @@ void adjoint_step(
             c1.data_ptr<float>(), c2.data_ptr<float>(),
             (float)rdy, (float)rdx, (float)rdy2, (float)rdx2,
             (int)t, (int)interval, (float)scale, (float)dt2,
-            n_shots, ny, nx, (int)pml_y0, (int)pml_y1, (int)pml_x0, (int)pml_x1,
+            n_shots, ny, nx, (int)pml_y0_b, (int)pml_y1_b, (int)pml_x0_b, (int)pml_x1_b,
             (int)v_batched, (int64_t)snap_off, (int)fd_pad);
     } else {
         LAUNCH_STEP_INTERIOR(step_adjoint_interior_kernel, double,
+            pml_y0_b, pml_y1_b, pml_x0_b, pml_x1_b,
             v.data_ptr<double>(), lam_next.data_ptr<double>(), lam_next2.data_ptr<double>(), lam_new.data_ptr<double>(),
             w_store.data_ptr<double>(), grad_v.data_ptr<double>(),
             c1.data_ptr<double>(), c2.data_ptr<double>(),
             rdy, rdx, rdy2, rdx2,
             (int)t, (int)interval, scale, dt2,
-            n_shots, ny, nx, (int)pml_y0, (int)pml_y1, (int)pml_x0, (int)pml_x1,
+            n_shots, ny, nx, (int)pml_y0_b, (int)pml_y1_b, (int)pml_x0_b, (int)pml_x1_b,
             (int)v_batched, (int64_t)snap_off, (int)fd_pad);
         LAUNCH_STEP(step_adjoint_frame_kernel, double,
             v.data_ptr<double>(), lam_next.data_ptr<double>(), lam_next2.data_ptr<double>(), lam_new.data_ptr<double>(),
@@ -528,7 +545,7 @@ void adjoint_step(
             c1.data_ptr<double>(), c2.data_ptr<double>(),
             rdy, rdx, rdy2, rdx2,
             (int)t, (int)interval, scale, dt2,
-            n_shots, ny, nx, (int)pml_y0, (int)pml_y1, (int)pml_x0, (int)pml_x1,
+            n_shots, ny, nx, (int)pml_y0_b, (int)pml_y1_b, (int)pml_x0_b, (int)pml_x1_b,
             (int)v_batched, (int64_t)snap_off, (int)fd_pad);
     }
 }

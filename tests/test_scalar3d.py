@@ -210,8 +210,8 @@ def test_checkpoint_forward_and_gradient_parity():
             storage="auto", ckpt_steps=ckpt,
         )
         # padded model saved by the autograd Function (first saved tensor);
-        # its gradient is the adjoint model gradient without the (racy)
-        # replicate-padding backward, so it is bit-exact under checkpointing.
+        # its gradient is the adjoint model gradient upstream of the
+        # replicate-padding backward.
         v_p = out.grad_fn.saved_tensors[0]
         return out, v_p
 
@@ -231,15 +231,10 @@ def test_checkpoint_forward_and_gradient_parity():
             g_full.abs().max().item() + 1e-300
         )
         assert rel == 0.0, f"ckpt_steps={ckpt} grad rel err {rel}"
-        # The gradient w.r.t. the unpadded v flows through
-        # replication_pad3d_backward, whose CUDA kernel has no deterministic
-        # implementation (boundary cells accumulate with atomics), so it
-        # carries ~1-ulp run-to-run noise even for full storage.  A real
-        # checkpointing error would be orders of magnitude larger.
         rel_v = (g_v - g_v_full).abs().max().item() / (
             g_v_full.abs().max().item() + 1e-300
         )
-        assert rel_v <= 1e-12, f"ckpt_steps={ckpt} grad_v rel err {rel_v}"
+        assert rel_v == 0.0, f"ckpt_steps={ckpt} grad_v rel err {rel_v}"
 
 
 def test_stride_forward_traces_exact():
@@ -275,3 +270,110 @@ def test_storage_false_is_forward_only():
     except RuntimeError:
         return
     raise AssertionError("storage='none' backward should raise RuntimeError")
+
+
+def _multi_shot_survey(nz, ny, nx, nt, dtype):
+    """Two shots with distinct near-center sources/receivers."""
+    srcs = torch.tensor(
+        [
+            [[nz // 2, ny // 2, nx // 2 - 2]],
+            [[nz // 2, ny // 2 - 2, nx // 2 + 2]],
+        ]
+    )
+    recs = torch.tensor(
+        [
+            [
+                [nz // 2, ny // 2, nx // 2 + 2],
+                [nz // 2, ny // 2 + 2, nx // 2],
+            ],
+            [
+                [nz // 2, ny // 2 - 3, nx // 2],
+                [nz // 2, ny // 2, nx // 2 - 3],
+            ],
+        ]
+    )
+    amp = torch.zeros(2, 1, nt, dtype=dtype)
+    amp[0, 0, :3] = torch.tensor([1.0, -0.5, 0.2], dtype=dtype)
+    amp[1, 0, :3] = torch.tensor([0.7, 0.3, -0.1], dtype=dtype)
+    return srcs, recs, amp
+
+
+def test_multi_shot_shared_model():
+    """n_shots=2 shared [nz, ny, nx] model: fwd matches singles; grad is sum."""
+    dtype = torch.float64
+    c = build_case(
+        dtype=dtype, nz=12, ny=14, nx=16, nt=12, pml=3, device="cuda:0",
+        seed=1, near_pml=False,
+    )
+    dev = c["device"]
+    nz, ny, nx = c["v"].shape
+    nt = c["nt"]
+    srcs, recs, amp = _multi_shot_survey(nz, ny, nx, nt, dtype)
+
+    def run(v, shot=None):
+        sl = slice(None) if shot is None else slice(shot, shot + 1)
+        return scalar3d(
+            v, c["grid_spacing"], c["dt"],
+            source_amplitudes=amp[sl].to(dev),
+            source_locations=srcs[sl].to(dev),
+            receiver_locations=recs[sl].to(dev),
+            accuracy=2, pml_width=c["pml"], pml_freq=25.0, nt=nt,
+        )
+
+    v = c["v"].to(dev, dtype).requires_grad_(True)
+    v0 = c["v"].to(dev, dtype).requires_grad_(True)
+    v1 = c["v"].to(dev, dtype).requires_grad_(True)
+    r = run(v)
+    r0, r1 = run(v0, 0), run(v1, 1)
+    assert r.shape == (nt, 2, 2)
+    assert (r[:, 0].detach() - r0[:, 0].detach()).abs().max().item() == 0.0
+    assert (r[:, 1].detach() - r1[:, 0].detach()).abs().max().item() == 0.0
+    g = torch.autograd.grad(r.square().sum(), v)[0]
+    g0 = torch.autograd.grad(r0.square().sum(), v0)[0]
+    g1 = torch.autograd.grad(r1.square().sum(), v1)[0]
+    rel = (g - (g0 + g1)).abs().max().item() / (
+        (g0 + g1).abs().max().item() + 1e-300
+    )
+    assert rel < 1e-12, f"shared-model grad rel err {rel}"
+
+
+def test_multi_shot_batched_model():
+    """n_shots=2 batched [2, nz, ny, nx] model: slice i matches single-shot i."""
+    dtype = torch.float64
+    c0 = build_case(
+        dtype=dtype, nz=12, ny=14, nx=16, nt=12, pml=3, device="cuda:0",
+        seed=1, near_pml=False,
+    )
+    c1 = build_case(
+        dtype=dtype, nz=12, ny=14, nx=16, nt=12, pml=3, device="cuda:0",
+        seed=2, near_pml=False,
+    )
+    dev = c0["device"]
+    nz, ny, nx = c0["v"].shape
+    nt = c0["nt"]
+    srcs, recs, amp = _multi_shot_survey(nz, ny, nx, nt, dtype)
+
+    def run(v, shot=None):
+        sl = slice(None) if shot is None else slice(shot, shot + 1)
+        return scalar3d(
+            v, c0["grid_spacing"], c0["dt"],
+            source_amplitudes=amp[sl].to(dev),
+            source_locations=srcs[sl].to(dev),
+            receiver_locations=recs[sl].to(dev),
+            accuracy=2, pml_width=c0["pml"], pml_freq=25.0, nt=nt,
+        )
+
+    v_b = torch.stack([c0["v"], c1["v"]]).to(dev, dtype).requires_grad_(True)
+    v0 = c0["v"].to(dev, dtype).requires_grad_(True)
+    v1 = c1["v"].to(dev, dtype).requires_grad_(True)
+    r = run(v_b)
+    r0, r1 = run(v0, 0), run(v1, 1)
+    assert r.shape == (nt, 2, 2)
+    assert (r[:, 0].detach() - r0[:, 0].detach()).abs().max().item() == 0.0
+    assert (r[:, 1].detach() - r1[:, 0].detach()).abs().max().item() == 0.0
+    g = torch.autograd.grad(r.square().sum(), v_b)[0]
+    g0 = torch.autograd.grad(r0.square().sum(), v0)[0]
+    g1 = torch.autograd.grad(r1.square().sum(), v1)[0]
+    rel0 = (g[0] - g0).abs().max().item() / (g0.abs().max().item() + 1e-300)
+    rel1 = (g[1] - g1).abs().max().item() / (g1.abs().max().item() + 1e-300)
+    assert rel0 < 1e-12 and rel1 < 1e-12, f"batched grad rel ({rel0}, {rel1})"

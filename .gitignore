@@ -1,24 +1,19 @@
-# Build & install
+# Build (setuptools / torch CUDA extensions)
 build/
 dist/
 *.egg-info/
 .eggs/
 *.so
-*.pyd
 
-# Tooling / env
-.pixi/
-pixi.lock
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
+# Python / test / lint caches
 __pycache__/
 *.py[cod]
-.venv/
-venv/
+.pytest_cache/
+.ruff_cache/
 
-# Editor / OS
+# Local env (pixi); lock is machine/dev-specific — not tracked
+.pixi/
+pixi.lock
+
+# Editor
 .vscode/
-.idea/
-.DS_Store
-*.swp

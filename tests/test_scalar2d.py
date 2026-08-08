@@ -183,6 +183,7 @@ def test_checkpoint_forward_and_gradient_parity():
         rel = (g - g_full).abs().max().item() / (
             g_full.abs().max().item() + 1e-300
         )
+        # bit-exact: deterministic cat/expand replicate pad in survey.py
         assert rel == 0.0, f"ckpt_steps={ckpt} grad rel err {rel}"
 
 
@@ -270,3 +271,111 @@ def test_storage_false_is_forward_only():
     except RuntimeError:
         return
     raise AssertionError("storage='none' backward should raise RuntimeError")
+
+
+def _multi_shot_survey(ny, nx, nt, dtype):
+    """Two shots with distinct source/receiver locations and amplitudes."""
+    srcs = torch.tensor([[[ny // 2, nx // 2 - 4]], [[ny // 2 - 3, nx // 2 + 4]]])
+    recs = torch.tensor(
+        [
+            [[ny // 2, nx // 2 + 3], [ny // 2 + 3, nx // 2]],
+            [[ny // 2 - 4, nx // 2], [ny // 2, nx // 2 - 5]],
+        ]
+    )
+    amp = torch.zeros(2, 1, nt, dtype=dtype)
+    amp[0, 0, :3] = torch.tensor([1.0, -0.5, 0.2], dtype=dtype)
+    amp[1, 0, :3] = torch.tensor([0.7, 0.3, -0.1], dtype=dtype)
+    return srcs, recs, amp
+
+
+def test_multi_shot_shared_model():
+    """n_shots=2 with a shared [ny, nx] model: the forward matches the two
+    single-shot runs and the shared-model gradient is the sum of the two
+    single-shot gradients."""
+    dtype = torch.float64
+    c = build_case(
+        dtype=dtype, ny=24, nx=28, nt=12, pml=4, device="cuda:0", seed=1
+    )
+    dev = c["device"]
+    ny, nx = c["v"].shape
+    nt = c["nt"]
+    srcs, recs, amp = _multi_shot_survey(ny, nx, nt, dtype)
+
+    def run(v, shot=None):
+        sl = slice(None) if shot is None else slice(shot, shot + 1)
+        return scalar2d(
+            v, c["dx"], c["dt"],
+            source_amplitudes=amp[sl].to(dev),
+            source_locations=srcs[sl].to(dev),
+            receiver_locations=recs[sl].to(dev),
+            accuracy=2, pml_width=c["pml"], pml_freq=25.0, nt=nt,
+        )
+
+    v = c["v"].to(dev, dtype).requires_grad_(True)
+    v0 = c["v"].to(dev, dtype).requires_grad_(True)
+    v1 = c["v"].to(dev, dtype).requires_grad_(True)
+    r = run(v)
+    r0, r1 = run(v0, 0), run(v1, 1)
+    assert r.shape == (nt, 2, 2)
+    assert (r[:, 0].detach() - r0[:, 0].detach()).abs().max().item() == 0.0, (
+        "shot 0 fwd"
+    )
+    assert (r[:, 1].detach() - r1[:, 0].detach()).abs().max().item() == 0.0, (
+        "shot 1 fwd"
+    )
+    g = torch.autograd.grad(r.square().sum(), v)[0]
+    g0 = torch.autograd.grad(r0.square().sum(), v0)[0]
+    g1 = torch.autograd.grad(r1.square().sum(), v1)[0]
+    rel = (g - (g0 + g1)).abs().max().item() / (
+        (g0 + g1).abs().max().item() + 1e-300
+    )
+    print(f"multi-shot shared-model grad rel err {rel:.3e}")
+    assert rel < 1e-12, f"shared-model grad rel err {rel}"
+
+
+def test_multi_shot_batched_model():
+    """n_shots=2 with a batched [2, ny, nx] model: shot i uses model slice i
+    and slice i of the batched gradient matches the single-shot gradient."""
+    dtype = torch.float64
+    c0 = build_case(
+        dtype=dtype, ny=24, nx=28, nt=12, pml=4, device="cuda:0", seed=1
+    )
+    c1 = build_case(
+        dtype=dtype, ny=24, nx=28, nt=12, pml=4, device="cuda:0", seed=2
+    )
+    dev = c0["device"]
+    ny, nx = c0["v"].shape
+    nt = c0["nt"]
+    srcs, recs, amp = _multi_shot_survey(ny, nx, nt, dtype)
+
+    def run(v, shot=None):
+        sl = slice(None) if shot is None else slice(shot, shot + 1)
+        return scalar2d(
+            v, c0["dx"], c0["dt"],
+            source_amplitudes=amp[sl].to(dev),
+            source_locations=srcs[sl].to(dev),
+            receiver_locations=recs[sl].to(dev),
+            accuracy=2, pml_width=c0["pml"], pml_freq=25.0, nt=nt,
+        )
+
+    v_batch = torch.stack([c0["v"], c1["v"]]).to(dev, dtype).requires_grad_(True)
+    v0 = c0["v"].to(dev, dtype).requires_grad_(True)
+    v1 = c1["v"].to(dev, dtype).requires_grad_(True)
+    r = run(v_batch)
+    r0, r1 = run(v0, 0), run(v1, 1)
+    assert r.shape == (nt, 2, 2)
+    assert (r[:, 0].detach() - r0[:, 0].detach()).abs().max().item() == 0.0, (
+        "shot 0 fwd"
+    )
+    assert (r[:, 1].detach() - r1[:, 0].detach()).abs().max().item() == 0.0, (
+        "shot 1 fwd"
+    )
+    g = torch.autograd.grad(r.square().sum(), v_batch)[0]
+    g0 = torch.autograd.grad(r0.square().sum(), v0)[0]
+    g1 = torch.autograd.grad(r1.square().sum(), v1)[0]
+    rel0 = (g[0] - g0).abs().max().item() / (g0.abs().max().item() + 1e-300)
+    rel1 = (g[1] - g1).abs().max().item() / (g1.abs().max().item() + 1e-300)
+    print(f"multi-shot batched-model grad rel err ({rel0:.3e}, {rel1:.3e})")
+    assert rel0 < 1e-12 and rel1 < 1e-12, (
+        f"batched-model grad rel err ({rel0}, {rel1})"
+    )

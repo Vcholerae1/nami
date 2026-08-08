@@ -75,7 +75,7 @@ __global__ void step_adjoint_stress_kernel(
     const T* __restrict__ ax, const T* __restrict__ bx,
     const T* __restrict__ c,
     int fd_pad_y0, int fd_pad_y1, int fd_pad_x0, int fd_pad_x1,
-    T rdy, T rdx, T dtv,
+    T rdy, T rdx, T dtv, T scale,
     int t, int interval, int64_t snap_off, int n_shots, int ny, int nx,
     int pml_y0, int pml_y1, int pml_x0, int pml_x1,
     int model_batched)
@@ -105,9 +105,9 @@ __global__ void step_adjoint_stress_kernel(
             const long soff = snap_off + ((long)s * ny + y) * nx + x;
             const T dx_store = dvxdx_store[soff];
             const T dy_store = dvydy_store[soff];
-            grad_lamb[off] += (T)interval * (sxx_v + syy_v)
+            grad_lamb[off] += scale * (sxx_v + syy_v)
                               * (dx_store + dy_store);
-            grad_mu[off] += (T)interval * (T)2
+            grad_mu[off] += scale * (T)2
                             * (sxx_v * dx_store + syy_v * dy_store);
         }
         const T lam = lamb_s[(long)y * nx + x];
@@ -165,7 +165,7 @@ __global__ void step_adjoint_stress_kernel(
         const long off = off_s + (long)y * nx + x;
         const T sxy_v = l_sxy[off];
         if (t % interval == 0)
-            grad_mu_yx[off] += (T)interval * sxy_v
+            grad_mu_yx[off] += scale * sxy_v
                 * dvydx_plus_dvxdy_store[
                     snap_off + ((long)s * ny + y) * nx + x];
         const T mu_yx_v = mu_yx_s[(long)y * nx + x];
@@ -242,7 +242,7 @@ __global__ void step_adjoint_velocity_kernel(
     const T* __restrict__ ax, const T* __restrict__ bx,
     const T* __restrict__ c,
     int fd_pad_y0, int fd_pad_y1, int fd_pad_x0, int fd_pad_x1,
-    T rdy, T rdx, T dtv,
+    T rdy, T rdx, T dtv, T scale,
     int t, int interval, int64_t snap_off, int n_shots, int ny, int nx,
     int pml_y0, int pml_y1, int pml_x0, int pml_x1,
     int model_batched)
@@ -325,7 +325,7 @@ __global__ void step_adjoint_velocity_kernel(
             m_syx_new[off] = b_y * dtv * ax[x] * vy_new + ax[x] * m_syx_old[off];
         }
         if (t % interval == 0)
-            grad_buoyancy_y[off] += (T)interval * vy_new
+            grad_buoyancy_y[off] += scale * vy_new
                 * dvydbuoyancy_store[snap_off + ((long)s * ny + y) * nx + x];
     }
     // vx: y in [fd_pad_y0, ny-fd_pad_y1), x in [fd_pad_x0, nx-fd_pad_x0)
@@ -387,7 +387,7 @@ __global__ void step_adjoint_velocity_kernel(
             m_syxx_new[off] = b_x * dtv * axh[x] * vx_new + axh[x] * m_syxx_old[off];
         }
         if (t % interval == 0)
-            grad_buoyancy_x[off] += (T)interval * vx_new
+            grad_buoyancy_x[off] += scale * vx_new
                 * dvxdbuoyancy_store[snap_off + ((long)s * ny + y) * nx + x];
     }
 }
@@ -792,7 +792,7 @@ void step_adjoint_velocity(
     torch::Tensor axh, torch::Tensor bxh, torch::Tensor ax, torch::Tensor bx,
     torch::Tensor c,
     int64_t fd_pad_y0, int64_t fd_pad_y1, int64_t fd_pad_x0, int64_t fd_pad_x1,
-    double rdy, double rdx, double dtv,
+    double rdy, double rdx, double dtv, double scale,
     int64_t t, int64_t interval, int64_t snap_off, int64_t n_shots, int64_t ny, int64_t nx,
     int64_t model_batched,
     int64_t pml_y0, int64_t pml_y1, int64_t pml_x0, int64_t pml_x1)
@@ -820,7 +820,7 @@ void step_adjoint_velocity(
             axh.data_ptr<float>(), bxh.data_ptr<float>(), ax.data_ptr<float>(), bx.data_ptr<float>(),
             c.data_ptr<float>(), (int)fd_pad_y0, (int)fd_pad_y1,
             (int)fd_pad_x0, (int)fd_pad_x1,
-            (float)rdy, (float)rdx, (float)dtv,
+            (float)rdy, (float)rdx, (float)dtv, (float)scale,
             (int)t, (int)interval, (int64_t)snap_off, (int)n_shots, (int)ny, (int)nx,
             iy0, iy1, ix0, ix1,
             (int)model_batched);
@@ -842,7 +842,7 @@ void step_adjoint_velocity(
             axh.data_ptr<double>(), bxh.data_ptr<double>(), ax.data_ptr<double>(), bx.data_ptr<double>(),
             c.data_ptr<double>(), (int)fd_pad_y0, (int)fd_pad_y1,
             (int)fd_pad_x0, (int)fd_pad_x1,
-            rdy, rdx, dtv,
+            rdy, rdx, dtv, scale,
             (int)t, (int)interval, (int64_t)snap_off, (int)n_shots, (int)ny, (int)nx,
             iy0, iy1, ix0, ix1,
             (int)model_batched);
@@ -864,7 +864,7 @@ void step_adjoint_stress(
     torch::Tensor axh, torch::Tensor bxh, torch::Tensor ax, torch::Tensor bx,
     torch::Tensor c,
     int64_t fd_pad_y0, int64_t fd_pad_y1, int64_t fd_pad_x0, int64_t fd_pad_x1,
-    double rdy, double rdx, double dtv,
+    double rdy, double rdx, double dtv, double scale,
     int64_t t, int64_t interval, int64_t snap_off, int64_t n_shots, int64_t ny, int64_t nx,
     int64_t model_batched,
     int64_t pml_y0, int64_t pml_y1, int64_t pml_x0, int64_t pml_x1)
@@ -889,7 +889,7 @@ void step_adjoint_stress(
             axh.data_ptr<float>(), bxh.data_ptr<float>(), ax.data_ptr<float>(), bx.data_ptr<float>(),
             c.data_ptr<float>(), (int)fd_pad_y0, (int)fd_pad_y1,
             (int)fd_pad_x0, (int)fd_pad_x1,
-            (float)rdy, (float)rdx, (float)dtv,
+            (float)rdy, (float)rdx, (float)dtv, (float)scale,
             (int)t, (int)interval, (int64_t)snap_off, (int)n_shots, (int)ny, (int)nx,
             iy0, iy1, ix0, ix1,
             (int)model_batched);
@@ -910,7 +910,7 @@ void step_adjoint_stress(
             axh.data_ptr<double>(), bxh.data_ptr<double>(), ax.data_ptr<double>(), bx.data_ptr<double>(),
             c.data_ptr<double>(), (int)fd_pad_y0, (int)fd_pad_y1,
             (int)fd_pad_x0, (int)fd_pad_x1,
-            rdy, rdx, dtv,
+            rdy, rdx, dtv, scale,
             (int)t, (int)interval, (int64_t)snap_off, (int)n_shots, (int)ny, (int)nx,
             iy0, iy1, ix0, ix1,
             (int)model_batched);
@@ -1050,7 +1050,7 @@ void backward_step(
     torch::Tensor grad_f, torch::Tensor src_i,
     torch::Tensor grad_r, torch::Tensor rec_i,
     int64_t fd_pad_y0, int64_t fd_pad_y1, int64_t fd_pad_x0, int64_t fd_pad_x1,
-    double rdy, double rdx, double dtv,
+    double rdy, double rdx, double dtv, double scale,
     int64_t t, int64_t interval, int64_t snap_off,
     int64_t n_shots, int64_t ny, int64_t nx, int64_t ny_nx,
     int64_t n_src, int64_t n_rec,
@@ -1069,7 +1069,7 @@ void backward_step(
         dvydbuoyancy_store, dvxdbuoyancy_store,
         ayh, byh, ay, by, axh, bxh, ax, bx,
         c, fd_pad_y0, fd_pad_y1, fd_pad_x0, fd_pad_x1,
-        rdy, rdx, dtv, t, interval, snap_off, n_shots, ny, nx,
+        rdy, rdx, dtv, scale, t, interval, snap_off, n_shots, ny, nx,
         model_batched,
         pml_y0, pml_y1, pml_x0, pml_x1);
     step_adjoint_stress(
@@ -1081,7 +1081,7 @@ void backward_step(
         dvydy_store, dvxdx_store, dvydx_plus_dvxdy_store,
         ayh, byh, ay, by, axh, bxh, ax, bx,
         c, fd_pad_y0, fd_pad_y1, fd_pad_x0, fd_pad_x1,
-        rdy, rdx, dtv, t, interval, snap_off, n_shots, ny, nx,
+        rdy, rdx, dtv, scale, t, interval, snap_off, n_shots, ny, nx,
         model_batched,
         pml_y0, pml_y1, pml_x0, pml_x1);
     if (n_rec > 0)

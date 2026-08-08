@@ -14,8 +14,11 @@ requires-python = ">=3.12"
 license = "MIT"
 dependencies = [
     "torch>=2.1",
-    "numpy>=1.24",
+    "numpy>=1.24",  # unused by nami itself; keeps torch's NumPy init quiet at import
 ]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
 
 [tool.setuptools.package-dir]
 "" = "src"

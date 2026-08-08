@@ -5,6 +5,7 @@ forward outputs and ``backward`` gradients must match exactly, and a tiny
 FWI loop must reduce the data-misfit loss.
 """
 
+import pytest
 import torch
 
 
@@ -356,3 +357,152 @@ def test_em_fwi_converges():
             model.epsilon -= 1e-3 * ge / (ge.norm() + 1e-12)
     print("em FWI loss:", [f"{x:.3e}" for x in losses])
     assert losses[-1] < losses[0]
+
+
+def test_backward_writes_param_grad_scalar():
+    from nami.models import Scalar
+
+    c = _scalar_case()
+    dev = c["device"]
+    v = c["v"].to(dev)
+    amp = c["amp"].to(dev)
+    srcs, recs = c["srcs"].to(dev), c["recs"].to(dev)
+
+    model = Scalar(v.clone(), c["dx"], c["dt"], pml_width=c["pml"])
+    assert model.v.grad is None
+    rec = model.forward(amp, srcs, recs)
+    g = model.backward(rec.square().sum())
+    assert model.v.grad is not None
+    assert torch.equal(model.v.grad, g)
+
+
+def test_backward_writes_param_grad_elastic():
+    from nami.models import Elastic
+
+    c = _elastic_case()
+    dev = c["device"]
+    lamb = c["lamb"].to(dev)
+    mu = c["mu"].to(dev)
+    buoy = c["buoy"].to(dev)
+    amp = c["amp"].to(dev)
+    srcs, recs = c["srcs"].to(dev), c["recs"].to(dev)
+
+    model = Elastic(
+        lamb.clone(), mu.clone(), buoy.clone(), c["dx"], c["dt"],
+        pml_width=c["pml"],
+    )
+    rec = model.forward(amp, srcs, recs)
+    gl, gm, gb = model.backward(rec.square().sum())
+    assert torch.equal(model.lamb.grad, gl)
+    assert torch.equal(model.mu.grad, gm)
+    assert torch.equal(model.buoyancy.grad, gb)
+
+
+def test_backward_clears_stale_param_grad():
+    from nami.models import Elastic
+
+    c = _elastic_case()
+    dev = c["device"]
+    lamb = c["lamb"].to(dev)
+    mu = c["mu"].to(dev)
+    buoy = c["buoy"].to(dev)
+    amp = c["amp"].to(dev)
+    srcs, recs = c["srcs"].to(dev), c["recs"].to(dev)
+
+    model = Elastic(
+        lamb.clone(), mu.clone(), buoy.clone(), c["dx"], c["dt"],
+        pml_width=c["pml"],
+    )
+    rec = model.forward(amp, srcs, recs)
+    gl, gm, gb = model.backward(rec.square().sum())
+    assert model.mu.grad is not None
+
+    # Drop mu from the gradient set; the next backward must not leave the
+    # previous gradient on model.mu.grad.
+    model.mu.requires_grad_(False)
+    rec = model.forward(amp, srcs, recs)
+    gl2, gm2, gb2 = model.backward(rec.square().sum())
+    assert gm2 is None
+    assert model.mu.grad is None
+    assert torch.equal(model.lamb.grad, gl2)
+    assert torch.equal(model.buoyancy.grad, gb2)
+
+
+def test_adam_step_updates_parameters():
+    from nami.models import Scalar
+
+    c = _scalar_case()
+    dev = c["device"]
+    v = c["v"].to(dev)
+    amp = c["amp"].to(dev)
+    srcs, recs = c["srcs"].to(dev), c["recs"].to(dev)
+
+    model = Scalar(v.clone(), c["dx"], c["dt"], pml_width=c["pml"])
+    opt = torch.optim.Adam(model.parameters())
+    rec = model.forward(amp, srcs, recs)
+    model.backward(rec.square().sum())
+    v_before = model.v.detach().clone()
+    opt.step()
+    assert not torch.equal(model.v.detach(), v_before)
+
+
+def test_storage_none_forward_ok_backward_raises():
+    from nami.models import Scalar
+
+    c = _scalar_case()
+    dev = c["device"]
+    v = c["v"].to(dev)
+    amp = c["amp"].to(dev)
+    srcs, recs = c["srcs"].to(dev), c["recs"].to(dev)
+
+    model = Scalar(v.clone(), c["dx"], c["dt"], pml_width=c["pml"],
+                   storage="none")
+    rec = model.forward(amp, srcs, recs)
+    assert rec.shape == (c["nt"], 1, recs.shape[1])
+    with pytest.raises(RuntimeError):
+        model.backward(rec.square().sum())
+
+
+def test_ckpt_steps_matches_full_storage():
+    from nami.models import Scalar
+
+    c = _scalar_case()
+    dev = c["device"]
+    v = c["v"].to(dev)
+    amp = c["amp"].to(dev)
+    srcs, recs = c["srcs"].to(dev), c["recs"].to(dev)
+
+    grads = {}
+    for name, ckpt in (("full", 0), ("ckpt", 3)):
+        model = Scalar(v.clone(), c["dx"], c["dt"], pml_width=c["pml"],
+                       ckpt_steps=ckpt)
+        rec = model.forward(amp, srcs, recs)
+        grads[name] = model.backward(rec.square().sum())
+    torch.testing.assert_close(grads["ckpt"], grads["full"])
+
+
+def test_em3d_components():
+    from nami.em.em3d import em3d
+    from nami.models import EM3D
+
+    c = _em3d_case()
+    dev = c["device"]
+    eps = c["eps"].to(dev)
+    sig = c["sig"].to(dev)
+    mu = c["mu"].to(dev)
+    amp = c["amp"].to(dev)
+    srcs, recs = c["srcs"].to(dev), c["recs"].to(dev)
+
+    model = EM3D(eps.clone(), sig.clone(), mu.clone(), c["dx"], c["dt"],
+                 pml_width=c["pml"], source_component="ex",
+                 receiver_component="ez")
+    rec_cls = model.forward(amp, srcs, recs)
+    assert rec_cls.shape == (c["nt"], 1, recs.shape[1])
+
+    rec_fn = em3d(
+        eps.clone(), sig.clone(), mu.clone(), c["dx"], c["dt"],
+        source_amplitudes=amp, source_locations=srcs,
+        receiver_locations=recs, accuracy=2, pml_width=c["pml"], nt=c["nt"],
+        source_component="ex", receiver_component="ez",
+    )
+    assert torch.equal(rec_cls, rec_fn)

@@ -26,8 +26,8 @@
  * zero-padded coefficient array (max radius 4) and per-side FD padding
  * ``fd_pad = [accuracy // 2, accuracy // 2 - 1] * 3``.  Snapshots (six
  * streams: pre-update Ex/Ey/Ez and PML-modified curls) live in C++-owned
- * storage with device / pinned-cpu / disk offload and optional bf16
- * compression.
+ * GPU-resident storage (see storage.h); memory is controlled from the
+ * Python front end via checkpointing of the full wavefield state.
  */
 
 #include <torch/extension.h>

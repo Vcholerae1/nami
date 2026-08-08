@@ -33,23 +33,26 @@ Return convention: ``[nt, n_shots, n_rec]`` scattered pressure traces
 ``-(dsyy + dsxx) / 2``, matching elastic2d's pressure receivers.
 """
 
-import math
-
 import nami_born_em_el as _ext
 import nami_elastic2d as _storage_ext
 import torch
 
+from ..common.cfl import check_cfl
 from ..common.fd import check_accuracy, staggered_diff1_coeffs
+from ..common.pml import set_pml_width
 from ..common.storage import (
     SnapshotStorage,
     check_sample_steps,
     resolve_storage,
     storage_plan,
 )
-from ..common.survey import extract_survey_2d
+from ..common.survey import (
+    check_model_batching,
+    extract_survey_2d,
+    is_shot_batched,
+)
 from .elastic2d import (
     _set_elastic_pml_profiles,
-    _set_pml_width,
     lambmubuoyancy_to_vpvsrho,
     prepare_parameters,
 )
@@ -229,6 +232,9 @@ class BornElasticFunc(torch.autograd.Function):
                     dsyy, dsxx, r, rec_i, t, n_shots, n_rec, ny_nx,
                 )
             store = 0 if segments else (1 if storage is not None else 0)
+            snap_off = (
+                storage[0].snap_offset(t // grad_stride) if store else 0
+            )
             ext.born_step_velocity(
                 vy, vx, syy, sxx, sxy, dvy, dvx, dsyy, dsxx, dsxy,
                 m_sigmayyy, m_sigmaxyx, m_sigmaxyy, m_sigmaxxx,
@@ -238,7 +244,7 @@ class BornElasticFunc(torch.autograd.Function):
                 ayh, byh, ay, by, axh, bxh, ax, bx, c,
                 fd_pad_y0, fd_pad_y1, fd_pad_x0, fd_pad_x1,
                 rdy, rdx, dtv, t, grad_stride,
-                model_batched, scatter_batched, store,
+                model_batched, scatter_batched, store, snap_off,
             )
             ext.born_step_stress(
                 vy, vx, dvy, dvx, syy, sxx, sxy, dsyy, dsxx, dsxy,
@@ -250,7 +256,7 @@ class BornElasticFunc(torch.autograd.Function):
                 ayh, byh, ay, by, axh, bxh, ax, bx, c,
                 fd_pad_y0, fd_pad_y1, fd_pad_x0, fd_pad_x1,
                 rdy, rdx, dtv, t, grad_stride,
-                model_batched, scatter_batched, store,
+                model_batched, scatter_batched, store, snap_off,
             )
             if n_src > 0:
                 ext.born_inject_pressure(syy, sxx, f, src_i, t, n_shots, n_src, ny_nx)
@@ -298,6 +304,9 @@ class BornElasticFunc(torch.autograd.Function):
         dtype = lamb_p.dtype
         n_shots, ny, nx, ny_nx = ctx.n_shots, ctx.ny, ctx.nx, ctx.ny_nx
         nt, grad_stride = ctx.nt, ctx.grad_stride
+        # integral sampling: each snapshot represents
+        # `grad_stride` time steps of the model-gradient integral.
+        scale = float(grad_stride)
 
         if grad_r is None:
             grad_r = torch.zeros(nt, n_shots, ctx.n_rec, device=device, dtype=dtype)
@@ -337,10 +346,7 @@ class BornElasticFunc(torch.autograd.Function):
             # Checkpointed backward: per segment, restore the wavefield state,
             # replay the forward steps to regenerate the snapshots, then run
             # the adjoint steps.  The adjoint state carries across segments.
-            # The born kernels index the snapshot streams by ``t/grad_stride``,
-            # so the replay/adjoint calls use a segment-local time ``t - base``
-            # with ``base`` the first multiple of ``grad_stride`` >= s0; the
-            # record/inject/grad kernels keep the global ``t``.
+            # Snapshots use snap_off (same layout as elastic2d full-wave).
             f_vy, f_vx = z(n_shots, ny, nx), z(n_shots, ny, nx)
             f_dvy, f_dvx = z(n_shots, ny, nx), z(n_shots, ny, nx)
             f_syy, f_sxx, f_sxy = (
@@ -366,12 +372,9 @@ class BornElasticFunc(torch.autograd.Function):
                 f_dm_sigmayyy, f_dm_sigmaxyx, f_dm_sigmaxyy, f_dm_sigmaxxx,
             )
             ckpt = ctx.ckpt_state
+            shot_count = n_shots * ny * nx
             for k in range(len(segments) - 1, -1, -1):
                 s0, s1 = segments[k]
-                base = (
-                    s0 if s0 % grad_stride == 0
-                    else ((s0 // grad_stride) + 1) * grad_stride
-                )
                 if s0 > 0:
                     c = ckpt[k - 1]
                     for i, buf in enumerate(state_bufs):
@@ -381,7 +384,7 @@ class BornElasticFunc(torch.autograd.Function):
                         buf.zero_()
                 # replay the forward steps (regenerate the snapshots)
                 for t in range(s0, s1):
-                    t_step = t - base
+                    snap_off = ((t - s0) // grad_stride) * shot_count
                     ext.born_step_velocity(
                         f_vy, f_vx, f_syy, f_sxx, f_sxy,
                         f_dvy, f_dvx, f_dsyy, f_dsxx, f_dsxy,
@@ -391,8 +394,8 @@ class BornElasticFunc(torch.autograd.Function):
                         dvydb_store, dvxdb_store, ddvydb_store, ddvxdb_store,
                         ayh, byh, ay, by, axh, bxh, ax, bx, ctx.c,
                         ctx.fd_pad[0], ctx.fd_pad[1], ctx.fd_pad[2], ctx.fd_pad[3],
-                        ctx.rdy, ctx.rdx, ctx.dtv, t_step, grad_stride,
-                        ctx.model_batched, ctx.scatter_batched, 1,
+                        ctx.rdy, ctx.rdx, ctx.dtv, t, grad_stride,
+                        ctx.model_batched, ctx.scatter_batched, 1, snap_off,
                     )
                     ext.born_step_stress(
                         f_vy, f_vx, f_dvy, f_dvx,
@@ -404,8 +407,8 @@ class BornElasticFunc(torch.autograd.Function):
                         ddvydy_store, ddvxdx_store, ddvxy_store,
                         ayh, byh, ay, by, axh, bxh, ax, bx, ctx.c,
                         ctx.fd_pad[0], ctx.fd_pad[1], ctx.fd_pad[2], ctx.fd_pad[3],
-                        ctx.rdy, ctx.rdx, ctx.dtv, t_step, grad_stride,
-                        ctx.model_batched, ctx.scatter_batched, 1,
+                        ctx.rdy, ctx.rdx, ctx.dtv, t, grad_stride,
+                        ctx.model_batched, ctx.scatter_batched, 1, snap_off,
                     )
                     if ctx.n_src > 0:
                         ext.born_inject_pressure(
@@ -413,7 +416,7 @@ class BornElasticFunc(torch.autograd.Function):
                         )
                 # adjoint steps for the segment
                 for t in range(s1 - 1, s0 - 1, -1):
-                    t_step = t - base
+                    snap_off = ((t - s0) // grad_stride) * shot_count
                     parity = (nt - 1 - t) % 2
                     old = m_sig_b if parity else m_sig_a
                     new = m_sig_a if parity else m_sig_b
@@ -440,8 +443,8 @@ class BornElasticFunc(torch.autograd.Function):
                         ayh, byh, ay, by, axh, bxh, ax, bx,
                         ctx.c, ctx.fd_pad[0], ctx.fd_pad[1],
                         ctx.fd_pad[2], ctx.fd_pad[3],
-                        ctx.rdy, ctx.rdx, ctx.dtv, t_step, grad_stride,
-                        ctx.model_batched, ctx.scatter_batched,
+                        ctx.rdy, ctx.rdx, ctx.dtv, t, grad_stride, scale,
+                        ctx.model_batched, ctx.scatter_batched, snap_off,
                     )
                     ext.born_adjoint_stress(
                         buoyancy_y, buoyancy_x, dbuoyancy_y, dbuoyancy_x,
@@ -459,8 +462,8 @@ class BornElasticFunc(torch.autograd.Function):
                         ayh, byh, ay, by, axh, bxh, ax, bx,
                         ctx.c, ctx.fd_pad[0], ctx.fd_pad[1],
                         ctx.fd_pad[2], ctx.fd_pad[3],
-                        ctx.rdy, ctx.rdx, ctx.dtv, t_step, grad_stride,
-                        ctx.model_batched, ctx.scatter_batched,
+                        ctx.rdy, ctx.rdx, ctx.dtv, t, grad_stride, scale,
+                        ctx.model_batched, ctx.scatter_batched, snap_off,
                     )
                     if ctx.n_rec > 0:
                         ext.born_add_grad_r(
@@ -474,6 +477,7 @@ class BornElasticFunc(torch.autograd.Function):
                 new = m_sig_a if parity else m_sig_b
                 dold = dm_sig_b if parity else dm_sig_a
                 dnew = dm_sig_a if parity else dm_sig_b
+                snap_off = storage[0].snap_offset(t // grad_stride)
                 if ctx.n_src > 0:
                     ext.born_record_grad_f_p(
                         l_syy, l_sxx, grad_f, src_i, t, n_shots, ctx.n_src, ny_nx,
@@ -493,8 +497,8 @@ class BornElasticFunc(torch.autograd.Function):
                     dvydb_store, dvxdb_store, ddvydb_store, ddvxdb_store,
                     ayh, byh, ay, by, axh, bxh, ax, bx,
                     ctx.c, ctx.fd_pad[0], ctx.fd_pad[1], ctx.fd_pad[2], ctx.fd_pad[3],
-                    ctx.rdy, ctx.rdx, ctx.dtv, t, grad_stride,
-                    ctx.model_batched, ctx.scatter_batched,
+                    ctx.rdy, ctx.rdx, ctx.dtv, t, grad_stride, scale,
+                    ctx.model_batched, ctx.scatter_batched, snap_off,
                 )
                 ext.born_adjoint_stress(
                     buoyancy_y, buoyancy_x, dbuoyancy_y, dbuoyancy_x,
@@ -511,8 +515,8 @@ class BornElasticFunc(torch.autograd.Function):
                     ddvydy_store, ddvxdx_store, ddvxy_store,
                     ayh, byh, ay, by, axh, bxh, ax, bx,
                     ctx.c, ctx.fd_pad[0], ctx.fd_pad[1], ctx.fd_pad[2], ctx.fd_pad[3],
-                    ctx.rdy, ctx.rdx, ctx.dtv, t, grad_stride,
-                    ctx.model_batched, ctx.scatter_batched,
+                    ctx.rdy, ctx.rdx, ctx.dtv, t, grad_stride, scale,
+                    ctx.model_batched, ctx.scatter_batched, snap_off,
                 )
                 if ctx.n_rec > 0:
                     ext.born_add_grad_r(
@@ -588,7 +592,7 @@ def elastic2d_born(
     if not isinstance(grid_spacing, (list, tuple)):
         grid_spacing = [float(grid_spacing)] * 2
     grid_spacing = [float(g) for g in grid_spacing]
-    pml_w = _set_pml_width(pml_width, 2)
+    pml_w = set_pml_width(pml_width, 2)
     fd_pad = [accuracy // 2, accuracy // 2 - 1] * 2  # [1, 0, 1, 0]
     device = lamb.device
     if device.type == "cuda":
@@ -643,20 +647,7 @@ def elastic2d_born(
     # CFL condition and the PML grading.
     vp, vs, _ = lambmubuoyancy_to_vpvsrho(lamb, mu, buoyancy)
     max_vel = max(vp.abs().max().item(), vs.abs().max().item())
-    if max_vel == 0:  # empty model: no CFL restriction
-        max_dt = float("inf")
-    else:
-        max_dt = (
-            0.6
-            / math.sqrt(sum(1 / g**2 for g in grid_spacing))
-            / (max_vel**2 + 1e-15)
-        ) * max_vel
-    if math.ceil(abs(float(dt)) / max_dt) > 1:
-        raise NotImplementedError(
-            "nami elastic2d_born requires dt <= "
-            f"{max_dt:.3e} to satisfy the CFL condition (step_ratio=1); "
-            f"got dt={dt}."
-        )
+    check_cfl(grid_spacing, dt, max_vel, "elastic2d_born")
 
     profiles = _set_elastic_pml_profiles(
         pml_w,
@@ -704,8 +695,21 @@ def elastic2d_born(
         nt_inner, N_STATE, grad_stride, N_STREAMS, storage_enabled,
         ckpt_steps=ckpt_steps,
     )
-    model_batched = 1 if (lamb_p.ndim == 3 and lamb_p.shape[0] > 1) else 0
-    scatter_batched = 1 if (dlamb_p.ndim == 3 and dlamb_p.shape[0] > 1) else 0
+    # Batched flags from the *user* models (before pad).  Each flag governs
+    # its whole group; None scatter counts as shared zeros.
+    check_model_batching(
+        [lamb, mu, buoyancy], ("lamb", "mu", "buoyancy"), n_shots
+    )
+    check_model_batching(
+        [lamb_scatter, mu_scatter, buoyancy_scatter],
+        ("lamb_scatter", "mu_scatter", "buoyancy_scatter"),
+        n_shots,
+    )
+    model_batched = 1 if is_shot_batched(lamb, n_shots) else 0
+    scatter_batched = 1 if any(
+        is_shot_batched(m, n_shots)
+        for m in (lamb_scatter, mu_scatter, buoyancy_scatter)
+    ) else 0
 
     stores = None
     ckpt_state = None
@@ -714,7 +718,7 @@ def elastic2d_born(
             SnapshotStorage(
                 _storage_ext, n_snap, n_shots, ny, nx, dtype, device,
             )
-            for _ in range(10)
+            for _ in range(N_STREAMS)
         ]
         if n_ckpt > 0:
             ckpt_state = torch.zeros(

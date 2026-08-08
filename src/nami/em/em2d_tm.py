@@ -24,8 +24,9 @@ convention); the kernels are driven by coefficient arrays (fixed max radius
 4, zero-padded for lower orders) and the per-side FD padding
 ``fd_pad = [accuracy // 2, accuracy // 2 - 1] * 2``, mirroring the scalar
 backend.  Snapshots (pre-update Ey and the PML-modified curl, two streams)
-live in C++-owned storage with device / pinned-cpu / disk
-offload and optional bf16 compression.
+live in C++-owned GPU-resident storage (see storage.h); memory usage is
+controlled from the Python front end via checkpointing of the full
+wavefield state.
 """
 
 import math
@@ -35,6 +36,7 @@ import torch
 
 from ..common.cfl import check_cfl
 from ..common.fd import check_accuracy, staggered_diff1_coeffs
+from ..common.pml import set_pml_width
 from ..common.storage import (
     SnapshotStorage,
     check_sample_steps,
@@ -42,10 +44,7 @@ from ..common.storage import (
     storage_plan,
 )
 from ..common.survey import extract_survey_2d
-
-# vacuum permittivity / permeability / speed of light (SI)
-EPS0 = 8.8541878128e-12  # F/m
-MU0 = 1.2566370614359173e-06  # H/m
+from ._common import EPS0, MU0, _compile_material_coefficients, _pml_profile_1d
 
 # Checkpoint state layout (saved at time t before step t):
 #   [0] ey      pre-update E field
@@ -87,7 +86,11 @@ class TM2DFunc(torch.autograd.Function):
         if device.type == "cuda":
             torch.cuda.set_device(device)
         dtype = ca_p.dtype
-        n_shots, ny, nx = ca_p.shape
+        # n_shots comes from the survey (sources), not from the model batch
+        # dim: a shared [1, ny, nx] model still runs n_shots independent
+        # wavefields (ca_batched/cb_batched/cq_batched select model slab 0).
+        n_shots = int(src_i.shape[0])
+        ny, nx = ca_p.shape[-2:]
         n_src = src_i.shape[1]
         n_rec = rec_i.shape[1]
         ny_nx = ny * nx
@@ -177,7 +180,12 @@ class TM2DFunc(torch.autograd.Function):
                         ayh, byh, axh, bxh, kyh, kxh,
                         ay, by, ax, bx, ky, kx,
                         grad_stride, shot_count, s0, s1):
-        """Re-run forward steps [s0, s1), writing segment-local snapshots."""
+        """Re-run forward steps [s0, s1), writing segment-local snapshots.
+
+        ``shot_count`` is the flat per-snapshot size (``n_shots * ny * nx``)
+        used for snapshot offsets; inject still needs the per-shot stride
+        ``ny_nx = ny * nx`` (passing ``shot_count`` here mis-indexes shot ≥ 1).
+        """
         ny_nx = shot_count // n_shots
         ny, nx = ey_f.shape[-2:]
         for t in range(s0, s1):
@@ -194,7 +202,7 @@ class TM2DFunc(torch.autograd.Function):
                 ctx.rdy, ctx.rdx, t, grad_stride, snap_off,
                 ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
                 *ctx.fd_pad, ctx.cq_batched, ctx.ca_batched, ctx.cb_batched,
-                n_shots, ny, nx, shot_count, n_src, 0, 0,
+                n_shots, ny, nx, ny_nx, n_src, 0, 0,
             )
 
     @staticmethod
@@ -212,7 +220,8 @@ class TM2DFunc(torch.autograd.Function):
         if device.type == "cuda":
             torch.cuda.set_device(device)
         dtype = ca_p.dtype
-        n_shots, ny, nx = ca_p.shape
+        n_shots = int(src_i.shape[0])
+        ny, nx = ca_p.shape[-2:]
         n_src, n_rec = src_i.shape[1], rec_i.shape[1]
         nt = ctx.nt
         ny_nx = ny * nx
@@ -406,7 +415,7 @@ def em2d_tm(
     if not isinstance(grid_spacing, (list, tuple)):
         grid_spacing = [float(grid_spacing)] * 2
     grid_spacing = [float(g) for g in grid_spacing]
-    pml_w = _set_pml_width(pml_width, 2)
+    pml_w = set_pml_width(pml_width, 2)
     fd_pad = [accuracy // 2, accuracy // 2 - 1, accuracy // 2, accuracy // 2 - 1]
     device = epsilon.device
     if device.type == "cuda":
@@ -460,6 +469,21 @@ def em2d_tm(
     else:
         amp = torch.zeros(n_shots, 0, nt_inner, device=device, dtype=dtype)
 
+    # Shared [ny, nx] / [1, ny, nx] models stay rank-1 in the batch dim;
+    # kernels index slab 0 (ca_batched=0) while wavefields are n_shots-wide.
+    # Per-shot model grads are summed in backward (same pattern as elastic2d).
+    # Do not expand shared models to [n_shots, ...] here: that would clash with
+    # the sum(0) reduction (shape mismatch on the Function inputs).
+    ca_batched = 1 if (
+        epsilon.ndim == 3 and epsilon.shape[0] == n_shots and n_shots > 1
+    ) else 0
+    cb_batched = 1 if (
+        sigma.ndim == 3 and sigma.shape[0] == n_shots and n_shots > 1
+    ) else 0
+    cq_batched = 1 if (
+        mu.ndim == 3 and mu.shape[0] == n_shots and n_shots > 1
+    ) else 0
+
     source_coeff = -1.0 / (grid_spacing[0] * grid_spacing[1])
     if amp.numel() > 0:
         src_mask = src_i != -1
@@ -476,9 +500,6 @@ def em2d_tm(
     rdy, rdx = 1.0 / grid_spacing[0], 1.0 / grid_spacing[1]
     pml_y0, pml_y1 = fd_pad[0] + pml_w[0], ny - fd_pad[1] - pml_w[1]
     pml_x0, pml_x1 = fd_pad[2] + pml_w[2], nx - fd_pad[3] - pml_w[3]
-    ca_batched = 1 if ca_p.shape[0] == n_shots else 0
-    cb_batched = 1 if cb_p.shape[0] == n_shots else 0
-    cq_batched = 1 if cq_p.shape[0] == n_shots else 0
 
     storage_mode = resolve_storage(storage)
     grad_stride = check_sample_steps(sample_steps)
@@ -515,85 +536,6 @@ def em2d_tm(
         ckpt_state, checkpoint_every, segments,
     )
     return r
-
-
-def _compile_material_coefficients(epsilon_r, sigma_r, mu_r, dt):
-    """Compile material models into 2D TM Maxwell update coefficients.
-
-    Same formulas as ``compile_material_coefficients`` (and the
-    FDTD convention used by the eager reference): ca/cb for the E update
-    with a conductivity loss averaged over the time step, cq = dt/mu for
-    the H update.  Differentiable, so gradients flow from ca/cb/cq back to
-    epsilon/sigma/mu.
-    """
-    eps = epsilon_r * EPS0
-    mu = mu_r * MU0
-    denom = 1.0 + sigma_r * dt / (2.0 * eps)
-    ca = (1.0 - sigma_r * dt / (2.0 * eps)) / denom
-    cb = (dt / eps) / denom
-    cq = dt / mu
-    return ca, cb, cq
-
-
-def _pml_profile_1d(
-    pml_width,
-    pml_start,
-    dt,
-    n,
-    dtype,
-    device,
-    half,
-    accuracy=2,
-    n_power=4,
-    eps=1e-9,
-    grid_spacing=1.0,
-    eps_scale=EPS0,
-):
-    """a, b, k CPML profiles along one dimension.
-
-    ``accuracy`` is validated for API parity but does not affect the EM
-    a/b/k profiles (the CPML recursion is FD-order independent).
-    """
-    check_accuracy(accuracy)
-    k_max_cpml = 5.0  # maximum coordinate stretching factor
-    alpha_max_cpml = 0.008  # maximum frequency shift
-
-    a = torch.zeros(n, dtype=dtype, device=device)
-    b = torch.zeros(n, dtype=dtype, device=device)
-    k = torch.ones(n, dtype=dtype, device=device)
-
-    if pml_width[0] == 0 and pml_width[1] == 0:
-        return a, b, k
-
-    sigma0 = (n_power + 1) / (150.0 * math.pi * grid_spacing)
-
-    x = torch.arange(n, dtype=dtype, device=device)
-    if half:
-        x = x + 0.5
-
-    for side in range(2):
-        if pml_width[side] == 0:
-            continue
-        abscissa = pml_start[0] - x if side == 0 else x - pml_start[1]
-        mask = abscissa >= 0
-        # Normalized distance into the PML (0 at inner edge, 1 at outer edge)
-        abscissa_norm = torch.clamp(abscissa / pml_width[side], 0, 1)
-
-        sigma = sigma0 * (abscissa_norm**n_power)
-        k_side = 1.0 + (k_max_cpml - 1.0) * (abscissa_norm**n_power)
-        alpha = alpha_max_cpml * (1.0 - abscissa_norm) + 0.1 * alpha_max_cpml
-
-        k = torch.where(mask, k_side, k)
-
-        b_side = torch.exp(-(sigma / k_side + alpha) * dt / eps_scale)
-        b = torch.where(mask, b_side, b)
-
-        denom = k_side * (sigma + k_side * alpha) + eps
-        a_side = sigma * (b_side - 1.0) / denom
-        a_side = torch.where(sigma > 1e-6, a_side, torch.zeros_like(a_side))
-        a = torch.where(mask, a_side, a)
-
-    return a, b, k
 
 
 def _set_em_pml_profiles(
@@ -647,12 +589,3 @@ def _set_em_pml_profiles(
         profiles[2], profiles[8], profiles[3], profiles[9],
         profiles[4], profiles[10], profiles[5], profiles[11],
     ]
-
-
-def _set_pml_width(pml_width, ndim):
-    if isinstance(pml_width, int):
-        return [pml_width] * (2 * ndim)
-    pml_width = list(pml_width)
-    if len(pml_width) != 2 * ndim:
-        raise ValueError(f"pml_width must be int or length {2 * ndim}.")
-    return pml_width

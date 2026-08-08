@@ -6,71 +6,12 @@ correctness is verified via numerical gradients
 (``torch.autograd.gradcheck``), the first-order Born linearity relation (the
 scattered solve matches the perturbed full solve to O(delta^2)), and central
 finite differences of the analytic gradients.
-
-nami imports are deferred to inside the test functions so that merely
-importing this module never triggers compilation of the nami_em3d_born CUDA
-extension.
 """
 
 import torch
 
-
-def _ensure_extension_importable():
-    """Make ``nami_em3d_born`` and ``nami_em3d`` importable when the build
-    recipe only compiles the born extension into /tmp
-    (``torch.utils.cpp_extension.load`` returns the module without
-    registering it on ``sys.path``; the recipe sets ``sys.modules``
-    explicitly).  No-op when the extensions are already importable; does not
-    compile anything itself.
-    """
-    import os
-    import sys
-
-    try:
-        import nami_em3d_born  # noqa: F401
-    except ModuleNotFoundError:
-        candidates = ["/tmp/nami_agent_em3d_born", "/tmp/nami_agent_em3d"]
-        build = os.path.join(os.path.dirname(__file__), "..", "build")
-        if os.path.isdir(build):
-            candidates += [
-                os.path.join(build, d)
-                for d in sorted(os.listdir(build))
-                if d.startswith("lib.")
-            ]
-        for d in candidates:
-            if not os.path.isdir(d):
-                continue
-            for f in os.listdir(d):
-                if f.startswith("nami_em3d_born") and f.endswith((".so", ".pyd")):
-                    if d not in sys.path:
-                        sys.path.insert(0, d)
-                    break
-            else:
-                continue
-            break
-    try:
-        import nami_em3d  # noqa: F401
-    except ModuleNotFoundError:
-        candidates = ["/tmp/nami_agent_em3d", "/tmp/nami_agent_em3d_clean_v2"]
-        build = os.path.join(os.path.dirname(__file__), "..", "build")
-        if os.path.isdir(build):
-            candidates += [
-                os.path.join(build, d)
-                for d in sorted(os.listdir(build))
-                if d.startswitZXsdfghjkl.
-                h("lib.")
-            ]
-        for d in candidates:
-            if not os.path.isdir(d):
-                continue
-            for f in os.listdir(d):
-                if f.startswith("nami_em3d") and f.endswith((".so", ".pyd")):
-                    if d not in sys.path:
-                        sys.path.insert(0, d)
-                    return
-
-
-_ensure_extension_importable()
+from nami.em.em3d import em3d
+from nami.em.em3d_born import em3d_born
 
 
 def build_case(
@@ -158,8 +99,6 @@ def build_case(
 
 def _run_full(c, eps, sigma, mu, amp, accuracy=2, recs=None):
     """Full (non-Born) em3d solve at the given models."""
-    from nami.em.em3d import em3d
-
     dev = c["device"]
     return em3d(
         eps,
@@ -177,9 +116,7 @@ def _run_full(c, eps, sigma, mu, amp, accuracy=2, recs=None):
 
 
 def _run_born(c, eps, sigma, mu, deps, dsig, dmu, amp, accuracy=2, **kwargs):
-    """Runs nami's em3d_born (import deferred: never compiled at import)."""
-    from nami.em.em3d_born import em3d_born
-
+    """Runs nami's em3d_born."""
     dev = c["device"]
     return em3d_born(
         eps,
@@ -462,9 +399,7 @@ def test_checkpoint_forward_and_gradient_parity():
             rel = (ga - gb).abs().max().item() / (
                 gb.abs().max().item() + 1e-300
             )
-            # em3d CUDA backward reduces in nondeterministic order, so even
-            # ckpt_steps=0 vs 0 differs by ~1 ULP of the largest term.
-            # 1e-12 keeps parity semantics while absorbing that noise.
+            # em3d CUDA reductions can differ by ~1 ULP of the largest term
             assert rel < 1e-12, f"ckpt_steps={ckpt} {name} grad rel err {rel}"
 
 
@@ -491,3 +426,152 @@ def test_storage_false_is_forward_only():
     except RuntimeError:
         return
     raise AssertionError("storage='none' backward should raise RuntimeError")
+
+
+def _multi_shot_survey(nz, ny, nx, nt, dtype):
+    srcs = torch.tensor(
+        [
+            [
+                [nz // 2, ny // 2, nx // 2],
+                [nz // 2, ny // 2, nx // 2 + 1],
+            ],
+            [
+                [nz // 2, ny // 2 + 1, nx // 2 + 1],
+                [nz // 2 + 1, ny // 2, nx // 2],
+            ],
+        ]
+    )
+    recs = torch.tensor(
+        [
+            [
+                [nz // 2, ny // 2, nx // 2],
+                [nz // 2, ny // 2, nx // 2 + 1],
+                [nz // 2 + 1, ny // 2, nx // 2],
+            ],
+            [
+                [nz // 2, ny // 2 + 1, nx // 2 + 1],
+                [nz // 2 + 1, ny // 2, nx // 2],
+                [nz // 2, ny // 2 + 1, nx // 2],
+            ],
+        ]
+    )
+    bg_recs = torch.tensor(
+        [
+            [[nz // 2, ny // 2, nx // 2], [nz // 2, ny // 2 + 1, nx // 2]],
+            [[nz // 2, ny // 2 + 1, nx // 2 + 1], [nz // 2 + 1, ny // 2, nx // 2]],
+        ]
+    )
+    amp = torch.zeros(2, 2, nt, dtype=dtype)
+    amp[0, 0, :3] = torch.tensor([1.0, -0.5, 0.2], dtype=dtype)
+    amp[0, 1, :3] = torch.tensor([0.5, 0.1, -0.2], dtype=dtype)
+    amp[1, 0, :3] = torch.tensor([0.7, 0.3, -0.1], dtype=dtype)
+    amp[1, 1, :3] = torch.tensor([-0.4, 0.2, 0.1], dtype=dtype)
+    return srcs, recs, bg_recs, amp
+
+
+def test_multi_shot_shared_model():
+    """n_shots=2 shared models: Born fwd matches singles; grads are sums."""
+    dtype = torch.float64
+    c = build_case(dtype=dtype, nz=8, ny=8, nx=8, nt=6, pml=2,
+                   device="cuda:0", seed=1)
+    dev = c["device"]
+    nz, ny, nx = c["eps"].shape
+    nt = c["nt"]
+    srcs, recs, bg_recs, amp = _multi_shot_survey(nz, ny, nx, nt, dtype)
+    keys = ("eps", "sig", "mu", "deps", "dsig", "dmu")
+
+    def run(models, shot=None):
+        sl = slice(None) if shot is None else slice(shot, shot + 1)
+        return em3d_born(
+            *models, c["dx"], c["dt"],
+            source_amplitudes=amp[sl].to(dev),
+            source_locations=srcs[sl].to(dev),
+            receiver_locations=recs[sl].to(dev),
+            bg_receiver_locations=bg_recs[sl].to(dev),
+            accuracy=2, pml_width=c["pml"], nt=nt,
+        )
+
+    params = {k: c[k].to(dev, dtype) for k in keys}
+    p = {k: v.clone().requires_grad_(True) for k, v in params.items()}
+    p0 = {k: v.clone().requires_grad_(True) for k, v in params.items()}
+    p1 = {k: v.clone().requires_grad_(True) for k, v in params.items()}
+    r, r_bg = run([p[k] for k in keys])
+    r0, r0_bg = run([p0[k] for k in keys], 0)
+    r1, r1_bg = run([p1[k] for k in keys], 1)
+    assert r.shape == (nt, 2, 3) and r_bg.shape == (nt, 2, 2)
+    for out, ref, name in (
+        (r[:, 0], r0[:, 0], "shot 0 fwd r"),
+        (r[:, 1], r1[:, 0], "shot 1 fwd r"),
+        (r_bg[:, 0], r0_bg[:, 0], "shot 0 fwd r_bg"),
+        (r_bg[:, 1], r1_bg[:, 0], "shot 1 fwd r_bg"),
+    ):
+        assert (out.detach() - ref.detach()).abs().max().item() == 0.0, name
+    loss = r.square().sum() + r_bg.square().sum()
+    gs = torch.autograd.grad(loss, [p[k] for k in keys])
+    g0s = torch.autograd.grad(
+        r0.square().sum() + r0_bg.square().sum(), [p0[k] for k in keys]
+    )
+    g1s = torch.autograd.grad(
+        r1.square().sum() + r1_bg.square().sum(), [p1[k] for k in keys]
+    )
+    for g, g0, g1, name in zip(gs, g0s, g1s, keys, strict=True):
+        rel = (g - (g0 + g1)).abs().max().item() / (
+            (g0 + g1).abs().max().item() + 1e-300
+        )
+        # Deterministic ~1-ulp residual: the shared-model gradient sums the
+        # per-shot gradients before the padding backward, the reference sums
+        # the two single-shot gradients after it (measured <= 5e-16).
+        assert rel < 1e-12, f"shared-model grad_{name} rel err {rel}"
+
+
+def test_multi_shot_batched_model():
+    """n_shots=2 batched models: shot i uses slice i."""
+    dtype = torch.float64
+    c0 = build_case(dtype=dtype, nz=8, ny=8, nx=8, nt=6, pml=2,
+                    device="cuda:0", seed=1)
+    c1 = build_case(dtype=dtype, nz=8, ny=8, nx=8, nt=6, pml=2,
+                    device="cuda:0", seed=2)
+    dev = c0["device"]
+    nz, ny, nx = c0["eps"].shape
+    nt = c0["nt"]
+    srcs, recs, bg_recs, amp = _multi_shot_survey(nz, ny, nx, nt, dtype)
+    keys = ("eps", "sig", "mu", "deps", "dsig", "dmu")
+
+    def run(models, shot=None):
+        sl = slice(None) if shot is None else slice(shot, shot + 1)
+        return em3d_born(
+            *models, c0["dx"], c0["dt"],
+            source_amplitudes=amp[sl].to(dev),
+            source_locations=srcs[sl].to(dev),
+            receiver_locations=recs[sl].to(dev),
+            bg_receiver_locations=bg_recs[sl].to(dev),
+            accuracy=2, pml_width=c0["pml"], nt=nt,
+        )
+
+    batch = [
+        torch.stack([c0[k], c1[k]]).to(dev, dtype).requires_grad_(True)
+        for k in keys
+    ]
+    m0 = [c0[k].to(dev, dtype).requires_grad_(True) for k in keys]
+    m1 = [c1[k].to(dev, dtype).requires_grad_(True) for k in keys]
+    r, r_bg = run(batch)
+    r0, r0_bg = run(m0, 0)
+    r1, r1_bg = run(m1, 1)
+    assert r.shape == (nt, 2, 3) and r_bg.shape == (nt, 2, 2)
+    for out, ref, name in (
+        (r[:, 0], r0[:, 0], "shot 0 fwd r"),
+        (r[:, 1], r1[:, 0], "shot 1 fwd r"),
+        (r_bg[:, 0], r0_bg[:, 0], "shot 0 fwd r_bg"),
+        (r_bg[:, 1], r1_bg[:, 0], "shot 1 fwd r_bg"),
+    ):
+        assert (out.detach() - ref.detach()).abs().max().item() == 0.0, name
+    loss = r.square().sum() + r_bg.square().sum()
+    gs = torch.autograd.grad(loss, batch)
+    g0s = torch.autograd.grad(r0.square().sum() + r0_bg.square().sum(), m0)
+    g1s = torch.autograd.grad(r1.square().sum() + r1_bg.square().sum(), m1)
+    for gb, g0, g1, name in zip(gs, g0s, g1s, keys, strict=True):
+        rel0 = (gb[0] - g0).abs().max().item() / (g0.abs().max().item() + 1e-300)
+        rel1 = (gb[1] - g1).abs().max().item() / (g1.abs().max().item() + 1e-300)
+        assert rel0 < 1e-12 and rel1 < 1e-12, (
+            f"batched-model grad_{name} rel err ({rel0}, {rel1})"
+        )

@@ -7,10 +7,12 @@ step and its exact-transpose adjoint are custom CUDA kernels.
 
 Layout (directory = physics, file = dimensionality):
 
-    common/    survey / PML profiles / wavelets / materials
-    scalar/    acoustic waves       scalar2d.py
-    elastic/   elastic waves        elastic2d.py
-    em/        electromagnetic      em2d_tm.py, em3d.py (future)
+    common/      survey / PML profiles / CFL / storage / FD coefficients
+    scalar/      acoustic waves       scalar2d.py, scalar3d.py (+ Born)
+    elastic/     elastic waves        elastic2d.py (+ Born)
+    em/          electromagnetic      em2d_tm.py, em3d.py (+ Born)
+    wavelets.py  source wavelets (ricker)
+    models.py    class-based FWI wrappers
 """
 
 from . import common  # noqa: F401
