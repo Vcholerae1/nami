@@ -18,7 +18,7 @@ numpy = ">=1.24"
 # Dev-only tooling, opt-in via `pixi run -e dev pytest` / `pixi shell -e dev`.
 [feature.dev.dependencies]
 pytest = ">=9.1.1"
-ruff = ">=0.16.2,<0.17"
+ruff = ">=0.16.2"
 
 [environments]
 default = []

@@ -70,31 +70,31 @@ def _run_nami(c, v, amp, accuracy=2):
         nt=c["nt"],
     )
 def test_gradcheck():
-    """Numerical gradient check for v and source_amplitudes."""
+    """Numerical gradient check for v and source amplitudes at every order."""
     dtype = torch.float64
     c = build_case(
         dtype=dtype, ny=24, nx=24, nt=10, pml=4, device="cuda:0", seed=1
     )
     dev = c["device"]
 
-    def fn(v, amp):
-        return _run_nami(c, v, amp)
+    for accuracy in (2, 4, 6, 8):
+        def fn(v, amp, accuracy=accuracy):
+            return _run_nami(c, v, amp, accuracy=accuracy)
 
-    ok = torch.autograd.gradcheck(
-        fn,
-        (
-            c["v"].to(dev, dtype).requires_grad_(True),
-            c["amp"].to(dev, dtype).requires_grad_(True),
-        ),
-        eps=1e-6,
-        atol=1e-5,
-        rtol=1e-3,
-        fast_mode=True,
-        nondet_tol=1e-8,
-        raise_exception=False,
-    )
-    print("gradcheck nami scalar2d (v, amp):", ok)
-    assert ok
+        ok = torch.autograd.gradcheck(
+            fn,
+            (
+                c["v"].to(dev, dtype).requires_grad_(True),
+                c["amp"].to(dev, dtype).requires_grad_(True),
+            ),
+            eps=1e-6,
+            atol=1e-5,
+            rtol=1e-3,
+            fast_mode=True,
+            nondet_tol=1e-8,
+            raise_exception=False,
+        )
+        assert ok, f"scalar2d gradcheck failed at accuracy={accuracy}"
 
 
 def _ricker(freq, nt, dt, device, dtype):

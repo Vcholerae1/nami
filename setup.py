@@ -16,14 +16,15 @@ _CSRC = "src/nami/csrc"
 
 _EXTENSIONS = [
     ("nami_scalar2d", "scalar2d.cu"),
+    ("nami_scalar2d_born", "scalar2d_born.cu"),
     ("nami_scalar3d", "scalar3d.cu"),
     ("nami_scalar3d_born", "scalar3d_born.cu"),
     ("nami_elastic2d", "elastic2d.cu"),
+    ("nami_elastic2d_born", "elastic2d_born.cu"),
     ("nami_em2d_tm", "em2d_tm.cu"),
+    ("nami_em2d_tm_born", "em2d_tm_born.cu"),
     ("nami_em3d", "em3d.cu"),
     ("nami_em3d_born", "em3d_born.cu"),
-    ("nami_born", "born.cu"),
-    ("nami_born_em_el", "born_em_el.cu"),
 ]
 
 setup(

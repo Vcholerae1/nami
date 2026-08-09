@@ -19,6 +19,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <vector>
 
 namespace nami_storage {
 
@@ -93,6 +94,46 @@ inline void storage_destroy(int64_t handle)
     auto* store = reinterpret_cast<SnapshotStoreBase*>(handle);
     if (store != nullptr)
         delete store;
+}
+
+// ---------------- checkpoint state transfers (shared by all modules) --------
+
+inline void ckpt_save(const torch::Tensor& ckpt_state, int64_t k,
+                      const std::vector<const torch::Tensor*>& state)
+{
+    // ckpt_state is contiguous [n_ckpt, N_STATE, n_shots, ...].  Copy one
+    // flat device slab per state slot on the caller's current CUDA stream.
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int64_t n_state = ckpt_state.size(1);
+    const int64_t slab_bytes = state[0]->numel() * state[0]->element_size();
+    char* base = static_cast<char*>(ckpt_state.data_ptr())
+                 + k * n_state * slab_bytes;
+    for (size_t j = 0; j < state.size(); ++j)
+        cudaMemcpyAsync(base + static_cast<int64_t>(j) * slab_bytes,
+                        state[j]->data_ptr(), slab_bytes,
+                        cudaMemcpyDeviceToDevice, stream);
+}
+
+inline void ckpt_restore(const torch::Tensor& ckpt_state, int64_t k,
+                         const std::vector<torch::Tensor*>& state)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int64_t n_state = ckpt_state.size(1);
+    const int64_t slab_bytes = state[0]->numel() * state[0]->element_size();
+    const char* base = static_cast<const char*>(ckpt_state.data_ptr())
+                       + k * n_state * slab_bytes;
+    for (size_t j = 0; j < state.size(); ++j)
+        cudaMemcpyAsync(state[j]->data_ptr(),
+                        base + static_cast<int64_t>(j) * slab_bytes,
+                        slab_bytes, cudaMemcpyDeviceToDevice, stream);
+}
+
+inline void zero_buffers(const std::vector<torch::Tensor*>& bufs)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    for (auto* buffer : bufs)
+        cudaMemsetAsync(buffer->data_ptr(), 0,
+                        buffer->numel() * buffer->element_size(), stream);
 }
 
 #define NAMI_STORAGE_PYBIND(m)                                                 \

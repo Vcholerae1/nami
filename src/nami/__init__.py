@@ -11,7 +11,7 @@ Layout (directory = physics, file = dimensionality):
     scalar/      acoustic waves       scalar2d.py, scalar3d.py (+ Born)
     elastic/     elastic waves        elastic2d.py (+ Born)
     em/          electromagnetic      em2d_tm.py, em3d.py (+ Born)
-    wavelets.py  source wavelets (ricker)
+    wavelets.py  Gaussian / Ricker / Ormsby / Klauder / swept sources
     models.py    class-based FWI wrappers
 """
 

@@ -1,8 +1,8 @@
 # なみ / nami
 
-An all-in-one tool for scalar, elastic, and electromagnetic wave forward modelling and inversion. 
+nami is an all-in-one tool for scalar, elastic, and electromagnetic wave modelling, imaging, and inversion.
 
-nami is built around my personal preferences, so it **only supports GNU/Linux + CUDA** and is distributed as **source only**. For similar needs, please refer to the projects in [Acknowledgements](#acknowledgements).
+nami is built solely around my personal preferences, so it **only supports GNU/Linux + CUDA** and is distributed as **source only**. For similar needs, please refer to the projects in [Acknowledgements](#acknowledgements).
 
 ## AGENTS.md
 
@@ -21,7 +21,7 @@ nami stands on the shoulders of the projects doing the real work in wave modelli
 - [fancompute/wavetorch](https://github.com/fancompute/wavetorch)
 - [gprMax/gprMax](https://github.com/gprMax/gprMax)
 - [songc0a/Fast-GPR-FWI](https://github.com/songc0a/Fast-GPR-FWI)
-- [vcholerae1/tide-GPR](https://pypi.org/project/tide-GPR)
+- [vcholerae1/tide-GPR](https://github.com/Vcholerae1/tide-GPR)
 - [witwin-ai/witwin-maxwell](https://github.com/witwin-ai/witwin-maxwell)
 
 Huge thanks to everyone who maintains them.

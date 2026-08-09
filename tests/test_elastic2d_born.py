@@ -95,7 +95,7 @@ def build_case(
     }
 
 
-def _run_full(c, lamb, mu, buoyancy, amp, accuracy=2):
+def _run_full(c, lamb, mu, buoyancy, amp, accuracy=2, recs=None):
     dev = c["device"]
     return elastic2d(
         lamb,
@@ -105,7 +105,7 @@ def _run_full(c, lamb, mu, buoyancy, amp, accuracy=2):
         c["dt"],
         source_amplitudes=amp,
         source_locations=c["srcs"].to(dev),
-        receiver_locations=c["recs"].to(dev),
+        receiver_locations=(c["recs"] if recs is None else recs).to(dev),
         accuracy=accuracy,
         pml_width=c["pml"],
         nt=c["nt"],
@@ -113,7 +113,7 @@ def _run_full(c, lamb, mu, buoyancy, amp, accuracy=2):
 
 
 def _run_born(c, lamb, mu, buoyancy, dlamb, dmu, dbuoy, amp, accuracy=2,
-              storage="auto", ckpt_steps=0, sample_steps=1):
+              storage="auto", ckpt_steps=0, sample_steps=1, bg_recs=None):
     dev = c["device"]
     return elastic2d_born(
         lamb,
@@ -127,6 +127,7 @@ def _run_born(c, lamb, mu, buoyancy, dlamb, dmu, dbuoy, amp, accuracy=2,
         source_amplitudes=amp,
         source_locations=c["srcs"].to(dev),
         receiver_locations=c["recs"].to(dev),
+        bg_receiver_locations=None if bg_recs is None else bg_recs.to(dev),
         accuracy=accuracy,
         pml_width=c["pml"],
         nt=c["nt"],
@@ -178,6 +179,30 @@ def test_born_linearity():
     assert 3.0 < ratio < 5.0, f"residual did not scale quadratically: {ratio}"
 
 
+def test_background_receiver_matches_full_solve_and_gradient():
+    c = build_case(dtype=torch.float64, ny=20, nx=20, nt=8, pml=3,
+                   device="cuda:0", seed=7)
+    dev = c["device"]
+    lamb = c["lamb"].to(dev).requires_grad_(True)
+    mu = c["mu"].to(dev).requires_grad_(True)
+    buoyancy = c["buoyancy"].to(dev).requires_grad_(True)
+    amp = c["amp"].to(dev).requires_grad_(True)
+    scatter = [c[k].to(dev) for k in ("dlamb", "dmu", "dbuoy")]
+    _, r_bg = _run_born(
+        c, lamb, mu, buoyancy, *scatter, amp, bg_recs=c["recs"]
+    )
+    full_models = [
+        x.detach().clone().requires_grad_(True) for x in (lamb, mu, buoyancy)
+    ]
+    full_amp = amp.detach().clone().requires_grad_(True)
+    r_full = _run_full(c, *full_models, full_amp)
+    torch.testing.assert_close(r_bg, r_full, rtol=0, atol=0)
+    grads = torch.autograd.grad(r_bg.square().sum(), (lamb, mu, buoyancy, amp))
+    refs = torch.autograd.grad(r_full.square().sum(), (*full_models, full_amp))
+    for grad, ref in zip(grads, refs, strict=True):
+        torch.testing.assert_close(grad, ref, rtol=1e-6, atol=1e-12)
+
+
 def test_gradcheck():
     """Numerical gradient check for bg + scatter models and amplitudes."""
     dtype = torch.float64
@@ -210,37 +235,29 @@ def test_gradcheck():
     assert ok
 
 
-def test_gradcheck_accuracy4():
-    """Same gradcheck at accuracy 4 (coefficient-driven stencils)."""
+def test_gradcheck_higher_order():
+    """Same gradcheck at accuracy 4, 6, and 8."""
     dtype = torch.float64
     c = build_case(dtype=dtype, ny=20, nx=20, nt=8, pml=4,
                    device="cuda:0", seed=2)
     dev = c["device"]
 
-    def fn(lamb, mu, buoyancy, dlamb, dmu, dbuoy, amp):
-        return _run_born(c, lamb, mu, buoyancy, dlamb, dmu, dbuoy, amp,
-                         accuracy=4)
+    for accuracy in (4, 6, 8):
+        def fn(lamb, mu, buoyancy, dlamb, dmu, dbuoy, amp, accuracy=accuracy):
+            return _run_born(
+                c, lamb, mu, buoyancy, dlamb, dmu, dbuoy, amp,
+                accuracy=accuracy,
+            )
 
-    ok = torch.autograd.gradcheck(
-        fn,
-        (
-            c["lamb"].to(dev, dtype).requires_grad_(True),
-            c["mu"].to(dev, dtype).requires_grad_(True),
-            c["buoyancy"].to(dev, dtype).requires_grad_(True),
-            c["dlamb"].to(dev, dtype).requires_grad_(True),
-            c["dmu"].to(dev, dtype).requires_grad_(True),
-            c["dbuoy"].to(dev, dtype).requires_grad_(True),
-            c["amp"].to(dev, dtype).requires_grad_(True),
-        ),
-        eps=1e-6,
-        atol=1e-5,
-        rtol=1e-3,
-        fast_mode=True,
-        nondet_tol=1e-8,
-        raise_exception=False,
-    )
-    print("gradcheck nami elastic2d_born accuracy 4:", ok)
-    assert ok
+        args = tuple(
+            c[name].to(dev, dtype).requires_grad_(True)
+            for name in ("lamb", "mu", "buoyancy", "dlamb", "dmu", "dbuoy", "amp")
+        )
+        ok = torch.autograd.gradcheck(
+            fn, args, eps=1e-6, atol=1e-5, rtol=1e-3, fast_mode=True,
+            nondet_tol=1e-8, raise_exception=False,
+        )
+        assert ok, f"elastic2d_born gradcheck failed at accuracy={accuracy}"
 
 
 def test_forward_sanity():
@@ -505,39 +522,157 @@ def test_multi_shot_batched_model():
         )
 
 
-def test_mixed_batch_models_raise():
-    """Mixed shared/batched models raise ValueError: the kernel selects the
-    model slab with one flag per group (background, scatter), so mixed
-    batch forms within a group would read a shared model out of bounds."""
+def test_batched_background_with_shared_scatter():
+    """Derived scatter coefficients inherit batching from the background."""
     dtype = torch.float64
-    c = build_case(dtype=dtype, ny=20, nx=20, nt=10, pml=3, device="cuda:0",
-                   seed=1)
-    dev = c["device"]
-    ny, nx = c["lamb"].shape
-    nt = c["nt"]
+    c0 = build_case(dtype=dtype, ny=20, nx=20, nt=10, pml=3,
+                    device="cuda:0", seed=1)
+    c1 = build_case(dtype=dtype, ny=20, nx=20, nt=10, pml=3,
+                    device="cuda:0", seed=2)
+    dev = c0["device"]
+    ny, nx = c0["lamb"].shape
+    nt = c0["nt"]
     srcs, recs, amp = _multi_shot_survey(ny, nx, nt, dtype)
+    keys = ("lamb", "mu", "buoyancy", "dlamb", "dmu", "dbuoy")
 
-    def run(lamb, mu, buoy, dlamb, dmu, dbuoy):
+    def run(models, shot=None):
+        sl = slice(None) if shot is None else slice(shot, shot + 1)
         return elastic2d_born(
-            lamb, mu, buoy, dlamb, dmu, dbuoy, c["dx"], c["dt"],
-            source_amplitudes=amp.to(dev),
-            source_locations=srcs.to(dev),
-            receiver_locations=recs.to(dev),
-            accuracy=2, pml_width=c["pml"], nt=nt,
+            *models, c0["dx"], c0["dt"],
+            source_amplitudes=amp[sl].to(dev),
+            source_locations=srcs[sl].to(dev),
+            receiver_locations=recs[sl].to(dev),
+            accuracy=2, pml_width=c0["pml"], nt=nt,
         )
 
-    bg = [c[k].to(dev, dtype) for k in ("lamb", "mu", "buoyancy")]
-    sc = [c[k].to(dev, dtype) for k in ("dlamb", "dmu", "dbuoy")]
+    models = [
+        (torch.stack([c0[k], c1[k]]) if i < 3 else c0[k])
+        .to(dev, dtype).requires_grad_(True)
+        for i, k in enumerate(keys)
+    ]
+    singles = [
+        [
+            (m[i] if j < 3 else m).detach().clone().requires_grad_(True)
+            for j, m in enumerate(models)
+        ]
+        for i in range(2)
+    ]
+    r = run(models)
+    refs = [run(singles[i], i) for i in range(2)]
+    for i in range(2):
+        torch.testing.assert_close(r[:, i], refs[i][:, 0], rtol=0, atol=0)
+    grads = torch.autograd.grad(r.square().sum(), models)
+    ref_grads = [torch.autograd.grad(ref.square().sum(), single)
+                 for ref, single in zip(refs, singles, strict=True)]
+    for j, (grad, g0, g1) in enumerate(zip(grads, *ref_grads, strict=True)):
+        expected = torch.stack([g0, g1]) if j < 3 else g0 + g1
+        torch.testing.assert_close(grad, expected, rtol=1e-12, atol=1e-20)
 
-    def batched(t):
-        return torch.stack([t, t]).clone()
 
-    # batched background lamb + shared mu/buoyancy
-    with pytest.raises(ValueError, match="all shared|all batched"):
-        run(batched(bg[0]), bg[1], bg[2], sc[0], sc[1], sc[2])
-    # batched scatter dlamb + shared dmu/dbuoyancy
-    with pytest.raises(ValueError, match="all shared|all batched"):
-        run(bg[0], bg[1], bg[2], batched(sc[0]), sc[1], sc[2])
-    # batched scatter + None siblings (None = shared zeros)
-    with pytest.raises(ValueError, match="all shared|all batched"):
-        run(bg[0], bg[1], bg[2], batched(sc[0]), None, None)
+@pytest.mark.parametrize(
+    "batched_index",
+    range(6),
+    ids=("lamb", "mu", "buoyancy", "dlamb", "dmu", "dbuoyancy"),
+)
+def test_multi_shot_mixed_model_batching(batched_index):
+    """Each Born background/scatter model may independently be per-shot."""
+    dtype = torch.float64
+    c0 = build_case(
+        dtype=dtype, ny=20, nx=20, nt=10, pml=3, device="cuda:0", seed=1
+    )
+    c1 = build_case(
+        dtype=dtype, ny=20, nx=20, nt=10, pml=3, device="cuda:0", seed=2
+    )
+    dev = c0["device"]
+    ny, nx = c0["lamb"].shape
+    nt = c0["nt"]
+    srcs, recs, amp = _multi_shot_survey(ny, nx, nt, dtype)
+
+    def run(models, shot=None):
+        sl = slice(None) if shot is None else slice(shot, shot + 1)
+        return elastic2d_born(
+            *models, c0["dx"], c0["dt"],
+            source_amplitudes=amp[sl].to(dev),
+            source_locations=srcs[sl].to(dev),
+            receiver_locations=recs[sl].to(dev),
+            accuracy=2, pml_width=c0["pml"], nt=nt,
+        )
+
+    keys = ("lamb", "mu", "buoyancy", "dlamb", "dmu", "dbuoy")
+    models = [
+        (
+            torch.stack([c0[key], c1[key]])
+            if index == batched_index
+            else c0[key]
+        ).to(dev, dtype).requires_grad_(True)
+        for index, key in enumerate(keys)
+    ]
+    singles = [
+        [
+            (model[shot] if index == batched_index else model)
+            .detach().clone().requires_grad_(True)
+            for index, model in enumerate(models)
+        ]
+        for shot in range(2)
+    ]
+    result = run(models)
+    references = [run(singles[shot], shot) for shot in range(2)]
+    for shot, reference in enumerate(references):
+        torch.testing.assert_close(
+            result[:, shot], reference[:, 0], rtol=0, atol=0
+        )
+
+    gradients = torch.autograd.grad(result.square().sum(), models)
+    reference_gradients = [
+        torch.autograd.grad(reference.square().sum(), single)
+        for reference, single in zip(references, singles, strict=True)
+    ]
+    for index, (gradient, grad0, grad1) in enumerate(
+        zip(gradients, *reference_gradients, strict=True)
+    ):
+        expected = (
+            torch.stack([grad0, grad1])
+            if index == batched_index
+            else grad0 + grad1
+        )
+        torch.testing.assert_close(gradient, expected, rtol=1e-12, atol=1e-20)
+
+
+def test_mixed_scatter_batching_with_none_siblings():
+    """A per-shot scatter model can be mixed with implicit shared zeros."""
+    dtype = torch.float64
+    case = build_case(
+        dtype=dtype, ny=20, nx=20, nt=10, pml=3, device="cuda:0", seed=1
+    )
+    device = case["device"]
+    ny, nx = case["lamb"].shape
+    nt = case["nt"]
+    sources, receivers, amplitudes = _multi_shot_survey(ny, nx, nt, dtype)
+    dlamb = torch.stack([case["dlamb"], -case["dlamb"]]).to(device, dtype)
+
+    def run(scatter, shot=None):
+        sl = slice(None) if shot is None else slice(shot, shot + 1)
+        return elastic2d_born(
+            case["lamb"].to(device, dtype),
+            case["mu"].to(device, dtype),
+            case["buoyancy"].to(device, dtype),
+            scatter,
+            None,
+            None,
+            case["dx"],
+            case["dt"],
+            source_amplitudes=amplitudes[sl].to(device),
+            source_locations=sources[sl].to(device),
+            receiver_locations=receivers[sl].to(device),
+            accuracy=2,
+            pml_width=case["pml"],
+            nt=nt,
+            storage="none",
+        )
+
+    result = run(dlamb)
+    for shot in range(2):
+        reference = run(dlamb[shot], shot)
+        torch.testing.assert_close(
+            result[:, shot], reference[:, 0], rtol=0, atol=0
+        )

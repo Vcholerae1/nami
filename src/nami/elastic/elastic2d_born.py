@@ -33,13 +33,14 @@ Return convention: ``[nt, n_shots, n_rec]`` scattered pressure traces
 ``-(dsyy + dsxx) / 2``, matching elastic2d's pressure receivers.
 """
 
-import nami_born_em_el as _ext
-import nami_elastic2d as _storage_ext
+import nami_elastic2d_born as _ext
 import torch
 
+from ..common.callback import validate_callback_frequency, wrap_forward_callback
 from ..common.cfl import check_cfl
 from ..common.fd import check_accuracy, staggered_diff1_coeffs
 from ..common.pml import set_pml_width
+from ..common.state import allocate_final_state, prepare_initial_state, unpack_state
 from ..common.storage import (
     SnapshotStorage,
     check_sample_steps,
@@ -47,9 +48,9 @@ from ..common.storage import (
     storage_plan,
 )
 from ..common.survey import (
-    check_model_batching,
     extract_survey_2d,
-    is_shot_batched,
+    materialize_batched_group,
+    prepare_source_amplitudes,
 )
 from .elastic2d import (
     _set_elastic_pml_profiles,
@@ -74,6 +75,21 @@ from .elastic2d import (
 #   [12] m_sigmaxxx    [25] dm_sigmaxxx
 N_STATE = 26
 N_STREAMS = 10
+
+# Full N_STATE names: keys of the state dicts returned by ``return_state``
+# and accepted by ``initial_state`` (for split-run continuation).
+_WAVEFIELD_NAMES = (
+    "vy", "vx", "syy", "sxx", "sxy",
+    "m_vyy", "m_vxx", "m_vxy", "m_vyx",
+    "m_sigmayyy", "m_sigmaxyx", "m_sigmaxyy", "m_sigmaxxx",
+    "dvy", "dvx", "dsyy", "dsxx", "dsxy",
+    "dm_vyy", "dm_vxx", "dm_vxy", "dm_vyx",
+    "dm_sigmayyy", "dm_sigmaxyx", "dm_sigmaxyy", "dm_sigmaxxx",
+)
+_CALLBACK_FIELDS = (
+    "vy", "vx", "syy", "sxx", "sxy",
+    "dvy", "dvx", "dsyy", "dsxx", "dsxy",
+)
 
 
 def _linearize_prepare_parameters(mu, buoyancy, dmu, db):
@@ -146,7 +162,7 @@ class BornElasticFunc(torch.autograd.Function):
         lamb_p, mu_p, mu_yx, buoyancy_y, buoyancy_x,
         dlamb_p, dmu_p, dmu_yx, dbuoyancy_y, dbuoyancy_x,
         amp,              # [n_shots, n_src, nt] pressure source amplitudes
-        src_i, rec_i,
+        src_i, rec_i, bg_rec_i,
         profs, c,
         fd_pad_y0, fd_pad_y1, fd_pad_x0, fd_pad_x1,
         rdy, rdx, dtv,
@@ -155,6 +171,10 @@ class BornElasticFunc(torch.autograd.Function):
         ckpt_state,      # [n_ckpt, N_STATE, n_shots, ny, nx] or None
         checkpoint_every,  # 0 = full storage; N = checkpoint every N steps
         segments,        # [(s0, s1)] replay segments; [] = full storage
+        init_state,      # [N_STATE, n_shots, ny, nx] initial wavefield or None
+        final_state,     # [N_STATE, n_shots, ny, nx] output buffer or None
+        forward_callback,  # cb(t, nt, background fields..., scattered fields...)
+        callback_frequency,  # call the callback every N steps
     ):
         ext = _ext
         device = lamb_p.device
@@ -164,6 +184,7 @@ class BornElasticFunc(torch.autograd.Function):
         ny, nx = lamb_p.shape[-2:]
         n_src = src_i.shape[1]
         n_rec = rec_i.shape[1]
+        n_bg_rec = bg_rec_i.shape[1]
         ny_nx = ny * nx
 
         # pressure-source pre-scaling: f = -amp * dt
@@ -186,6 +207,7 @@ class BornElasticFunc(torch.autograd.Function):
         dm_vyy, dm_vxx = z(n_shots, ny, nx), z(n_shots, ny, nx)
         dm_vxy, dm_vyx = z(n_shots, ny, nx), z(n_shots, ny, nx)
         r = z(nt, n_shots, n_rec)
+        r_bg = z(nt, n_shots, n_bg_rec)
         if storage is not None:
             (dvydy_store, dvxdx_store, dvxy_store, dvydb_store, dvxdb_store,
              ddvydy_store, ddvxdx_store, ddvxy_store, ddvydb_store,
@@ -197,75 +219,42 @@ class BornElasticFunc(torch.autograd.Function):
              ddvxdb_store) = (dummy,) * 10
 
         ayh, byh, ay, by, axh, bxh, ax, bx = profs
-        ckpt = ckpt_state is not None
-        for t in range(nt):
-            if ckpt and t > 0 and t % checkpoint_every == 0:
-                k = t // checkpoint_every - 1
-                ckpt_state[k, 0].copy_(vy)
-                ckpt_state[k, 1].copy_(vx)
-                ckpt_state[k, 2].copy_(syy)
-                ckpt_state[k, 3].copy_(sxx)
-                ckpt_state[k, 4].copy_(sxy)
-                ckpt_state[k, 5].copy_(m_vyy)
-                ckpt_state[k, 6].copy_(m_vxx)
-                ckpt_state[k, 7].copy_(m_vxy)
-                ckpt_state[k, 8].copy_(m_vyx)
-                ckpt_state[k, 9].copy_(m_sigmayyy)
-                ckpt_state[k, 10].copy_(m_sigmaxyx)
-                ckpt_state[k, 11].copy_(m_sigmaxyy)
-                ckpt_state[k, 12].copy_(m_sigmaxxx)
-                ckpt_state[k, 13].copy_(dvy)
-                ckpt_state[k, 14].copy_(dvx)
-                ckpt_state[k, 15].copy_(dsyy)
-                ckpt_state[k, 16].copy_(dsxx)
-                ckpt_state[k, 17].copy_(dsxy)
-                ckpt_state[k, 18].copy_(dm_vyy)
-                ckpt_state[k, 19].copy_(dm_vxx)
-                ckpt_state[k, 20].copy_(dm_vxy)
-                ckpt_state[k, 21].copy_(dm_vyx)
-                ckpt_state[k, 22].copy_(dm_sigmayyy)
-                ckpt_state[k, 23].copy_(dm_sigmaxyx)
-                ckpt_state[k, 24].copy_(dm_sigmaxyy)
-                ckpt_state[k, 25].copy_(dm_sigmaxxx)
-            if n_rec > 0:
-                ext.born_record_pressure(
-                    dsyy, dsxx, r, rec_i, t, n_shots, n_rec, ny_nx,
-                )
-            store = 0 if segments else (1 if storage is not None else 0)
-            snap_off = (
-                storage[0].snap_offset(t // grad_stride) if store else 0
-            )
-            ext.born_step_velocity(
-                vy, vx, syy, sxx, sxy, dvy, dvx, dsyy, dsxx, dsxy,
-                m_sigmayyy, m_sigmaxyx, m_sigmaxyy, m_sigmaxxx,
-                dm_sigmayyy, dm_sigmaxyx, dm_sigmaxyy, dm_sigmaxxx,
-                buoyancy_y, buoyancy_x, dbuoyancy_y, dbuoyancy_x,
-                dvydb_store, dvxdb_store, ddvydb_store, ddvxdb_store,
-                ayh, byh, ay, by, axh, bxh, ax, bx, c,
-                fd_pad_y0, fd_pad_y1, fd_pad_x0, fd_pad_x1,
-                rdy, rdx, dtv, t, grad_stride,
-                model_batched, scatter_batched, store, snap_off,
-            )
-            ext.born_step_stress(
-                vy, vx, dvy, dvx, syy, sxx, sxy, dsyy, dsxx, dsxy,
-                m_vyy, m_vxx, m_vxy, m_vyx,
-                dm_vyy, dm_vxx, dm_vxy, dm_vyx,
-                lamb_p, mu_p, mu_yx, dlamb_p, dmu_p, dmu_yx,
-                dvydy_store, dvxdx_store, dvxy_store,
-                ddvydy_store, ddvxdx_store, ddvxy_store,
-                ayh, byh, ay, by, axh, bxh, ax, bx, c,
-                fd_pad_y0, fd_pad_y1, fd_pad_x0, fd_pad_x1,
-                rdy, rdx, dtv, t, grad_stride,
-                model_batched, scatter_batched, store, snap_off,
-            )
-            if n_src > 0:
-                ext.born_inject_pressure(syy, sxx, f, src_i, t, n_shots, n_src, ny_nx)
+        # N_STATE layout: [0] vy [1] vx [2] syy [3] sxx [4] sxy
+        # [5] m_vyy [6] m_vxx [7] m_vxy [8] m_vyx
+        # [9] m_sigmayyy [10] m_sigmaxyx [11] m_sigmaxyy [12] m_sigmaxxx
+        # [13..25] scattered counterparts (dvy, dvx, dsyy, dsxx, dsxy, dm_*)
+        state = [
+            vy, vx, syy, sxx, sxy,
+            m_vyy, m_vxx, m_vxy, m_vyx,
+            m_sigmayyy, m_sigmaxyx, m_sigmaxyy, m_sigmaxxx,
+            dvy, dvx, dsyy, dsxx, dsxy,
+            dm_vyy, dm_vxx, dm_vxy, dm_vyx,
+            dm_sigmayyy, dm_sigmaxyx, dm_sigmaxyy, dm_sigmaxxx,
+        ]
+        # Checkpointed forward skips global snapshot writes; replay
+        # regenerates segment-local snaps via snap_off.
+        store = 0 if segments else (1 if storage is not None else 0)
+        ext.born_elastic_forward_loop(
+            lamb_p, mu_p, mu_yx, buoyancy_y, buoyancy_x,
+            dlamb_p, dmu_p, dmu_yx, dbuoyancy_y, dbuoyancy_x,
+            state,
+            dvydy_store, dvxdx_store, dvxy_store, dvydb_store, dvxdb_store,
+            ddvydy_store, ddvxdx_store, ddvxy_store, ddvydb_store, ddvxdb_store,
+            ayh, byh, ay, by, axh, bxh, ax, bx, c,
+            f, src_i, r, rec_i, r_bg, bg_rec_i,
+            fd_pad_y0, fd_pad_y1, fd_pad_x0, fd_pad_x1,
+            rdy, rdx, dtv,
+            nt, grad_stride,
+            model_batched, scatter_batched,
+            store, checkpoint_every, ckpt_state,
+            init_state, final_state, forward_callback, callback_frequency,
+        )
 
         ctx.ext = ext
         ctx.save_for_backward(
             lamb_p, mu_p, mu_yx, buoyancy_y, buoyancy_x,
             dlamb_p, dmu_p, dmu_yx, dbuoyancy_y, dbuoyancy_x,
-            src_i, rec_i, f,
+            src_i, rec_i, bg_rec_i, f,
         )
         ctx.storage = storage
         ctx.profs = profs
@@ -274,16 +263,16 @@ class BornElasticFunc(torch.autograd.Function):
         ctx.rdy, ctx.rdx, ctx.dtv = rdy, rdx, dtv
         ctx.nt, ctx.grad_stride = nt, grad_stride
         ctx.n_shots, ctx.ny, ctx.nx, ctx.ny_nx = n_shots, ny, nx, ny_nx
-        ctx.n_src, ctx.n_rec = n_src, n_rec
+        ctx.n_src, ctx.n_rec, ctx.n_bg_rec = n_src, n_rec, n_bg_rec
         ctx.model_batched = model_batched
         ctx.scatter_batched = scatter_batched
         ctx.ckpt_state = ckpt_state
         ctx.checkpoint_every = checkpoint_every
         ctx.segments = segments
-        return r
+        return r, r_bg
 
     @staticmethod
-    def backward(ctx, grad_r):
+    def backward(ctx, grad_r, grad_r_bg):
         if ctx.storage is None:
             raise RuntimeError(
                 "elastic2d_born backward() requires snapshot storage: run the "
@@ -294,7 +283,7 @@ class BornElasticFunc(torch.autograd.Function):
         storage = ctx.storage
         (lamb_p, mu_p, mu_yx, buoyancy_y, buoyancy_x,
          dlamb_p, dmu_p, dmu_yx, dbuoyancy_y, dbuoyancy_x,
-         src_i, rec_i, f) = ctx.saved_tensors
+         src_i, rec_i, bg_rec_i, f) = ctx.saved_tensors
         (dvydy_store, dvxdx_store, dvxy_store, dvydb_store, dvxdb_store,
          ddvydy_store, ddvxdx_store, ddvxy_store, ddvydb_store,
          ddvxdb_store) = [st.snap for st in storage]
@@ -302,7 +291,7 @@ class BornElasticFunc(torch.autograd.Function):
         if device.type == "cuda":
             torch.cuda.set_device(device)
         dtype = lamb_p.dtype
-        n_shots, ny, nx, ny_nx = ctx.n_shots, ctx.ny, ctx.nx, ctx.ny_nx
+        n_shots, ny, nx = ctx.n_shots, ctx.ny, ctx.nx
         nt, grad_stride = ctx.nt, ctx.grad_stride
         # integral sampling: each snapshot represents
         # `grad_stride` time steps of the model-gradient integral.
@@ -311,6 +300,11 @@ class BornElasticFunc(torch.autograd.Function):
         if grad_r is None:
             grad_r = torch.zeros(nt, n_shots, ctx.n_rec, device=device, dtype=dtype)
         grad_r = grad_r.contiguous()
+        if grad_r_bg is None:
+            grad_r_bg = torch.zeros(
+                nt, n_shots, ctx.n_bg_rec, device=device, dtype=dtype
+            )
+        grad_r_bg = grad_r_bg.contiguous()
         grad_f = torch.zeros(nt, n_shots, ctx.n_src, device=device, dtype=dtype)
         grad_lamb = torch.zeros(n_shots, ny, nx, device=device, dtype=dtype)
         grad_mu = torch.zeros_like(grad_lamb)
@@ -342,11 +336,15 @@ class BornElasticFunc(torch.autograd.Function):
 
         ayh, byh, ay, by, axh, bxh, ax, bx = ctx.profs
         segments = ctx.segments
+        # Checkpointed backward: per segment the C++ loop restores the
+        # wavefield state, replays the forward steps to regenerate the
+        # snapshots, then runs the adjoint.  Full storage: straight adjoint.
+        segments_t = (
+            torch.tensor(segments, dtype=torch.int64)
+            if segments
+            else torch.empty(0, 2, dtype=torch.int64)
+        )
         if segments:
-            # Checkpointed backward: per segment, restore the wavefield state,
-            # replay the forward steps to regenerate the snapshots, then run
-            # the adjoint steps.  The adjoint state carries across segments.
-            # Snapshots use snap_off (same layout as elastic2d full-wave).
             f_vy, f_vx = z(n_shots, ny, nx), z(n_shots, ny, nx)
             f_dvy, f_dvx = z(n_shots, ny, nx), z(n_shots, ny, nx)
             f_syy, f_sxx, f_sxy = (
@@ -363,165 +361,38 @@ class BornElasticFunc(torch.autograd.Function):
             f_m_vxy, f_m_vyx = z(n_shots, ny, nx), z(n_shots, ny, nx)
             f_dm_vyy, f_dm_vxx = z(n_shots, ny, nx), z(n_shots, ny, nx)
             f_dm_vxy, f_dm_vyx = z(n_shots, ny, nx), z(n_shots, ny, nx)
-            state_bufs = (
+            state_f = [
                 f_vy, f_vx, f_syy, f_sxx, f_sxy,
                 f_m_vyy, f_m_vxx, f_m_vxy, f_m_vyx,
                 f_m_sigmayyy, f_m_sigmaxyx, f_m_sigmaxyy, f_m_sigmaxxx,
                 f_dvy, f_dvx, f_dsyy, f_dsxx, f_dsxy,
                 f_dm_vyy, f_dm_vxx, f_dm_vxy, f_dm_vyx,
                 f_dm_sigmayyy, f_dm_sigmaxyx, f_dm_sigmaxyy, f_dm_sigmaxxx,
-            )
-            ckpt = ctx.ckpt_state
-            shot_count = n_shots * ny * nx
-            for k in range(len(segments) - 1, -1, -1):
-                s0, s1 = segments[k]
-                if s0 > 0:
-                    c = ckpt[k - 1]
-                    for i, buf in enumerate(state_bufs):
-                        buf.copy_(c[i])
-                else:
-                    for buf in state_bufs:
-                        buf.zero_()
-                # replay the forward steps (regenerate the snapshots)
-                for t in range(s0, s1):
-                    snap_off = ((t - s0) // grad_stride) * shot_count
-                    ext.born_step_velocity(
-                        f_vy, f_vx, f_syy, f_sxx, f_sxy,
-                        f_dvy, f_dvx, f_dsyy, f_dsxx, f_dsxy,
-                        f_m_sigmayyy, f_m_sigmaxyx, f_m_sigmaxyy, f_m_sigmaxxx,
-                        f_dm_sigmayyy, f_dm_sigmaxyx, f_dm_sigmaxyy, f_dm_sigmaxxx,
-                        buoyancy_y, buoyancy_x, dbuoyancy_y, dbuoyancy_x,
-                        dvydb_store, dvxdb_store, ddvydb_store, ddvxdb_store,
-                        ayh, byh, ay, by, axh, bxh, ax, bx, ctx.c,
-                        ctx.fd_pad[0], ctx.fd_pad[1], ctx.fd_pad[2], ctx.fd_pad[3],
-                        ctx.rdy, ctx.rdx, ctx.dtv, t, grad_stride,
-                        ctx.model_batched, ctx.scatter_batched, 1, snap_off,
-                    )
-                    ext.born_step_stress(
-                        f_vy, f_vx, f_dvy, f_dvx,
-                        f_syy, f_sxx, f_sxy, f_dsyy, f_dsxx, f_dsxy,
-                        f_m_vyy, f_m_vxx, f_m_vxy, f_m_vyx,
-                        f_dm_vyy, f_dm_vxx, f_dm_vxy, f_dm_vyx,
-                        lamb_p, mu_p, mu_yx, dlamb_p, dmu_p, dmu_yx,
-                        dvydy_store, dvxdx_store, dvxy_store,
-                        ddvydy_store, ddvxdx_store, ddvxy_store,
-                        ayh, byh, ay, by, axh, bxh, ax, bx, ctx.c,
-                        ctx.fd_pad[0], ctx.fd_pad[1], ctx.fd_pad[2], ctx.fd_pad[3],
-                        ctx.rdy, ctx.rdx, ctx.dtv, t, grad_stride,
-                        ctx.model_batched, ctx.scatter_batched, 1, snap_off,
-                    )
-                    if ctx.n_src > 0:
-                        ext.born_inject_pressure(
-                            f_syy, f_sxx, f, src_i, t, n_shots, ctx.n_src, ny_nx,
-                        )
-                # adjoint steps for the segment
-                for t in range(s1 - 1, s0 - 1, -1):
-                    snap_off = ((t - s0) // grad_stride) * shot_count
-                    parity = (nt - 1 - t) % 2
-                    old = m_sig_b if parity else m_sig_a
-                    new = m_sig_a if parity else m_sig_b
-                    dold = dm_sig_b if parity else dm_sig_a
-                    dnew = dm_sig_a if parity else dm_sig_b
-                    if ctx.n_src > 0:
-                        ext.born_record_grad_f_p(
-                            l_syy, l_sxx, grad_f, src_i, t,
-                            n_shots, ctx.n_src, ny_nx,
-                        )
-                    ext.born_adjoint_velocity(
-                        lamb_p, mu_p, mu_yx, dlamb_p, dmu_p, dmu_yx,
-                        l_vy, l_vx, l_dvy, l_dvx,
-                        l_syy, l_sxx, l_sxy, l_dsyy, l_dsxx, l_dsxy,
-                        m_vyy, m_vxx, m_vxy, m_vyx,
-                        dm_vyy, dm_vxx, dm_vxy, dm_vyx,
-                        old[0], old[1], old[2], old[3],
-                        new[0], new[1], new[2], new[3],
-                        dold[0], dold[1], dold[2], dold[3],
-                        dnew[0], dnew[1], dnew[2], dnew[3],
-                        buoyancy_y, buoyancy_x, dbuoyancy_y, dbuoyancy_x,
-                        grad_by, grad_bx, grad_dby, grad_dbx,
-                        dvydb_store, dvxdb_store, ddvydb_store, ddvxdb_store,
-                        ayh, byh, ay, by, axh, bxh, ax, bx,
-                        ctx.c, ctx.fd_pad[0], ctx.fd_pad[1],
-                        ctx.fd_pad[2], ctx.fd_pad[3],
-                        ctx.rdy, ctx.rdx, ctx.dtv, t, grad_stride, scale,
-                        ctx.model_batched, ctx.scatter_batched, snap_off,
-                    )
-                    ext.born_adjoint_stress(
-                        buoyancy_y, buoyancy_x, dbuoyancy_y, dbuoyancy_x,
-                        l_vy, l_vx, l_dvy, l_dvx,
-                        l_syy, l_sxx, l_sxy, l_dsyy, l_dsxx, l_dsxy,
-                        m_vyy, m_vxx, m_vxy, m_vyx,
-                        dm_vyy, dm_vxx, dm_vxy, dm_vyx,
-                        lamb_p, mu_p, mu_yx, dlamb_p, dmu_p, dmu_yx,
-                        old[0], old[1], old[2], old[3],
-                        dold[0], dold[1], dold[2], dold[3],
-                        grad_lamb, grad_mu, grad_mu_yx,
-                        grad_dlamb, grad_dmu, grad_dmu_yx,
-                        dvydy_store, dvxdx_store, dvxy_store,
-                        ddvydy_store, ddvxdx_store, ddvxy_store,
-                        ayh, byh, ay, by, axh, bxh, ax, bx,
-                        ctx.c, ctx.fd_pad[0], ctx.fd_pad[1],
-                        ctx.fd_pad[2], ctx.fd_pad[3],
-                        ctx.rdy, ctx.rdx, ctx.dtv, t, grad_stride, scale,
-                        ctx.model_batched, ctx.scatter_batched, snap_off,
-                    )
-                    if ctx.n_rec > 0:
-                        ext.born_add_grad_r(
-                            l_dsyy, l_dsxx, grad_r, rec_i, t,
-                            n_shots, ctx.n_rec, ny_nx,
-                        )
+            ]
         else:
-            for t in range(nt - 1, -1, -1):
-                parity = (nt - 1 - t) % 2
-                old = m_sig_b if parity else m_sig_a
-                new = m_sig_a if parity else m_sig_b
-                dold = dm_sig_b if parity else dm_sig_a
-                dnew = dm_sig_a if parity else dm_sig_b
-                snap_off = storage[0].snap_offset(t // grad_stride)
-                if ctx.n_src > 0:
-                    ext.born_record_grad_f_p(
-                        l_syy, l_sxx, grad_f, src_i, t, n_shots, ctx.n_src, ny_nx,
-                    )
-                ext.born_adjoint_velocity(
-                    lamb_p, mu_p, mu_yx, dlamb_p, dmu_p, dmu_yx,
-                    l_vy, l_vx, l_dvy, l_dvx,
-                    l_syy, l_sxx, l_sxy, l_dsyy, l_dsxx, l_dsxy,
-                    m_vyy, m_vxx, m_vxy, m_vyx,
-                    dm_vyy, dm_vxx, dm_vxy, dm_vyx,
-                    old[0], old[1], old[2], old[3],
-                    new[0], new[1], new[2], new[3],
-                    dold[0], dold[1], dold[2], dold[3],
-                    dnew[0], dnew[1], dnew[2], dnew[3],
-                    buoyancy_y, buoyancy_x, dbuoyancy_y, dbuoyancy_x,
-                    grad_by, grad_bx, grad_dby, grad_dbx,
-                    dvydb_store, dvxdb_store, ddvydb_store, ddvxdb_store,
-                    ayh, byh, ay, by, axh, bxh, ax, bx,
-                    ctx.c, ctx.fd_pad[0], ctx.fd_pad[1], ctx.fd_pad[2], ctx.fd_pad[3],
-                    ctx.rdy, ctx.rdx, ctx.dtv, t, grad_stride, scale,
-                    ctx.model_batched, ctx.scatter_batched, snap_off,
-                )
-                ext.born_adjoint_stress(
-                    buoyancy_y, buoyancy_x, dbuoyancy_y, dbuoyancy_x,
-                    l_vy, l_vx, l_dvy, l_dvx,
-                    l_syy, l_sxx, l_sxy, l_dsyy, l_dsxx, l_dsxy,
-                    m_vyy, m_vxx, m_vxy, m_vyx,
-                    dm_vyy, dm_vxx, dm_vxy, dm_vyx,
-                    lamb_p, mu_p, mu_yx, dlamb_p, dmu_p, dmu_yx,
-                    old[0], old[1], old[2], old[3],
-                    dold[0], dold[1], dold[2], dold[3],
-                    grad_lamb, grad_mu, grad_mu_yx,
-                    grad_dlamb, grad_dmu, grad_dmu_yx,
-                    dvydy_store, dvxdx_store, dvxy_store,
-                    ddvydy_store, ddvxdx_store, ddvxy_store,
-                    ayh, byh, ay, by, axh, bxh, ax, bx,
-                    ctx.c, ctx.fd_pad[0], ctx.fd_pad[1], ctx.fd_pad[2], ctx.fd_pad[3],
-                    ctx.rdy, ctx.rdx, ctx.dtv, t, grad_stride, scale,
-                    ctx.model_batched, ctx.scatter_batched, snap_off,
-                )
-                if ctx.n_rec > 0:
-                    ext.born_add_grad_r(
-                        l_dsyy, l_dsxx, grad_r, rec_i, t, n_shots, ctx.n_rec, ny_nx,
-                    )
+            state_f = []
+        ext.born_elastic_adjoint_loop(
+            lamb_p, mu_p, mu_yx, buoyancy_y, buoyancy_x,
+            dlamb_p, dmu_p, dmu_yx, dbuoyancy_y, dbuoyancy_x,
+            dvydy_store, dvxdx_store, dvxy_store, dvydb_store, dvxdb_store,
+            ddvydy_store, ddvxdx_store, ddvxy_store, ddvydb_store, ddvxdb_store,
+            grad_lamb, grad_mu, grad_mu_yx, grad_dlamb, grad_dmu, grad_dmu_yx,
+            grad_by, grad_bx, grad_dby, grad_dbx,
+            grad_f, grad_r, grad_r_bg,
+            src_i, rec_i, bg_rec_i, f,
+            l_vy, l_vx, l_dvy, l_dvx,
+            l_syy, l_sxx, l_sxy, l_dsyy, l_dsxx, l_dsxy,
+            m_vyy, m_vxx, m_vxy, m_vyx,
+            dm_vyy, dm_vxx, dm_vxy, dm_vyx,
+            m_sig_a, m_sig_b, dm_sig_a, dm_sig_b,
+            state_f,
+            ayh, byh, ay, by, axh, bxh, ax, bx, ctx.c,
+            ctx.fd_pad[0], ctx.fd_pad[1], ctx.fd_pad[2], ctx.fd_pad[3],
+            ctx.rdy, ctx.rdx, ctx.dtv, scale,
+            nt, grad_stride,
+            ctx.model_batched, ctx.scatter_batched,
+            segments_t, ctx.ckpt_state,
+        )
 
         if not ctx.model_batched:
             grad_lamb = grad_lamb.sum(0, keepdim=True)
@@ -537,12 +408,14 @@ class BornElasticFunc(torch.autograd.Function):
             grad_dbx = grad_dbx.sum(0, keepdim=True)
         # grad through the f = -amp * dt pre-scaling
         grad_amp = (grad_f * (-ctx.dtv)).permute(1, 2, 0)
+        # 36 forward() inputs: 11 model/source grads + 25 x None.
         return (
             grad_lamb, grad_mu, grad_mu_yx, grad_by, grad_bx,
             grad_dlamb, grad_dmu, grad_dmu_yx, grad_dby, grad_dbx,
             grad_amp,
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None,
         )
 
 
@@ -558,6 +431,7 @@ def elastic2d_born(
     source_amplitudes=None,
     source_locations=None,
     receiver_locations=None,
+    bg_receiver_locations=None,
     accuracy=2,
     pml_width=20,
     pml_freq=25.0,
@@ -565,6 +439,10 @@ def elastic2d_born(
     storage="auto",
     sample_steps=1,
     ckpt_steps=None,
+    forward_callback=None,
+    callback_frequency=1,
+    return_state=False,
+    initial_state=None,
 ):
     """2D elastic Born forward + adjoint (torch in/out).
 
@@ -585,8 +463,34 @@ def elastic2d_born(
             ~sqrt(nt), 0 = full storage (every sampled step), N = save wavefield
             state every N steps and replay on backward.  Same gradients as full
             storage at the same sample_steps.
+        forward_callback: called every ``callback_frequency`` steps with a
+            ``CallbackState`` (deepwave-style) exposing the current padded
+            wavefields via ``state.get_wavefield(name, view)`` — useful for
+            RTM imaging conditions, illumination accumulation, monitoring.
+            The available wavefields are all background and scattered
+            velocity/stress fields; PML memory variables stay internal.
+        callback_frequency: call ``forward_callback`` every N time steps.
+        return_state: if True, append the final state dict to the outputs.
+            The state is a
+            dict of the FINAL padded wavefield state (keys ``vy``, ``vx``,
+            ``syy``, ``sxx``, ``sxy``, ``dvy``, ``dvx``, ``dsyy``, ``dsxx``,
+            ``dsxy``, plus the PML memory variables) suitable for
+            continuation via ``initial_state``.
+        initial_state: a dict of initial wavefield state (padded grid, keys
+            as in the ``return_state=True`` output) to continue a previous
+            run.  Missing keys are zero-filled; a complete state dict (every
+            key, including the PML memory variables) makes a split run
+            bitwise match a one-shot run, while a partial dict restores only
+            the given fields with the remaining state starting from zero.
+            State I/O is for forward continuation; autograd does not propagate
+            across the boundary between runs.  State dicts are ephemeral
+            runtime snapshots: they may be passed back only to the same
+            propagator with the same model layout and nami version, and are
+            not a stable long-term checkpoint format.
 
-    Returns scattered pressure traces ``[nt, n_shots, n_rec]``.
+    Returns scattered pressure traces ``[nt, n_shots, n_rec]``.  When
+    ``bg_receiver_locations`` is provided, returns ``(r, r_bg)``; with
+    ``return_state=True`` the state dict is appended.
     """
     accuracy = check_accuracy(accuracy)
     if not isinstance(grid_spacing, (list, tuple)):
@@ -622,6 +526,13 @@ def elastic2d_born(
         device,
         dtype,
     )
+    if bg_receiver_locations is not None:
+        (_,), _, bg_rec_i = extract_survey_2d(
+            [lamb], None, bg_receiver_locations, fd_pad, pml_w,
+            n_shots, device, dtype,
+        )
+    else:
+        bg_rec_i = torch.empty((n_shots, 0), dtype=torch.int64, device=device)
     ny, nx = lamb_p.shape[-2:]
 
     def _pad_scatter(model):
@@ -672,15 +583,10 @@ def elastic2d_born(
         mu_p, buoy_p, dmu_p, db_p
     )
 
-    if source_amplitudes is not None:
-        amp = source_amplitudes.to(device=device, dtype=dtype)
-        if amp.shape[0] != n_shots:
-            raise ValueError("source_amplitudes must have n_shots batches.")
-        if amp.shape[2] < nt_inner:
-            raise ValueError("source_amplitudes must have at least nt steps.")
-        amp = amp[:, :, :nt_inner].contiguous()
-    else:
-        amp = torch.zeros(n_shots, 0, nt_inner, device=device, dtype=dtype)
+    amp = prepare_source_amplitudes(
+        source_amplitudes, n_shots, src_i.shape[1], nt_inner,
+        device=device, dtype=dtype,
+    )
 
     storage_mode = resolve_storage(storage)
     grad_stride = check_sample_steps(sample_steps)
@@ -695,29 +601,26 @@ def elastic2d_born(
         nt_inner, N_STATE, grad_stride, N_STREAMS, storage_enabled,
         ckpt_steps=ckpt_steps,
     )
-    # Batched flags from the *user* models (before pad).  Each flag governs
-    # its whole group; None scatter counts as shared zeros.
-    check_model_batching(
-        [lamb, mu, buoyancy], ("lamb", "mu", "buoyancy"), n_shots
+    # Each native flag governs a coefficient group.  Mixed public-model
+    # batching is normalised by materialising only shared group members;
+    # autograd still reduces those gradients to their original shapes.
+    background_coeffs, model_batched = materialize_batched_group(
+        [lamb_p, mu_p, mu_yx, buoyancy_y, buoyancy_x], n_shots
     )
-    check_model_batching(
-        [lamb_scatter, mu_scatter, buoyancy_scatter],
-        ("lamb_scatter", "mu_scatter", "buoyancy_scatter"),
-        n_shots,
+    lamb_p, mu_p, mu_yx, buoyancy_y, buoyancy_x = background_coeffs
+    scatter_coeffs = [
+        dlamb_p, dmu_p, dmu_yx, dbuoyancy_y, dbuoyancy_x,
+    ]
+    scatter_coeffs, scatter_batched = materialize_batched_group(
+        scatter_coeffs, n_shots
     )
-    model_batched = 1 if is_shot_batched(lamb, n_shots) else 0
-    scatter_batched = 1 if any(
-        is_shot_batched(m, n_shots)
-        for m in (lamb_scatter, mu_scatter, buoyancy_scatter)
-    ) else 0
+    dlamb_p, dmu_p, dmu_yx, dbuoyancy_y, dbuoyancy_x = scatter_coeffs
 
     stores = None
     ckpt_state = None
     if storage_enabled:
         stores = [
-            SnapshotStorage(
-                _storage_ext, n_snap, n_shots, ny, nx, dtype, device,
-            )
+            SnapshotStorage(_ext, n_snap, n_shots, ny, nx, dtype, device)
             for _ in range(N_STREAMS)
         ]
         if n_ckpt > 0:
@@ -725,10 +628,30 @@ def elastic2d_born(
                 n_ckpt, N_STATE, n_shots, ny, nx, device=device, dtype=dtype,
             )
 
-    r = BornElasticFunc.apply(
+    # Wavefield I/O (deepwave-style): continuation initial state, optional
+    # final-state output, and the per-step forward callback.
+    state_shape = (n_shots, ny, nx)
+    init_state = prepare_initial_state(
+        initial_state, _WAVEFIELD_NAMES, state_shape, device=device, dtype=dtype,
+    )
+    final_state = allocate_final_state(
+        return_state, _WAVEFIELD_NAMES, state_shape, device=device, dtype=dtype,
+    )
+    callback_frequency = validate_callback_frequency(callback_frequency)
+    cb = (
+        wrap_forward_callback(
+            forward_callback,
+            _CALLBACK_FIELDS,
+            float(dt), fd_pad, list(pml_w),
+        )
+        if forward_callback is not None
+        else None
+    )
+
+    r, r_bg = BornElasticFunc.apply(
         lamb_p, mu_p, mu_yx, buoyancy_y, buoyancy_x,
         dlamb_p, dmu_p, dmu_yx, dbuoyancy_y, dbuoyancy_x,
-        amp, src_i, rec_i, profs, c,
+        amp, src_i, rec_i, bg_rec_i, profs, c,
         fd_pad[0], fd_pad[1], fd_pad[2], fd_pad[3],
         1.0 / grid_spacing[0],
         1.0 / grid_spacing[1],
@@ -742,5 +665,15 @@ def elastic2d_born(
         ckpt_state,
         checkpoint_every,
         segments,
+        init_state, final_state, cb, callback_frequency,
     )
-    return -r / 2
+    r = -r / 2
+    r_bg = -r_bg / 2
+    if return_state:
+        state = unpack_state(final_state, _WAVEFIELD_NAMES)
+        if bg_receiver_locations is not None:
+            return r, r_bg, state
+        return r, state
+    if bg_receiver_locations is not None:
+        return r, r_bg
+    return r

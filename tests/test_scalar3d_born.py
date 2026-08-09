@@ -155,33 +155,59 @@ def test_born_linearity():
     assert 2.5 < ratio < 6.0, f"residual did not scale quadratically: {ratio}"
 
 
+def test_background_receiver_matches_full_solve_and_gradient():
+    c = build_case(
+        dtype=torch.float64, nz=8, ny=8, nx=8, nt=6, pml=2,
+        device="cuda:0", seed=7,
+    )
+    dev = c["device"]
+    v = c["v"].to(dev).requires_grad_(True)
+    scatter = c["scatter"].to(dev)
+    amp = c["amp"].to(dev).requires_grad_(True)
+    _, r_bg = _run_nami(c, v, scatter, amp)
+
+    full_v = v.detach().clone().requires_grad_(True)
+    full_amp = amp.detach().clone().requires_grad_(True)
+    r_full = scalar3d(
+        full_v, c["grid_spacing"], c["dt"], source_amplitudes=full_amp,
+        source_locations=c["srcs"].to(dev),
+        receiver_locations=c["bg_recs"].to(dev), accuracy=2,
+        pml_width=c["pml"], pml_freq=25.0, nt=c["nt"],
+    )
+    torch.testing.assert_close(r_bg, r_full, rtol=0, atol=0)
+    grads = torch.autograd.grad(r_bg.square().sum(), (v, amp))
+    refs = torch.autograd.grad(r_full.square().sum(), (full_v, full_amp))
+    for grad, ref in zip(grads, refs, strict=True):
+        torch.testing.assert_close(grad, ref, rtol=1e-6, atol=1e-12)
+
+
 def test_gradcheck():
-    """Numerical gradient check for v, scatter, and source_amplitudes."""
+    """Numerical gradient check for v, scatter, and amplitudes at every order."""
     dtype = torch.float64
     c = build_case(
         dtype=dtype, nz=8, ny=10, nx=10, nt=8, pml=3, device="cuda:0", seed=1
     )
     dev = c["device"]
 
-    def fn(v, scatter, amp):
-        return _run_nami(c, v, scatter, amp)
+    for accuracy in (2, 4, 6, 8):
+        def fn(v, scatter, amp, accuracy=accuracy):
+            return _run_nami(c, v, scatter, amp, accuracy=accuracy)
 
-    ok = torch.autograd.gradcheck(
-        fn,
-        (
-            c["v"].to(dev, dtype).requires_grad_(True),
-            c["scatter"].to(dev, dtype).requires_grad_(True),
-            c["amp"].to(dev, dtype).requires_grad_(True),
-        ),
-        eps=1e-6,
-        atol=1e-5,
-        rtol=1e-3,
-        fast_mode=True,
-        nondet_tol=1e-8,
-        raise_exception=False,
-    )
-    print("gradcheck nami scalar3d_born (v, scatter, amp):", ok)
-    assert ok
+        ok = torch.autograd.gradcheck(
+            fn,
+            (
+                c["v"].to(dev, dtype).requires_grad_(True),
+                c["scatter"].to(dev, dtype).requires_grad_(True),
+                c["amp"].to(dev, dtype).requires_grad_(True),
+            ),
+            eps=1e-6,
+            atol=1e-5,
+            rtol=1e-3,
+            fast_mode=True,
+            nondet_tol=1e-8,
+            raise_exception=False,
+        )
+        assert ok, f"scalar3d_born gradcheck failed at accuracy={accuracy}"
 
 
 def test_storage_false_is_forward_only():

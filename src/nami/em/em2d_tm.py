@@ -16,7 +16,9 @@ recursions.
 
 Kernels are intentionally unoptimised (one launch per step, naive stencil)
 — that is the correctness baseline; performance work lands on top of it
-later.
+later.  The time-stepping loop itself runs inside the extension
+(``forward_loop`` / ``adjoint_loop``): one pybind call per pass, with
+checkpoint save/restore and snapshot offsets computed in C++.
 
 The spatial FD order is user-selectable (accuracy 2/4/6/8) with the
 ``fd.STAGGERED_DIFF1`` coefficient tables (staggered-grid
@@ -34,16 +36,22 @@ import math
 import nami_em2d_tm as _ext
 import torch
 
+from ..common.callback import validate_callback_frequency, wrap_forward_callback
 from ..common.cfl import check_cfl
 from ..common.fd import check_accuracy, staggered_diff1_coeffs
 from ..common.pml import set_pml_width
+from ..common.state import allocate_final_state, prepare_initial_state, unpack_state
 from ..common.storage import (
     SnapshotStorage,
     check_sample_steps,
     resolve_storage,
     storage_plan,
 )
-from ..common.survey import extract_survey_2d
+from ..common.survey import (
+    extract_survey_2d,
+    is_shot_batched,
+    prepare_source_amplitudes,
+)
 from ._common import EPS0, MU0, _compile_material_coefficients, _pml_profile_1d
 
 # Checkpoint state layout (saved at time t before step t):
@@ -56,6 +64,11 @@ from ._common import EPS0, MU0, _compile_material_coefficients, _pml_profile_1d
 #   [6] m_hz_x  split-field memory (x) from the E integer-step
 N_STATE = 7
 N_STREAMS = 2
+
+# Wavefield names (callback + state-dict keys); slot order matches the
+# N_STATE comment above.
+_WAVEFIELD_NAMES = ("ey", "hx", "hz", "m_ey_z", "m_ey_x", "m_hx_z", "m_hz_x")
+_CALLBACK_FIELDS = ("ey", "hx", "hz")
 
 
 class TM2DFunc(torch.autograd.Function):
@@ -80,6 +93,10 @@ class TM2DFunc(torch.autograd.Function):
         ckpt_state,      # [n_ckpt, N_STATE, n_shots, ny, nx] or None
         checkpoint_every,  # 0 = full storage; N = checkpoint every N steps
         segments,        # [(s0, s1)] replay segments; [] = full storage
+        init_state,      # [N_STATE, n_shots, ny, nx] initial wavefield or None
+        final_state,     # [N_STATE, n_shots, ny, nx] output buffer or None
+        forward_callback,  # cb(t, nt, ey, hx, hz) or None
+        callback_frequency,  # call the callback every N steps
     ):
         ext = _ext
         device = ca_p.device
@@ -91,9 +108,7 @@ class TM2DFunc(torch.autograd.Function):
         # wavefields (ca_batched/cb_batched/cq_batched select model slab 0).
         n_shots = int(src_i.shape[0])
         ny, nx = ca_p.shape[-2:]
-        n_src = src_i.shape[1]
         n_rec = rec_i.shape[1]
-        ny_nx = ny * nx
 
         ey = torch.zeros(n_shots, ny, nx, device=device, dtype=dtype)
         hx = torch.zeros_like(ey)
@@ -113,42 +128,25 @@ class TM2DFunc(torch.autograd.Function):
         ay, ayh, ax, axh, by, byh, bx, bxh, ky, kyh, kx, kxh = [
             p.contiguous() for p in profs
         ]
-        ckpt = ckpt_state is not None
-        for t in range(nt):
-            # snapshot the full wavefield state before step t at every
-            # checkpoint boundary (only in checkpointed mode)
-            if ckpt and t > 0 and t % checkpoint_every == 0:
-                k = t // checkpoint_every - 1
-                ckpt_state[k, 0].copy_(ey)
-                ckpt_state[k, 1].copy_(hx)
-                ckpt_state[k, 2].copy_(hz)
-                ckpt_state[k, 3].copy_(m_ey_z)
-                ckpt_state[k, 4].copy_(m_ey_x)
-                ckpt_state[k, 5].copy_(m_hx_z)
-                ckpt_state[k, 6].copy_(m_hz_x)
-            if segments:
-                # checkpointed forward: intermediate snapshots are
-                # regenerated during the backward replay, so skip the
-                # global-offset writes (they would be ignored anyway)
-                snap_off = 0
-            else:
-                snap_off = (
-                    ey_storage.snap_offset(t // grad_stride) if ey_storage else 0
-                )
-            ext.forward_step(
-                cq_p, ey, hx, hz, m_ey_z, m_ey_x,
-                m_hx_z, m_hz_x,
-                ca_p, cb_p,
-                ey_store, curl_store,
-                ayh, byh, axh, bxh, kyh, kxh,
-                ay, by, ax, bx, ky, kx,
-                c,
-                f, src_i, r, rec_i,
-                rdy, rdx, t, grad_stride, snap_off,
-                pml_y0, pml_y1, pml_x0, pml_x1,
-                *fd_pad, cq_batched, ca_batched, cb_batched,
-                n_shots, ny, nx, ny_nx, n_src, n_rec, 1,
-            )
+        # checkpointed forward stores no snapshots (the backward replay
+        # regenerates them); full storage writes every sampled step.
+        store = 0 if segments else (1 if ey_storage is not None else 0)
+        ext.forward_loop(
+            cq_p, ey, hx, hz, m_ey_z, m_ey_x,
+            m_hx_z, m_hz_x,
+            ca_p, cb_p,
+            ey_store, curl_store,
+            ayh, byh, axh, bxh, kyh, kxh,
+            ay, by, ax, bx, ky, kx,
+            c,
+            f, src_i, r, rec_i,
+            rdy, rdx, nt, grad_stride,
+            pml_y0, pml_y1, pml_x0, pml_x1,
+            *fd_pad, cq_batched, ca_batched, cb_batched,
+            store,
+            checkpoint_every, ckpt_state,
+            init_state, final_state, forward_callback, callback_frequency,
+        )
 
         ctx.ext = ext
         ctx.need_cq = bool(ctx.needs_input_grad[2])
@@ -174,38 +172,6 @@ class TM2DFunc(torch.autograd.Function):
         return r
 
     @staticmethod
-    def _replay_segment(ext, ctx, ca_p, cb_p, cq_p, f, src_i, n_shots, n_src,
-                        ey_f, hx_f, hz_f, m_ey_z_f, m_ey_x_f, m_hx_z_f,
-                        m_hz_x_f, ey_store, curl_store,
-                        ayh, byh, axh, bxh, kyh, kxh,
-                        ay, by, ax, bx, ky, kx,
-                        grad_stride, shot_count, s0, s1):
-        """Re-run forward steps [s0, s1), writing segment-local snapshots.
-
-        ``shot_count`` is the flat per-snapshot size (``n_shots * ny * nx``)
-        used for snapshot offsets; inject still needs the per-shot stride
-        ``ny_nx = ny * nx`` (passing ``shot_count`` here mis-indexes shot ≥ 1).
-        """
-        ny_nx = shot_count // n_shots
-        ny, nx = ey_f.shape[-2:]
-        for t in range(s0, s1):
-            snap_off = ((t - s0) // grad_stride) * shot_count
-            ext.forward_step(
-                cq_p, ey_f, hx_f, hz_f, m_ey_z_f, m_ey_x_f,
-                m_hx_z_f, m_hz_x_f,
-                ca_p, cb_p,
-                ey_store, curl_store,
-                ayh, byh, axh, bxh, kyh, kxh,
-                ay, by, ax, bx, ky, kx,
-                ctx.c,
-                f, src_i, src_i, src_i,
-                ctx.rdy, ctx.rdx, t, grad_stride, snap_off,
-                ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
-                *ctx.fd_pad, ctx.cq_batched, ctx.ca_batched, ctx.cb_batched,
-                n_shots, ny, nx, ny_nx, n_src, 0, 0,
-            )
-
-    @staticmethod
     def backward(ctx, grad_r):
         ext = ctx.ext
         ca_p, cb_p, cq_p, f, src_i, rec_i = ctx.saved_tensors
@@ -224,7 +190,6 @@ class TM2DFunc(torch.autograd.Function):
         ny, nx = ca_p.shape[-2:]
         n_src, n_rec = src_i.shape[1], rec_i.shape[1]
         nt = ctx.nt
-        ny_nx = ny * nx
 
         if grad_r is None:
             grad_r = torch.zeros(nt, n_shots, n_rec, device=device, dtype=dtype)
@@ -261,93 +226,42 @@ class TM2DFunc(torch.autograd.Function):
         grad_stride = ctx.grad_stride
         segments = ctx.segments
         if segments:
-            # Checkpointed backward: per segment, restore the wavefield
-            # state, replay the forward steps to regenerate the snapshots,
-            # then run the adjoint steps.  The adjoint state (lambda +
-            # memory variables) carries across segments.
-            ey_f = torch.zeros(n_shots, ny, nx, device=device, dtype=dtype)
-            hx_f = torch.zeros_like(ey_f)
-            hz_f = torch.zeros_like(ey_f)
-            m_ey_z_f = torch.zeros_like(ey_f)
-            m_ey_x_f = torch.zeros_like(ey_f)
-            m_hx_z_f = torch.zeros_like(ey_f)
-            m_hz_x_f = torch.zeros_like(ey_f)
-            ckpt = ctx.ckpt_state
-            for k in range(len(segments) - 1, -1, -1):
-                s0, s1 = segments[k]
-                if s0 > 0:
-                    c = ckpt[k - 1]
-                    ey_f.copy_(c[0])
-                    hx_f.copy_(c[1])
-                    hz_f.copy_(c[2])
-                    m_ey_z_f.copy_(c[3])
-                    m_ey_x_f.copy_(c[4])
-                    m_hx_z_f.copy_(c[5])
-                    m_hz_x_f.copy_(c[6])
-                else:
-                    for buf in (
-                        ey_f, hx_f, hz_f, m_ey_z_f, m_ey_x_f, m_hx_z_f, m_hz_x_f,
-                    ):
-                        buf.zero_()
-                TM2DFunc._replay_segment(
-                    ext, ctx, ca_p, cb_p, cq_p, f, src_i, n_shots, n_src,
-                    ey_f, hx_f, hz_f, m_ey_z_f, m_ey_x_f, m_hx_z_f, m_hz_x_f,
-                    ey_store, curl_store,
-                    ayh, byh, axh, bxh, kyh, kxh,
-                    ay, by, ax, bx, ky, kx,
-                    grad_stride, n_shots * ny_nx, s0, s1,
-                )
-                for t in range(s1 - 1, s0 - 1, -1):
-                    snap_off = ((t - s0) // grad_stride) * (n_shots * ny_nx)
-                    ext.backward_step(
-                        ca_p, cb_p, cq_p,
-                        lam_ey,
-                        m_lambda_hx_z, m_lambda_hz_x,
-                        work_x, work_y,
-                        work2_x, work2_y,
-                        m_lambda_ey_x, m_lambda_ey_z,
-                        lam_hx, lam_hz,
-                        grad_r, rec_i,
-                        grad_f, src_i,
-                        ey_store, curl_store,
-                        grad_ca, grad_cb,
-                        grad_cq,
-                        ay, by, ax, bx, ky, kx,
-                        ayh, byh, axh, bxh, kyh, kxh,
-                        ctx.c,
-                        ctx.rdy, ctx.rdx, t, grad_stride, scale, snap_off,
-                        ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
-                        *ctx.fd_pad, ctx.cq_batched, ctx.ca_batched,
-                        ctx.cb_batched,
-                        n_shots, ny, nx, ny_nx, n_src, n_rec,
-                        need_cq, need_f,
-                    )
+            # Checkpointed backward replays each segment's forward pass in
+            # C++; these buffers hold the replayed wavefield state (slot
+            # order matches the N_STATE comment above).
+            fwd_state = [
+                torch.zeros(n_shots, ny, nx, device=device, dtype=dtype)
+                for _ in range(N_STATE)
+            ]
+            segments_t = torch.tensor(segments, dtype=torch.int64)
         else:
-            for t in range(nt - 1, -1, -1):
-                snap_off = ey_storage.snap_offset(t // grad_stride)
-                ext.backward_step(
-                    ca_p, cb_p, cq_p,
-                    lam_ey,
-                    m_lambda_hx_z, m_lambda_hz_x,
-                    work_x, work_y,
-                    work2_x, work2_y,
-                    m_lambda_ey_x, m_lambda_ey_z,
-                    lam_hx, lam_hz,
-                    grad_r, rec_i,
-                    grad_f, src_i,
-                    ey_store, curl_store,
-                    grad_ca, grad_cb,
-                    grad_cq,
-                    ay, by, ax, bx, ky, kx,
-                    ayh, byh, axh, bxh, kyh, kxh,
-                    ctx.c,
-                    ctx.rdy, ctx.rdx, t, grad_stride, scale, snap_off,
-                    ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
-                    *ctx.fd_pad, ctx.cq_batched, ctx.ca_batched,
-                    ctx.cb_batched,
-                    n_shots, ny, nx, ny_nx, n_src, n_rec,
-                    need_cq, need_f,
-                )
+            fwd_state = []
+            segments_t = torch.empty(0, 2, dtype=torch.int64)
+        ext.adjoint_loop(
+            ca_p, cb_p, cq_p,
+            lam_ey,
+            m_lambda_hx_z, m_lambda_hz_x,
+            work_x, work_y,
+            work2_x, work2_y,
+            m_lambda_ey_x, m_lambda_ey_z,
+            lam_hx, lam_hz,
+            grad_r, rec_i,
+            grad_f, src_i,
+            f,
+            ey_store, curl_store,
+            grad_ca, grad_cb,
+            grad_cq,
+            ay, by, ax, bx, ky, kx,
+            ayh, byh, axh, bxh, kyh, kxh,
+            ctx.c,
+            fwd_state,
+            ctx.rdy, ctx.rdx, scale,
+            nt, grad_stride,
+            ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
+            *ctx.fd_pad, ctx.cq_batched, ctx.ca_batched, ctx.cb_batched,
+            need_cq, need_f,
+            segments_t, ctx.ckpt_state,
+        )
 
         grad_ca = grad_ca if ctx.ca_batched else grad_ca.sum(0, keepdim=True)
         grad_cb = grad_cb if ctx.cb_batched else grad_cb.sum(0, keepdim=True)
@@ -357,8 +271,8 @@ class TM2DFunc(torch.autograd.Function):
         return (
             grad_ca, grad_cb, grad_cq, grad_f,
             None, None, None, None, None, None, None, None, None, None,
-            None, None, None, None, None, None, None, None,
-            None, None, None,
+            None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None,
         )
 
 
@@ -377,6 +291,10 @@ def em2d_tm(
     storage="auto",
     sample_steps=1,
     ckpt_steps=None,
+    forward_callback=None,
+    callback_frequency=1,
+    return_state=False,
+    initial_state=None,
 ):
     """2D TM Maxwell (Ey-Hx-Hz) forward modelling / FWI primitive.
 
@@ -407,9 +325,31 @@ def em2d_tm(
             ~sqrt(nt), 0 = full storage (every sampled step), N = save wavefield
             state every N steps and replay on backward.  Same gradients as full
             storage at the same sample_steps.
+        forward_callback: called every ``callback_frequency`` steps with a
+            ``CallbackState`` (deepwave-style) exposing the current padded
+            wavefields (``ey``, ``hx``, ``hz``) via
+            ``state.get_wavefield(name, view)`` — useful for RTM imaging
+            conditions, illumination accumulation, monitoring.
+        callback_frequency: call ``forward_callback`` every N time steps.
+        return_state: if True, return ``(r, state)`` where ``state`` is a
+            dict of the FINAL padded wavefield state (keys ``ey``, ``hx``,
+            ``hz``, ``m_ey_z``, ``m_ey_x``, ``m_hx_z``, ``m_hz_x``)
+            suitable for continuation via ``initial_state``.
+        initial_state: a dict of initial wavefield state (padded grid, keys
+            as in the ``return_state=True`` output) to continue a previous
+            run.  Missing keys are zero-filled; a complete state dict (every
+            key, including the PML memory variables) makes a split run
+            bitwise match a one-shot run, while a partial dict restores only
+            the given fields with the remaining state starting from zero.
+            State I/O is for forward continuation; autograd does not propagate
+            across the boundary between runs.  State dicts are ephemeral
+            runtime snapshots: they may be passed back only to the same
+            propagator with the same model layout and nami version, and are
+            not a stable long-term checkpoint format.
 
     Returns:
-        receiver_amplitudes [nt, n_shots, n_rec].
+        receiver_amplitudes [nt, n_shots, n_rec] (or ``(r, state)`` when
+        ``return_state=True``).
     """
     accuracy = check_accuracy(accuracy)
     if not isinstance(grid_spacing, (list, tuple)):
@@ -459,30 +399,17 @@ def em2d_tm(
 
     c = staggered_diff1_coeffs(accuracy, dtype, device)
 
-    if source_amplitudes is not None:
-        amp = source_amplitudes.to(device=device, dtype=dtype)
-        if amp.shape[0] != n_shots:
-            raise ValueError("source_amplitudes must have n_shots batches.")
-        if amp.shape[2] < nt_inner:
-            raise ValueError("source_amplitudes must have at least nt steps.")
-        amp = amp[:, :, :nt_inner]
-    else:
-        amp = torch.zeros(n_shots, 0, nt_inner, device=device, dtype=dtype)
+    amp = prepare_source_amplitudes(
+        source_amplitudes, n_shots, src_i.shape[1], nt_inner,
+        device=device, dtype=dtype,
+    )
 
-    # Shared [ny, nx] / [1, ny, nx] models stay rank-1 in the batch dim;
-    # kernels index slab 0 (ca_batched=0) while wavefields are n_shots-wide.
-    # Per-shot model grads are summed in backward (same pattern as elastic2d).
-    # Do not expand shared models to [n_shots, ...] here: that would clash with
-    # the sum(0) reduction (shape mismatch on the Function inputs).
-    ca_batched = 1 if (
-        epsilon.ndim == 3 and epsilon.shape[0] == n_shots and n_shots > 1
-    ) else 0
-    cb_batched = 1 if (
-        sigma.ndim == 3 and sigma.shape[0] == n_shots and n_shots > 1
-    ) else 0
-    cq_batched = 1 if (
-        mu.ndim == 3 and mu.shape[0] == n_shots and n_shots > 1
-    ) else 0
+    # ca/cb both depend on epsilon and sigma, so broadcasting can make either
+    # compiled coefficient per-shot even when one source model is shared.
+    # Derive flags from the tensors consumed by CUDA, not the user inputs.
+    ca_batched = int(is_shot_batched(ca_p, n_shots))
+    cb_batched = int(is_shot_batched(cb_p, n_shots))
+    cq_batched = int(is_shot_batched(cq_p, n_shots))
 
     source_coeff = -1.0 / (grid_spacing[0] * grid_spacing[1])
     if amp.numel() > 0:
@@ -491,9 +418,6 @@ def em2d_tm(
         cb_flat = cb_p.reshape(-1, ny * nx).expand(n_shots, -1)
         cb_at_src = cb_flat.gather(1, src_i_masked)
         f = (amp.permute(2, 0, 1) * cb_at_src.unsqueeze(0) * source_coeff).contiguous()
-    elif src_i.shape[1] > 0:
-        # located sources without amplitudes: inject zero (no-op) amplitudes
-        f = torch.zeros(nt_inner, n_shots, src_i.shape[1], device=device, dtype=dtype)
     else:
         f = torch.empty(0, device=device, dtype=dtype)
 
@@ -526,6 +450,26 @@ def em2d_tm(
                 n_ckpt, N_STATE, n_shots, ny, nx, device=device, dtype=dtype,
             )
 
+    # Wavefield I/O (deepwave-style): continuation initial state, optional
+    # final-state output, and the per-step forward callback.
+    state_shape = (n_shots, ny, nx)
+    init_state = prepare_initial_state(
+        initial_state, _WAVEFIELD_NAMES, state_shape, device=device, dtype=dtype,
+    )
+    final_state = allocate_final_state(
+        return_state, _WAVEFIELD_NAMES, state_shape, device=device, dtype=dtype,
+    )
+    callback_frequency = validate_callback_frequency(callback_frequency)
+    cb = (
+        wrap_forward_callback(
+            forward_callback,
+            _CALLBACK_FIELDS,
+            float(dt), fd_pad, list(pml_w),
+        )
+        if forward_callback is not None
+        else None
+    )
+
     r = TM2DFunc.apply(
         ca_p, cb_p, cq_p, f, src_i, rec_i, profs, c, fd_pad,
         rdy, rdx, nt_inner,
@@ -534,7 +478,10 @@ def em2d_tm(
         grad_stride,
         ey_storage, curl_storage,
         ckpt_state, checkpoint_every, segments,
+        init_state, final_state, cb, callback_frequency,
     )
+    if return_state:
+        return r, unpack_state(final_state, _WAVEFIELD_NAMES)
     return r
 
 

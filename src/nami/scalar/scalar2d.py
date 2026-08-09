@@ -8,24 +8,29 @@ The spatial FD order is user-selectable (accuracy 2/4/6/8) with the
 ``regular_grid`` coefficient tables; the kernels are driven by
 coefficient arrays (fixed max radius 4, zero-padded for lower orders).
 
-Kernels are intentionally unoptimised (one launch per step, naive stencil)
-— that is the correctness baseline; performance work (persistent kernels,
-interior/PML splitting, shared-memory tiling) lands on top of it later.
+Kernels are intentionally unoptimised (naive stencil, one launch per
+operator) — that is the correctness baseline; performance work
+(interior/PML fusion, shared-memory tiling) lands on top of it later.
+The time-stepping loop itself runs inside the extension
+(``forward_loop`` / ``adjoint_loop``): one pybind call per pass, with
+checkpoint save/restore and snapshot offsets computed in C++.
 """
 
 import nami_scalar2d as _ext
 import torch
 
+from ..common.callback import validate_callback_frequency, wrap_forward_callback
 from ..common.cfl import check_cfl
 from ..common.fd import diff1_coeffs, diff2_coeffs
 from ..common.pml import set_acoustic_pml_profiles, set_pml_width
+from ..common.state import allocate_final_state, prepare_initial_state, unpack_state
 from ..common.storage import (
     SnapshotStorage,
     check_sample_steps,
     resolve_storage,
     storage_plan,
 )
-from ..common.survey import extract_survey_2d
+from ..common.survey import extract_survey_2d, prepare_source_amplitudes
 
 # Checkpoint state layout for the acoustic field:
 #   [0] u[t % 3]      field at time t
@@ -35,6 +40,10 @@ from ..common.survey import extract_survey_2d
 #   [4] zeta_y[t % 2] auxiliary memory (y)
 #   [5] zeta_x[t % 2] auxiliary memory (x)
 N_STATE = 6
+N_STREAMS = 1
+
+_WAVEFIELD_NAMES = ("u", "u_prev", "psi_y", "psi_x", "zeta_y", "zeta_x")
+_CALLBACK_FIELDS = ("u", "u_prev")
 
 
 class Scalar2DFunc(torch.autograd.Function):
@@ -56,6 +65,10 @@ class Scalar2DFunc(torch.autograd.Function):
         ckpt_state,      # [n_ckpt, N_STATE, n_shots, ny, nx] or None
         checkpoint_every,  # 0 = full storage; N = checkpoint every N steps
         segments,        # [(s0, s1)] replay segments; [] = full storage
+        init_state,      # [N_STATE, n_shots, ny, nx] initial wavefield or None
+        final_state,     # [N_STATE, n_shots, ny, nx] output buffer or None
+        forward_callback,  # cb(t, nt, u, u_prev) or None
+        callback_frequency,  # call the callback every N steps
     ):
         ext = _ext
         device = v_p.device
@@ -66,7 +79,6 @@ class Scalar2DFunc(torch.autograd.Function):
         # still runs n_shots wavefields (v_batched selects model slab 0).
         n_shots = int(src_i.shape[0])
         ny, nx = v_p.shape[-2:]
-        n_src = src_i.shape[1]
         n_rec = rec_i.shape[1]
 
         u = [torch.zeros(n_shots, ny, nx, device=device, dtype=dtype) for _ in range(3)]
@@ -75,47 +87,30 @@ class Scalar2DFunc(torch.autograd.Function):
         zeta_y = [torch.zeros_like(u[0]) for _ in range(2)]
         zeta_x = [torch.zeros_like(u[0]) for _ in range(2)]
         r = torch.zeros(nt, n_shots, n_rec, device=device, dtype=dtype)
-        ny_nx = ny * nx
 
         ay, by, dbydy, ax, bx, dbxdx = [p.contiguous() for p in profs]
-        ckpt = ckpt_state is not None
         w_store = torch.zeros(n_shots, ny, nx, device=device, dtype=dtype)
         if storage is not None:
             w_store = storage.snap
-        for t in range(nt):
-            if ckpt and t > 0 and t % checkpoint_every == 0:
-                k = t // checkpoint_every - 1
-                ckpt_state[k, 0].copy_(u[t % 3])
-                ckpt_state[k, 1].copy_(u[(t - 1) % 3])
-                ckpt_state[k, 2].copy_(psi_y[t % 2])
-                ckpt_state[k, 3].copy_(psi_x[t % 2])
-                ckpt_state[k, 4].copy_(zeta_y[t % 2])
-                ckpt_state[k, 5].copy_(zeta_x[t % 2])
-            if segments:
-                store = 0
-                snap_off = 0
-            else:
-                store = 1 if storage is not None else 0
-                snap_off = storage.snap_offset(t // grad_stride) if storage else 0
-            ext.forward_step(
-                v_p, u[t % 3], u[(t - 1) % 3],
-                psi_y[t % 2], psi_x[t % 2], zeta_y[t % 2], zeta_x[t % 2],
-                u[(t + 1) % 3], psi_y[(t + 1) % 2], psi_x[(t + 1) % 2],
-                zeta_y[(t + 1) % 2], zeta_x[(t + 1) % 2],
-                ay, by, dbydy, ax, bx, dbxdx, w_store,
-                c1, c2,
-                rdy, rdx, rdy2, rdx2, t, grad_stride, dt2,
-                pml_y0, pml_y1, pml_x0, pml_x1, v_batched, store, snap_off, fd_pad,
-            )
-            if n_src > 0:
-                ext.inject(u[(t + 1) % 3], f, src_i, t, n_shots, n_src, ny_nx)
-            if n_rec > 0:
-                ext.record(u[t % 3], r, rec_i, t, n_shots, n_rec, ny_nx)
+        # checkpointed forward stores no snapshots (the backward replay
+        # regenerates them); full storage writes every sampled step.
+        store = 0 if segments else (1 if storage is not None else 0)
+        ext.forward_loop(
+            v_p, u, psi_y, psi_x, zeta_y, zeta_x,
+            ay, by, dbydy, ax, bx, dbxdx, w_store,
+            f, src_i, r, rec_i,
+            c1, c2,
+            rdy, rdx, rdy2, rdx2, dt2,
+            nt, grad_stride,
+            pml_y0, pml_y1, pml_x0, pml_x1,
+            v_batched, store, fd_pad,
+            checkpoint_every, ckpt_state,
+            init_state, final_state, forward_callback, callback_frequency,
+        )
 
         ctx.ext = ext
         ctx.save_for_backward(v_p, f, src_i, rec_i, w_store, c1, c2)
         ctx.n_shots = n_shots
-        ctx.ny_nx = ny_nx
         ctx.rdy, ctx.rdx, ctx.rdy2, ctx.rdx2, ctx.dt2 = rdy, rdx, rdy2, rdx2, dt2
         ctx.nt = nt
         ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1 = (
@@ -130,30 +125,8 @@ class Scalar2DFunc(torch.autograd.Function):
         ctx.fd_pad = fd_pad
         ctx.storage = storage
         ctx.ckpt_state = ckpt_state
-        ctx.checkpoint_every = checkpoint_every
         ctx.segments = segments
         return r
-
-    @staticmethod
-    def _replay_segment(ext, v_p, f, src_i, n_shots, n_src, u, psi_y, psi_x,
-                        zeta_y, zeta_x, ay, by, dbydy, ax, bx, dbxdx, w_store,
-                        c1, c2, rdy, rdx, rdy2, rdx2, grad_stride, dt2, pml_y0,
-                        pml_y1, pml_x0, pml_x1, v_batched, fd_pad, ny_nx, s0, s1):
-        """Re-run forward steps [s0, s1), writing the w snapshots."""
-        for t in range(s0, s1):
-            snap_off = ((t - s0) // grad_stride) * (n_shots * ny_nx)
-            ext.forward_step(
-                v_p, u[t % 3], u[(t - 1) % 3],
-                psi_y[t % 2], psi_x[t % 2], zeta_y[t % 2], zeta_x[t % 2],
-                u[(t + 1) % 3], psi_y[(t + 1) % 2], psi_x[(t + 1) % 2],
-                zeta_y[(t + 1) % 2], zeta_x[(t + 1) % 2],
-                ay, by, dbydy, ax, bx, dbxdx, w_store,
-                c1, c2,
-                rdy, rdx, rdy2, rdx2, t, grad_stride, dt2,
-                pml_y0, pml_y1, pml_x0, pml_x1, v_batched, 1, snap_off, fd_pad,
-            )
-            if n_src > 0:
-                ext.inject(u[(t + 1) % 3], f, src_i, t, n_shots, n_src, ny_nx)
 
     @staticmethod
     def backward(ctx, grad_r):
@@ -164,7 +137,6 @@ class Scalar2DFunc(torch.autograd.Function):
                 "scalar2d backward() requires snapshot storage: run the forward "
                 "with an input requiring grad (and not under torch.no_grad())."
             )
-        storage = ctx.storage
         device = v_p.device
         if device.type == "cuda":
             torch.cuda.set_device(device)
@@ -174,10 +146,12 @@ class Scalar2DFunc(torch.autograd.Function):
         n_src, n_rec = src_i.shape[1], rec_i.shape[1]
         nt = ctx.nt
         grad_stride = ctx.grad_stride
-        ny_nx = ctx.ny_nx
 
         if grad_r is None:
             grad_r = torch.zeros(nt, n_shots, n_rec, device=device, dtype=dtype)
+        # grad_r arrives from autograd and may be a non-contiguous broadcast
+        # view; the kernels use flat row-major indexing, so materialise it.
+        grad_r = grad_r.contiguous()
         grad_f = torch.zeros(nt, n_shots, n_src, device=device, dtype=dtype)
         # Per-shot grads; summed below when the model is shared (not batched).
         grad_v = torch.zeros(n_shots, ny, nx, device=device, dtype=dtype)
@@ -197,10 +171,8 @@ class Scalar2DFunc(torch.autograd.Function):
         scale = float(grad_stride)
         segments = ctx.segments
         if segments:
-            # Checkpointed backward: per segment, restore the wavefield
-            # state, replay the forward steps to regenerate the w
-            # snapshots, then run the adjoint steps.  The adjoint state
-            # (lam + memory variables) carries across segments.
+            # Checkpointed backward replays each segment's forward pass in
+            # C++; these rings hold the replayed wavefield state.
             u = [
                 torch.zeros(n_shots, ny, nx, device=device, dtype=dtype)
                 for _ in range(3)
@@ -209,97 +181,43 @@ class Scalar2DFunc(torch.autograd.Function):
             psi_x_f = [torch.zeros_like(lam[0]) for _ in range(2)]
             zeta_y_f = [torch.zeros_like(lam[0]) for _ in range(2)]
             zeta_x_f = [torch.zeros_like(lam[0]) for _ in range(2)]
-            ckpt = ctx.ckpt_state
-            for k in range(len(segments) - 1, -1, -1):
-                s0, s1 = segments[k]
-                if s0 > 0:
-                    c = ckpt[k - 1]
-                    u[s0 % 3].copy_(c[0])
-                    u[(s0 - 1) % 3].copy_(c[1])
-                    psi_y_f[s0 % 2].copy_(c[2])
-                    psi_x_f[s0 % 2].copy_(c[3])
-                    zeta_y_f[s0 % 2].copy_(c[4])
-                    zeta_x_f[s0 % 2].copy_(c[5])
-                else:
-                    for buf in u:
-                        buf.zero_()
-                    for bufs in (psi_y_f, psi_x_f, zeta_y_f, zeta_x_f):
-                        for buf in bufs:
-                            buf.zero_()
-                Scalar2DFunc._replay_segment(
-                    ext, v_p, f, src_i, n_shots, n_src, u, psi_y_f, psi_x_f,
-                    zeta_y_f, zeta_x_f, ay, by, dbydy, ax, bx, dbxdx,
-                    w_store, c1, c2, ctx.rdy, ctx.rdx, ctx.rdy2, ctx.rdx2,
-                    grad_stride, ctx.dt2, ctx.pml_y0, ctx.pml_y1, ctx.pml_x0,
-                    ctx.pml_x1, ctx.v_batched, ctx.fd_pad, ny_nx, s0, s1,
-                )
-                for t in range(s1 - 1, s0 - 1, -1):
-                    if n_src > 0:
-                        ext.record_grad_f(
-                            lam[(t + 1) % 3], grad_f, src_i, t,
-                            n_shots, n_src, ny_nx,
-                        )
-                    snap_off = ((t - s0) // grad_stride) * (n_shots * ny_nx)
-                    ext.adjoint_step(
-                        v_p, lam[(t + 1) % 3], lam[(t + 2) % 3], lam[t % 3],
-                        psi_y[t % 2], psi_x[t % 2], zeta_y[t % 2], zeta_x[t % 2],
-                        psi_y[(t + 1) % 2], psi_x[(t + 1) % 2],
-                        zeta_y[(t + 1) % 2], zeta_x[(t + 1) % 2],
-                        ay, by, dbydy, ax, bx, dbxdx, w_store, grad_v,
-                        c1, c2,
-                        ctx.rdy, ctx.rdx, ctx.rdy2, ctx.rdx2, t, grad_stride,
-                        scale, ctx.dt2,
-                        ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
-                        ctx.pml_y0_b, ctx.pml_y1_b, ctx.pml_x0_b, ctx.pml_x1_b,
-                        ctx.v_batched, snap_off, ctx.fd_pad,
-                    )
-                    if n_rec > 0:
-                        ext.record_grad_r(
-                            lam[t % 3], grad_r, rec_i, t, n_shots, n_rec, ny_nx,
-                        )
+            segments_t = torch.tensor(segments, dtype=torch.int64)
         else:
-            for t in range(nt - 1, -1, -1):
-                if n_src > 0:
-                    ext.record_grad_f(
-                        lam[(t + 1) % 3], grad_f, src_i, t, n_shots, n_src, ny_nx
-                    )
-                snap_off = storage.snap_offset(t // grad_stride)
-                ext.adjoint_step(
-                    v_p, lam[(t + 1) % 3], lam[(t + 2) % 3], lam[t % 3],
-                    psi_y[t % 2], psi_x[t % 2], zeta_y[t % 2], zeta_x[t % 2],
-                    psi_y[(t + 1) % 2], psi_x[(t + 1) % 2],
-                    zeta_y[(t + 1) % 2], zeta_x[(t + 1) % 2],
-                    ay, by, dbydy, ax, bx, dbxdx, w_store, grad_v,
-                    c1, c2,
-                    ctx.rdy, ctx.rdx, ctx.rdy2, ctx.rdx2, t, grad_stride, scale,
-                    ctx.dt2,
-                    ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
-                    ctx.pml_y0_b, ctx.pml_y1_b, ctx.pml_x0_b, ctx.pml_x1_b,
-                    ctx.v_batched, snap_off, ctx.fd_pad,
-                )
-                if n_rec > 0:
-                    ext.record_grad_r(
-                        lam[t % 3], grad_r, rec_i, t, n_shots, n_rec, ny_nx
-                    )
+            u, psi_y_f, psi_x_f, zeta_y_f, zeta_x_f = [], [], [], [], []
+            segments_t = torch.empty(0, 2, dtype=torch.int64)
+        ext.adjoint_loop(
+            v_p, lam, psi_y, psi_x, zeta_y, zeta_x,
+            ay, by, dbydy, ax, bx, dbxdx,
+            w_store, grad_v,
+            grad_r, rec_i, grad_f, src_i, f,
+            u, psi_y_f, psi_x_f, zeta_y_f, zeta_x_f,
+            c1, c2,
+            ctx.rdy, ctx.rdx, ctx.rdy2, ctx.rdx2, scale, ctx.dt2,
+            nt, grad_stride,
+            ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
+            ctx.pml_y0_b, ctx.pml_y1_b, ctx.pml_x0_b, ctx.pml_x1_b,
+            ctx.v_batched, ctx.fd_pad,
+            segments_t, ctx.ckpt_state,
+        )
 
         # Shared model: sum per-shot grads to match v_p shape [1, ny, nx]
         # (same contract as elastic2d / em2d_tm). Batched model keeps
         # [n_shots, ...].
         if not ctx.v_batched:
             grad_v = grad_v.sum(0, keepdim=True)
-        # 28 forward() inputs: grad_v + grad_f + 26 x None
+        # 32 forward() inputs: grad_v + grad_f + 30 x None
         return (
             grad_v,
             grad_f,      # grad w.r.t. pre-scaled f; scaled to amp in scalar2d()
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None,
         )
 
 
 def scalar2d(
     v,
-    dx,
+    grid_spacing,
     dt,
     source_amplitudes=None,
     source_locations=None,
@@ -311,6 +229,10 @@ def scalar2d(
     storage="auto",
     sample_steps=1,
     ckpt_steps=None,
+    forward_callback=None,
+    callback_frequency=1,
+    return_state=False,
+    initial_state=None,
 ):
     """2D acoustic forward + adjoint (torch in/out).
 
@@ -328,12 +250,37 @@ def scalar2d(
             ~sqrt(nt), 0 = full storage (every sampled step), N = save wavefield
             state every N steps and replay on backward.  Same gradients as full
             storage at the same sample_steps.
+        forward_callback: called every ``callback_frequency`` steps with a
+            ``CallbackState`` (deepwave-style) exposing the current padded
+            wavefields via ``state.get_wavefield(name, view)`` — useful for
+            RTM imaging conditions, illumination accumulation, monitoring.
+        callback_frequency: call ``forward_callback`` every N time steps.
+        return_state: if True, return ``(r, state)`` where ``state`` is a
+            dict of the FINAL padded wavefield state (keys ``u``, ``u_prev``,
+            ``psi_y``, ``psi_x``, ``zeta_y``, ``zeta_x``) suitable for
+            continuation via ``initial_state``.
+        initial_state: a dict of initial wavefield state (padded grid, keys
+            as in the ``return_state=True`` output) to continue a previous
+            run.  Missing keys are zero-filled; a complete state dict (every
+            key, including the PML memory variables) makes a split run
+            bitwise match a one-shot run, while a partial dict restores only
+            the given fields with the remaining state starting from zero.
+            State I/O is for forward continuation; autograd does not propagate
+            across the boundary between runs.  State dicts are ephemeral
+            runtime snapshots: they may be passed back only to the same
+            propagator with the same model layout and nami version, and are
+            not a stable long-term checkpoint format.
 
-    Returns receiver amplitudes [nt, n_shots, n_rec].
+    Returns receiver amplitudes [nt, n_shots, n_rec] (or ``(r, state)``
+    when ``return_state=True``).
     """
-    if not isinstance(dx, (list, tuple)):
-        dx = [float(dx)] * 2
-    dx = [float(d) for d in dx]
+    if not isinstance(grid_spacing, (list, tuple)):
+        grid_spacing = [float(grid_spacing)] * 2
+    grid_spacing = [float(d) for d in grid_spacing]
+    if len(grid_spacing) != 2:
+        raise ValueError(
+            "grid_spacing must be a scalar or length 2 [dy, dx]."
+        )
     pml_w = set_pml_width(pml_width, 2)
     fd_pad = [accuracy // 2] * 4
     device = v.device
@@ -368,14 +315,18 @@ def scalar2d(
     # Per-shot model grads are summed in backward (elastic/EM style).
     ny, nx = v_p.shape[-2:]
     max_vel = float(v.detach().abs().max())
-    check_cfl(dx, dt, max_vel, "scalar2d")
+    check_cfl(grid_spacing, dt, max_vel, "scalar2d")
     profs = set_acoustic_pml_profiles(
-        pml_w, fd_pad, dt, dx, max_vel, pml_freq, (ny, nx), dtype, device,
+        pml_w, fd_pad, dt, grid_spacing, max_vel, pml_freq, (ny, nx), dtype,
+        device,
         accuracy=accuracy,
     )
 
-    if source_amplitudes is not None and source_amplitudes.numel() > 0:
-        amp = source_amplitudes.to(device=device, dtype=dtype)[:, :, :nt_inner]
+    amp = prepare_source_amplitudes(
+        source_amplitudes, n_shots, src_i.shape[1], nt_inner,
+        device=device, dtype=dtype,
+    )
+    if amp.numel() > 0:
         src_mask = src_i != -1
         src_i_masked = src_i.masked_fill(~src_mask, 0)
         # per-shot v at each source: expand the flat rows for gather only
@@ -386,12 +337,11 @@ def scalar2d(
             -amp.permute(2, 0, 1) * (v_at_src.unsqueeze(0) ** 2 * dt * dt)
         ).contiguous()
     else:
-        amp = torch.zeros(n_shots, 0, nt_inner, device=device, dtype=dtype)
         f = torch.empty(0, device=device, dtype=dtype)
 
     c1 = diff1_coeffs(accuracy, dtype, device)
     c2 = diff2_coeffs(accuracy, dtype, device)
-    rdy, rdx = 1.0 / dx[0], 1.0 / dx[1]
+    rdy, rdx = 1.0 / grid_spacing[0], 1.0 / grid_spacing[1]
     rdy2, rdx2 = rdy * rdy, rdx * rdx
     dt2 = float(dt) * float(dt)
     pml_y0, pml_y1 = fd_pad[0] + pml_w[0], ny - fd_pad[1] - pml_w[1]
@@ -413,7 +363,7 @@ def scalar2d(
         for t in (v, source_amplitudes)
     )
     checkpoint_every, segments, n_snap, n_ckpt = storage_plan(
-        nt_inner, N_STATE, grad_stride, 1, storage_enabled,
+        nt_inner, N_STATE, grad_stride, N_STREAMS, storage_enabled,
         ckpt_steps=ckpt_steps,
     )
     store_obj = None
@@ -427,6 +377,26 @@ def scalar2d(
                 n_ckpt, N_STATE, n_shots, ny, nx, device=device, dtype=dtype,
             )
 
+    # Wavefield I/O (deepwave-style): continuation initial state, optional
+    # final-state output, and the per-step forward callback.
+    state_shape = (n_shots, ny, nx)
+    init_state = prepare_initial_state(
+        initial_state, _WAVEFIELD_NAMES, state_shape, device=device, dtype=dtype,
+    )
+    final_state = allocate_final_state(
+        return_state, _WAVEFIELD_NAMES, state_shape, device=device, dtype=dtype,
+    )
+    callback_frequency = validate_callback_frequency(callback_frequency)
+    cb = (
+        wrap_forward_callback(
+            forward_callback,
+            _CALLBACK_FIELDS,
+            float(dt), fd_pad, list(pml_w),
+        )
+        if forward_callback is not None
+        else None
+    )
+
     r = Scalar2DFunc.apply(
         v_p, f, src_i, rec_i, profs, c1, c2,
         rdy, rdx, rdy2, rdx2, dt2,
@@ -435,9 +405,9 @@ def scalar2d(
         pml_y0_b, pml_y1_b, pml_x0_b, pml_x1_b,
         v_batched, grad_stride, fd_pad[0],
         store_obj, ckpt_state, checkpoint_every, segments,
+        init_state, final_state, cb, callback_frequency,
     )
 
-    # gradients returned by backward() need post-processing (done in a helper
-    # so autograd users can call .backward() on `r` and get model grads via
-    # the saved `v_p`; here we just return the receiver amplitudes).
+    if return_state:
+        return r, unpack_state(final_state, _WAVEFIELD_NAMES)
     return r

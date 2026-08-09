@@ -38,16 +38,22 @@ import math
 import nami_em3d_born as _ext
 import torch
 
+from ..common.callback import validate_callback_frequency, wrap_forward_callback
 from ..common.cfl import check_cfl
 from ..common.fd import check_accuracy, staggered_diff1_coeffs
 from ..common.pml import set_pml_width
+from ..common.state import allocate_final_state, prepare_initial_state, unpack_state
 from ..common.storage import (
     SnapshotStorage,
     check_sample_steps,
     resolve_storage,
     storage_plan,
 )
-from ..common.survey import extract_survey_3d
+from ..common.survey import (
+    extract_survey_3d,
+    is_shot_batched,
+    prepare_source_amplitudes,
+)
 from ._common import EPS0, MU0, _compile_material_coefficients
 from .em3d import _normalize_component, _set_em_pml_profiles_3d
 
@@ -63,6 +69,23 @@ from .em3d import _normalize_component, _set_em_pml_profiles_3d
 #   [30:36] scatter E-step memory variables
 N_STATE = 36
 N_STREAMS = 24
+
+# Full N_STATE names: keys of the state dicts returned by ``return_state``
+# and accepted by ``initial_state`` (for split-run continuation).
+_WAVEFIELD_NAMES = (
+    "ex", "ey", "ez",
+    "hx", "hy", "hz",
+    "m_ey_z", "m_ez_y", "m_ez_x", "m_ex_z", "m_ex_y", "m_ey_x",
+    "m_hy_z", "m_hz_y", "m_hz_x", "m_hx_z", "m_hx_y", "m_hy_x",
+    "d_ex", "d_ey", "d_ez",
+    "d_hx", "d_hy", "d_hz",
+    "dm_ey_z", "dm_ez_y", "dm_ez_x", "dm_ex_z", "dm_ex_y", "dm_ey_x",
+    "dm_hy_z", "dm_hz_y", "dm_hz_x", "dm_hx_z", "dm_hx_y", "dm_hy_x",
+)
+_CALLBACK_FIELDS = (
+    "ex", "ey", "ez", "hx", "hy", "hz",
+    "d_ex", "d_ey", "d_ez", "d_hx", "d_hy", "d_hz",
+)
 
 
 class BornEM3DFunc(torch.autograd.Function):
@@ -91,6 +114,10 @@ class BornEM3DFunc(torch.autograd.Function):
         ckpt_state,          # [n_ckpt, N_STATE, n_shots, nz, ny, nx] or None
         checkpoint_every,    # 0 = full storage; N = checkpoint every N steps
         segments,            # [(s0, s1)] replay segments; [] = full storage
+        init_state,          # [N_STATE, n_shots, nz, ny, nx] initial state or None
+        final_state,         # [N_STATE, n_shots, nz, ny, nx] output buffer or None
+        forward_callback,    # cb(t, nt, background fields..., scattered fields...)
+        callback_frequency,  # call the callback every N steps
     ):
         ext = _ext
         device = ca_p.device
@@ -99,7 +126,6 @@ class BornEM3DFunc(torch.autograd.Function):
         dtype = ca_p.dtype
         n_shots = int(src_i.shape[0])
         nz, ny, nx = ca_p.shape[-3:]
-        n_src = src_i.shape[1]
         n_rec = rec_i.shape[1]
         n_bg_rec = bg_rec_i.shape[1]
         numel = nz * ny * nx
@@ -180,106 +206,38 @@ class BornEM3DFunc(torch.autograd.Function):
             dex_store = dey_store = dez_store = scratch
             dcurl_x_store = dcurl_y_store = dcurl_z_store = scratch
 
-        az, azh, ay, ayh, ax, axh, bz, bzh, by, byh, bx, bxh, \
-            kz, kzh, ky, kyh, kx, kxh = [p.contiguous() for p in profs]
-        ckpt = ckpt_state is not None
-        for t in range(nt):
-            if ckpt and t > 0 and t % checkpoint_every == 0:
-                k = t // checkpoint_every - 1
-                ckpt_state[k, 0].copy_(ex)
-                ckpt_state[k, 1].copy_(ey)
-                ckpt_state[k, 2].copy_(ez)
-                ckpt_state[k, 3].copy_(hx)
-                ckpt_state[k, 4].copy_(hy)
-                ckpt_state[k, 5].copy_(hz)
-                ckpt_state[k, 6].copy_(m_ey_z)
-                ckpt_state[k, 7].copy_(m_ez_y)
-                ckpt_state[k, 8].copy_(m_ez_x)
-                ckpt_state[k, 9].copy_(m_ex_z)
-                ckpt_state[k, 10].copy_(m_ex_y)
-                ckpt_state[k, 11].copy_(m_ey_x)
-                ckpt_state[k, 12].copy_(m_hy_z)
-                ckpt_state[k, 13].copy_(m_hz_y)
-                ckpt_state[k, 14].copy_(m_hz_x)
-                ckpt_state[k, 15].copy_(m_hx_z)
-                ckpt_state[k, 16].copy_(m_hx_y)
-                ckpt_state[k, 17].copy_(m_hy_x)
-                ckpt_state[k, 18].copy_(d_ex)
-                ckpt_state[k, 19].copy_(d_ey)
-                ckpt_state[k, 20].copy_(d_ez)
-                ckpt_state[k, 21].copy_(d_hx)
-                ckpt_state[k, 22].copy_(d_hy)
-                ckpt_state[k, 23].copy_(d_hz)
-                ckpt_state[k, 24].copy_(dm_ey_z)
-                ckpt_state[k, 25].copy_(dm_ez_y)
-                ckpt_state[k, 26].copy_(dm_ez_x)
-                ckpt_state[k, 27].copy_(dm_ex_z)
-                ckpt_state[k, 28].copy_(dm_ex_y)
-                ckpt_state[k, 29].copy_(dm_ey_x)
-                ckpt_state[k, 30].copy_(dm_hy_z)
-                ckpt_state[k, 31].copy_(dm_hz_y)
-                ckpt_state[k, 32].copy_(dm_hz_x)
-                ckpt_state[k, 33].copy_(dm_hx_z)
-                ckpt_state[k, 34].copy_(dm_hx_y)
-                ckpt_state[k, 35].copy_(dm_hy_x)
-            if segments:
-                store = 0
-                snap_off = 0
-            elif ex_storage is not None:
-                store = 1
-                snap_off = ex_storage.snap_offset(t // grad_stride)
-            else:
-                store = 0
-                snap_off = (t // grad_stride) * shot_count
-            ext.born_step_h(
-                cq_p, dcq_p, ex, ey, ez, d_ex, d_ey, d_ez,
-                hx, hy, hz, d_hx, d_hy, d_hz,
-                m_ey_z, m_ez_y, m_ez_x, m_ex_z, m_ex_y, m_ey_x,
-                dm_ey_z, dm_ez_y, dm_ez_x, dm_ex_z, dm_ex_y, dm_ey_x,
-                dey_dz_store, dez_dy_store, dez_dx_store,
-                dex_dz_store, dex_dy_store, dey_dx_store,
-                ddey_dz_store, ddez_dy_store, ddez_dx_store,
-                ddex_dz_store, ddex_dy_store, ddey_dx_store,
-                azh, bzh, ayh, byh, axh, bxh, kzh, kyh, kxh,
-                c, rdz, rdy, rdx, t, grad_stride, snap_off,
-                n_shots, nz, ny, nx,
-                pml_z0, pml_z1, pml_y0, pml_y1, pml_x0, pml_x1,
-                fd_pad[0], fd_pad[2], fd_pad[4],
-                cq_batched, dcq_batched, store,
-            )
-            ext.born_step_e(
-                ca_p, cb_p, dca_p, dcb_p,
-                hx, hy, hz, d_hx, d_hy, d_hz,
-                ex, ey, ez, d_ex, d_ey, d_ez,
-                m_hy_z, m_hz_y, m_hz_x, m_hx_z, m_hx_y, m_hy_x,
-                dm_hy_z, dm_hz_y, dm_hz_x, dm_hx_z, dm_hx_y, dm_hy_x,
-                ex_store, ey_store, ez_store,
-                curl_x_store, curl_y_store, curl_z_store,
-                dex_store, dey_store, dez_store,
-                dcurl_x_store, dcurl_y_store, dcurl_z_store,
-                az, bz, ay, by, ax, bx, kz, ky, kx,
-                c, rdz, rdy, rdx, t, grad_stride, snap_off,
-                n_shots, nz, ny, nx,
-                pml_z0, pml_z1, pml_y0, pml_y1, pml_x0, pml_x1,
-                *fd_pad,
-                ca_batched, cb_batched, dca_batched, dcb_batched,
-            )
-            if n_src > 0:
-                ext.born_inject(
-                    (ex, ey, ez)[source_component],
-                    (d_ex, d_ey, d_ez)[source_component],
-                    f_bg, f_sc, src_i, t, n_shots, n_src, numel,
-                )
-            if n_rec > 0:
-                ext.born_record(
-                    (d_ex, d_ey, d_ez)[receiver_component], r, rec_i,
-                    t, n_shots, n_rec, numel,
-                )
-            if n_bg_rec > 0:
-                ext.born_record(
-                    (ex, ey, ez)[receiver_component], r_bg, bg_rec_i,
-                    t, n_shots, n_bg_rec, numel,
-                )
+        profs_c = [p.contiguous() for p in profs]
+        # checkpointed forward stores no snapshots (the backward replay
+        # regenerates them); full storage writes every sampled step.
+        store = 0 if segments else (1 if ex_storage is not None else 0)
+        ext.forward_loop(
+            ca_p, cb_p, cq_p, dca_p, dcb_p, dcq_p,
+            [ex, ey, ez], [d_ex, d_ey, d_ez],
+            [hx, hy, hz], [d_hx, d_hy, d_hz],
+            [m_ey_z, m_ez_y, m_ez_x, m_ex_z, m_ex_y, m_ey_x],
+            [dm_ey_z, dm_ez_y, dm_ez_x, dm_ex_z, dm_ex_y, dm_ey_x],
+            [m_hy_z, m_hz_y, m_hz_x, m_hx_z, m_hx_y, m_hy_x],
+            [dm_hy_z, dm_hz_y, dm_hz_x, dm_hx_z, dm_hx_y, dm_hy_x],
+            [dey_dz_store, dez_dy_store, dez_dx_store,
+             dex_dz_store, dex_dy_store, dey_dx_store,
+             ddey_dz_store, ddez_dy_store, ddez_dx_store,
+             ddex_dz_store, ddex_dy_store, ddey_dx_store],
+            [ex_store, ey_store, ez_store,
+             curl_x_store, curl_y_store, curl_z_store,
+             dex_store, dey_store, dez_store,
+             dcurl_x_store, dcurl_y_store, dcurl_z_store],
+            profs_c, c,
+            f_bg, f_sc, src_i, r, rec_i, r_bg, bg_rec_i,
+            rdz, rdy, rdx,
+            nt, grad_stride,
+            pml_z0, pml_z1, pml_y0, pml_y1, pml_x0, pml_x1,
+            fd_pad,
+            ca_batched, cb_batched, cq_batched,
+            dca_batched, dcb_batched, dcq_batched,
+            store, source_component, receiver_component,
+            checkpoint_every, ckpt_state,
+            init_state, final_state, forward_callback, callback_frequency,
+        )
 
         ctx.ext = ext
         ctx.save_for_backward(
@@ -336,72 +294,6 @@ class BornEM3DFunc(torch.autograd.Function):
         ctx.checkpoint_every = checkpoint_every
         ctx.segments = segments
         return r, r_bg
-
-    @staticmethod
-    def _replay_segment(ctx, ext, ca_p, cb_p, cq_p, dca_p, dcb_p, dcq_p,
-                        f_bg, f_sc, src_i, n_shots, n_src,
-                        ex, ey, ez, d_ex, d_ey, d_ez, hx, hy, hz,
-                        d_hx, d_hy, d_hz, m_ey_z, m_ez_y, m_ez_x, m_ex_z,
-                        m_ex_y, m_ey_x, dm_ey_z, dm_ez_y, dm_ez_x, dm_ex_z,
-                        dm_ex_y, dm_ey_x, m_hy_z, m_hz_y, m_hz_x, m_hx_z,
-                        m_hx_y, m_hy_x, dm_hy_z, dm_hz_y, dm_hz_x, dm_hx_z,
-                        dm_hx_y, dm_hy_x,
-                        dey_dz_store, dez_dy_store, dez_dx_store,
-                        dex_dz_store, dex_dy_store, dey_dx_store,
-                        ddey_dz_store, ddez_dy_store, ddez_dx_store,
-                        ddex_dz_store, ddex_dy_store, ddey_dx_store,
-                        ex_store, ey_store, ez_store,
-                        curl_x_store, curl_y_store, curl_z_store,
-                        dex_store, dey_store, dez_store,
-                        dcurl_x_store, dcurl_y_store, dcurl_z_store,
-                        numel, nz, ny, nx, s0, s1):
-        """Re-run forward steps [s0, s1), writing the w snapshots."""
-        az, azh, ay, ayh, ax, axh, bz, bzh, by, byh, bx, bxh, \
-            kz, kzh, ky, kyh, kx, kxh = [p.contiguous() for p in ctx.profs]
-        for t in range(s0, s1):
-            snap_off = ((t - s0) // ctx.grad_stride) * (n_shots * numel)
-            ext.born_step_h(
-                cq_p, dcq_p, ex, ey, ez, d_ex, d_ey, d_ez,
-                hx, hy, hz, d_hx, d_hy, d_hz,
-                m_ey_z, m_ez_y, m_ez_x, m_ex_z, m_ex_y, m_ey_x,
-                dm_ey_z, dm_ez_y, dm_ez_x, dm_ex_z, dm_ex_y, dm_ey_x,
-                dey_dz_store, dez_dy_store, dez_dx_store,
-                dex_dz_store, dex_dy_store, dey_dx_store,
-                ddey_dz_store, ddez_dy_store, ddez_dx_store,
-                ddex_dz_store, ddex_dy_store, ddey_dx_store,
-                azh, bzh, ayh, byh, axh, bxh, kzh, kyh, kxh,
-                ctx.c, ctx.rdz, ctx.rdy, ctx.rdx, t, ctx.grad_stride, snap_off,
-                n_shots, nz, ny, nx,
-                ctx.pml_z0, ctx.pml_z1, ctx.pml_y0, ctx.pml_y1,
-                ctx.pml_x0, ctx.pml_x1,
-                ctx.fd_pad[0], ctx.fd_pad[2], ctx.fd_pad[4],
-                ctx.cq_batched, ctx.dcq_batched, 1,
-            )
-            ext.born_step_e(
-                ca_p, cb_p, dca_p, dcb_p,
-                hx, hy, hz, d_hx, d_hy, d_hz,
-                ex, ey, ez, d_ex, d_ey, d_ez,
-                m_hy_z, m_hz_y, m_hz_x, m_hx_z, m_hx_y, m_hy_x,
-                dm_hy_z, dm_hz_y, dm_hz_x, dm_hx_z, dm_hx_y, dm_hy_x,
-                ex_store, ey_store, ez_store,
-                curl_x_store, curl_y_store, curl_z_store,
-                dex_store, dey_store, dez_store,
-                dcurl_x_store, dcurl_y_store, dcurl_z_store,
-                az, bz, ay, by, ax, bx, kz, ky, kx,
-                ctx.c, ctx.rdz, ctx.rdy, ctx.rdx, t, ctx.grad_stride, snap_off,
-                n_shots, nz, ny, nx,
-                ctx.pml_z0, ctx.pml_z1, ctx.pml_y0, ctx.pml_y1,
-                ctx.pml_x0, ctx.pml_x1,
-                *ctx.fd_pad,
-                ctx.ca_batched, ctx.cb_batched,
-                ctx.dca_batched, ctx.dcb_batched,
-            )
-            if n_src > 0:
-                ext.born_inject(
-                    (ex, ey, ez)[ctx.source_component],
-                    (d_ex, d_ey, d_ez)[ctx.source_component],
-                    f_bg, f_sc, src_i, t, n_shots, n_src, numel,
-                )
 
     @staticmethod
     def backward(ctx, grad_r, grad_r_bg):
@@ -472,8 +364,6 @@ class BornEM3DFunc(torch.autograd.Function):
             src_i.shape[1], rec_i.shape[1], bg_rec_i.shape[1],
         )
         nt = ctx.nt
-        numel = nz * ny * nx
-        shot_count = n_shots * numel
 
         if grad_r is None:
             grad_r = torch.zeros(nt, n_shots, n_rec, device=device, dtype=dtype)
@@ -556,18 +446,20 @@ class BornEM3DFunc(torch.autograd.Function):
             z(n_shots, nz, ny, nx), z(n_shots, nz, ny, nx), z(n_shots, nz, ny, nx),
         )
 
-        az, azh, ay, ayh, ax, axh, bz, bzh, by, byh, bx, bxh, \
-            kz, kzh, ky, kyh, kx, kxh = [p.contiguous() for p in ctx.profs]
+        profs_c = [p.contiguous() for p in ctx.profs]
         # integral sampling: each snapshot represents
         # `grad_stride` time steps of the model-gradient integral.
         scale = float(ctx.grad_stride)
         segments = ctx.segments
+        # Checkpointed backward: per segment the C++ loop restores the
+        # wavefield state, replays the forward steps to regenerate the
+        # snapshots, then runs the adjoint.  Full storage: straight adjoint.
+        segments_t = (
+            torch.tensor(segments, dtype=torch.int64)
+            if segments
+            else torch.empty(0, 2, dtype=torch.int64)
+        )
         if segments:
-            # Checkpointed backward: per segment, restore the wavefield
-            # state, replay the forward steps to regenerate the w
-            # snapshots at segment-local offsets, then run the adjoint
-            # steps.  The adjoint state (lam + memory variables) carries
-            # across segments.
             ex_f = torch.zeros(n_shots, nz, ny, nx, device=device, dtype=dtype)
             ey_f = torch.zeros_like(ex_f)
             ez_f = torch.zeros_like(ex_f)
@@ -604,287 +496,62 @@ class BornEM3DFunc(torch.autograd.Function):
             dm_hx_z_f = torch.zeros_like(ex_f)
             dm_hx_y_f = torch.zeros_like(ex_f)
             dm_hy_x_f = torch.zeros_like(ex_f)
-            ckpt = ctx.ckpt_state
-            for k in range(len(segments) - 1, -1, -1):
-                s0, s1 = segments[k]
-                if s0 > 0:
-                    c = ckpt[k - 1]
-                    ex_f.copy_(c[0])
-                    ey_f.copy_(c[1])
-                    ez_f.copy_(c[2])
-                    hx_f.copy_(c[3])
-                    hy_f.copy_(c[4])
-                    hz_f.copy_(c[5])
-                    m_ey_z_f.copy_(c[6])
-                    m_ez_y_f.copy_(c[7])
-                    m_ez_x_f.copy_(c[8])
-                    m_ex_z_f.copy_(c[9])
-                    m_ex_y_f.copy_(c[10])
-                    m_ey_x_f.copy_(c[11])
-                    m_hy_z_f.copy_(c[12])
-                    m_hz_y_f.copy_(c[13])
-                    m_hz_x_f.copy_(c[14])
-                    m_hx_z_f.copy_(c[15])
-                    m_hx_y_f.copy_(c[16])
-                    m_hy_x_f.copy_(c[17])
-                    d_ex_f.copy_(c[18])
-                    d_ey_f.copy_(c[19])
-                    d_ez_f.copy_(c[20])
-                    d_hx_f.copy_(c[21])
-                    d_hy_f.copy_(c[22])
-                    d_hz_f.copy_(c[23])
-                    dm_ey_z_f.copy_(c[24])
-                    dm_ez_y_f.copy_(c[25])
-                    dm_ez_x_f.copy_(c[26])
-                    dm_ex_z_f.copy_(c[27])
-                    dm_ex_y_f.copy_(c[28])
-                    dm_ey_x_f.copy_(c[29])
-                    dm_hy_z_f.copy_(c[30])
-                    dm_hz_y_f.copy_(c[31])
-                    dm_hz_x_f.copy_(c[32])
-                    dm_hx_z_f.copy_(c[33])
-                    dm_hx_y_f.copy_(c[34])
-                    dm_hy_x_f.copy_(c[35])
-                else:
-                    for buf in (
-                        ex_f, ey_f, ez_f, hx_f, hy_f, hz_f,
-                        m_ey_z_f, m_ez_y_f, m_ez_x_f, m_ex_z_f, m_ex_y_f,
-                        m_ey_x_f, m_hy_z_f, m_hz_y_f, m_hz_x_f, m_hx_z_f,
-                        m_hx_y_f, m_hy_x_f,
-                        d_ex_f, d_ey_f, d_ez_f, d_hx_f, d_hy_f, d_hz_f,
-                        dm_ey_z_f, dm_ez_y_f, dm_ez_x_f, dm_ex_z_f,
-                        dm_ex_y_f, dm_ey_x_f, dm_hy_z_f, dm_hz_y_f,
-                        dm_hz_x_f, dm_hx_z_f, dm_hx_y_f, dm_hy_x_f,
-                    ):
-                        buf.zero_()
-                BornEM3DFunc._replay_segment(
-                    ctx, ext, ca_p, cb_p, cq_p, dca_p, dcb_p, dcq_p,
-                    f_bg, f_sc, src_i, n_shots, n_src,
-                    ex_f, ey_f, ez_f, d_ex_f, d_ey_f, d_ez_f, hx_f, hy_f, hz_f,
-                    d_hx_f, d_hy_f, d_hz_f,
-                    m_ey_z_f, m_ez_y_f, m_ez_x_f, m_ex_z_f, m_ex_y_f,
-                    m_ey_x_f, dm_ey_z_f, dm_ez_y_f, dm_ez_x_f, dm_ex_z_f,
-                    dm_ex_y_f, dm_ey_x_f, m_hy_z_f, m_hz_y_f, m_hz_x_f,
-                    m_hx_z_f, m_hx_y_f, m_hy_x_f, dm_hy_z_f, dm_hz_y_f,
-                    dm_hz_x_f, dm_hx_z_f, dm_hx_y_f, dm_hy_x_f,
-                    dey_dz_store, dez_dy_store, dez_dx_store,
-                    dex_dz_store, dex_dy_store, dey_dx_store,
-                    ddey_dz_store, ddez_dy_store, ddez_dx_store,
-                    ddex_dz_store, ddex_dy_store, ddey_dx_store,
-                    ex_store, ey_store, ez_store,
-                    curl_x_store, curl_y_store, curl_z_store,
-                    dex_store, dey_store, dez_store,
-                    dcurl_x_store, dcurl_y_store, dcurl_z_store,
-                    numel, nz, ny, nx, s0, s1,
-                )
-                for t in range(s1 - 1, s0 - 1, -1):
-                    if n_rec > 0:
-                        ext.born_record_grad_r(
-                            (lam_d_ex, lam_d_ey, lam_d_ez)[ctx.receiver_component],
-                            grad_r, rec_i, t, n_shots, n_rec, numel,
-                        )
-                    if n_bg_rec > 0:
-                        ext.born_record_grad_r(
-                            (lam_ex, lam_ey, lam_ez)[ctx.receiver_component],
-                            grad_r_bg, bg_rec_i, t, n_shots, n_bg_rec, numel,
-                        )
-                    if n_src > 0:
-                        ext.born_record_grad_f(
-                            (lam_ex, lam_ey, lam_ez)[ctx.source_component],
-                            (lam_d_ex, lam_d_ey, lam_d_ez)[ctx.source_component],
-                            grad_f_bg, grad_f_sc, src_i, t, n_shots, n_src, numel,
-                        )
-                    snap_off = ((t - s0) // ctx.grad_stride) * shot_count
-                    if t % ctx.grad_stride == 0:
-                        ext.born_coeff_grad(
-                            lam_ex, lam_ey, lam_ez, lam_d_ex, lam_d_ey, lam_d_ez,
-                            ex_store, ey_store, ez_store,
-                            curl_x_store, curl_y_store, curl_z_store,
-                            dex_store, dey_store, dez_store,
-                            dcurl_x_store, dcurl_y_store, dcurl_z_store,
-                            grad_ca, grad_cb, grad_dca, grad_dcb,
-                            scale, snap_off,
-                            n_shots, nz, ny, nx,
-                            *ctx.fd_pad,
-                        )
-                    ext.born_adjoint_e_stage1(
-                        ca_p, cb_p, dca_p, dcb_p,
-                        lam_ex, lam_ey, lam_ez, lam_d_ex, lam_d_ey, lam_d_ez,
-                        m_lambda_hy_z, m_lambda_hz_y, m_lambda_hz_x,
-                        m_lambda_hx_z, m_lambda_hx_y, m_lambda_hy_x,
-                        dm_lambda_hy_z, dm_lambda_hz_y, dm_lambda_hz_x,
-                        dm_lambda_hx_z, dm_lambda_hx_y, dm_lambda_hy_x,
-                        work_hy_z, work_hz_y, work_hz_x,
-                        work_hx_z, work_hx_y, work_hy_x,
-                        work_dhy_z, work_dhz_y, work_dhz_x,
-                        work_dhx_z, work_dhx_y, work_dhy_x,
-                        az, bz, ay, by, ax, bx, kz, ky, kx,
-                        n_shots, nz, ny, nx,
-                        ctx.pml_z0, ctx.pml_z1, ctx.pml_y0, ctx.pml_y1,
-                        ctx.pml_x0, ctx.pml_x1,
-                        *ctx.fd_pad,
-                        ctx.ca_batched, ctx.cb_batched,
-                        ctx.dca_batched, ctx.dcb_batched,
-                    )
-                    ext.born_adjoint_e_stage2(
-                        work_hy_z, work_hz_y, work_hz_x,
-                        work_hx_z, work_hx_y, work_hy_x,
-                        work_dhy_z, work_dhz_y, work_dhz_x,
-                        work_dhx_z, work_dhx_y, work_dhy_x,
-                        lam_hy, lam_hz, lam_hx,
-                        lam_dhy, lam_dhz, lam_dhx,
-                        ctx.c, ctx.rdz, ctx.rdy, ctx.rdx,
-                        n_shots, nz, ny, nx,
-                        ctx.fd_pad[0], ctx.fd_pad[2], ctx.fd_pad[4],
-                    )
-                    ext.born_adjoint_h_stage1(
-                        cq_p, dcq_p,
-                        lam_hx, lam_hy, lam_hz,
-                        lam_dhx, lam_dhy, lam_dhz,
-                        m_lambda_ey_z, m_lambda_ez_y, m_lambda_ez_x,
-                        m_lambda_ex_z, m_lambda_ex_y, m_lambda_ey_x,
-                        dm_lambda_ey_z, dm_lambda_ez_y, dm_lambda_ez_x,
-                        dm_lambda_ex_z, dm_lambda_ex_y, dm_lambda_ey_x,
-                        work2_ey_z, work2_ez_y, work2_ez_x,
-                        work2_ex_z, work2_ex_y, work2_ey_x,
-                        work2_d_ey_z, work2_d_ez_y, work2_d_ez_x,
-                        work2_d_ex_z, work2_d_ex_y, work2_d_ey_x,
-                        azh, bzh, ayh, byh, axh, bxh, kzh, kyh, kxh,
-                        n_shots, nz, ny, nx,
-                        ctx.pml_z0, ctx.pml_z1, ctx.pml_y0, ctx.pml_y1,
-                        ctx.pml_x0, ctx.pml_x1,
-                        *ctx.fd_pad,
-                        ctx.cq_batched, ctx.dcq_batched,
-                    )
-                    if t % ctx.grad_stride == 0:
-                        ext.born_cq_grad(
-                            lam_hx, lam_hy, lam_hz,
-                            lam_dhx, lam_dhy, lam_dhz,
-                            dey_dz_store, dez_dy_store, dez_dx_store,
-                            dex_dz_store, dex_dy_store, dey_dx_store,
-                            ddey_dz_store, ddez_dy_store, ddez_dx_store,
-                            ddex_dz_store, ddex_dy_store, ddey_dx_store,
-                            grad_cq, grad_dcq,
-                            t, ctx.grad_stride, scale, snap_off,
-                            n_shots, nz, ny, nx,
-                            *ctx.fd_pad,
-                        )
-                    ext.born_adjoint_h_stage2(
-                        work2_ey_z, work2_ez_y, work2_ez_x,
-                        work2_ex_z, work2_ex_y, work2_ey_x,
-                        work2_d_ey_z, work2_d_ez_y, work2_d_ez_x,
-                        work2_d_ex_z, work2_d_ex_y, work2_d_ey_x,
-                        lam_ex, lam_ey, lam_ez,
-                        lam_d_ex, lam_d_ey, lam_d_ez,
-                        ctx.c, ctx.rdz, ctx.rdy, ctx.rdx,
-                        n_shots, nz, ny, nx,
-                        ctx.fd_pad[0], ctx.fd_pad[2], ctx.fd_pad[4],
-                    )
-
+            e_f = [ex_f, ey_f, ez_f]
+            d_e_f = [d_ex_f, d_ey_f, d_ez_f]
+            h_f = [hx_f, hy_f, hz_f]
+            d_h_f = [d_hx_f, d_hy_f, d_hz_f]
+            m_h_f = [m_ey_z_f, m_ez_y_f, m_ez_x_f, m_ex_z_f, m_ex_y_f, m_ey_x_f]
+            dm_h_f = [dm_ey_z_f, dm_ez_y_f, dm_ez_x_f, dm_ex_z_f, dm_ex_y_f, dm_ey_x_f]
+            m_e_f = [m_hy_z_f, m_hz_y_f, m_hz_x_f, m_hx_z_f, m_hx_y_f, m_hy_x_f]
+            dm_e_f = [dm_hy_z_f, dm_hz_y_f, dm_hz_x_f, dm_hx_z_f, dm_hx_y_f, dm_hy_x_f]
         else:
-            for t in range(nt - 1, -1, -1):
-                if n_rec > 0:
-                    ext.born_record_grad_r(
-                        (lam_d_ex, lam_d_ey, lam_d_ez)[ctx.receiver_component],
-                        grad_r, rec_i, t, n_shots, n_rec, numel,
-                    )
-                if n_bg_rec > 0:
-                    ext.born_record_grad_r(
-                        (lam_ex, lam_ey, lam_ez)[ctx.receiver_component],
-                        grad_r_bg, bg_rec_i, t, n_shots, n_bg_rec, numel,
-                    )
-                if n_src > 0:
-                    ext.born_record_grad_f(
-                        (lam_ex, lam_ey, lam_ez)[ctx.source_component],
-                        (lam_d_ex, lam_d_ey, lam_d_ez)[ctx.source_component],
-                        grad_f_bg, grad_f_sc, src_i, t, n_shots, n_src, numel,
-                    )
-                snap_off = ex_storage.snap_offset(t // ctx.grad_stride)
-                if t % ctx.grad_stride == 0:
-                    ext.born_coeff_grad(
-                        lam_ex, lam_ey, lam_ez, lam_d_ex, lam_d_ey, lam_d_ez,
-                        ex_store, ey_store, ez_store,
-                        curl_x_store, curl_y_store, curl_z_store,
-                        dex_store, dey_store, dez_store,
-                        dcurl_x_store, dcurl_y_store, dcurl_z_store,
-                        grad_ca, grad_cb, grad_dca, grad_dcb,
-                        scale, snap_off,
-                        n_shots, nz, ny, nx,
-                        *ctx.fd_pad,
-                    )
-                ext.born_adjoint_e_stage1(
-                    ca_p, cb_p, dca_p, dcb_p,
-                    lam_ex, lam_ey, lam_ez, lam_d_ex, lam_d_ey, lam_d_ez,
-                    m_lambda_hy_z, m_lambda_hz_y, m_lambda_hz_x,
-                    m_lambda_hx_z, m_lambda_hx_y, m_lambda_hy_x,
-                    dm_lambda_hy_z, dm_lambda_hz_y, dm_lambda_hz_x,
-                    dm_lambda_hx_z, dm_lambda_hx_y, dm_lambda_hy_x,
-                    work_hy_z, work_hz_y, work_hz_x,
-                    work_hx_z, work_hx_y, work_hy_x,
-                    work_dhy_z, work_dhz_y, work_dhz_x,
-                    work_dhx_z, work_dhx_y, work_dhy_x,
-                    az, bz, ay, by, ax, bx, kz, ky, kx,
-                    n_shots, nz, ny, nx,
-                    ctx.pml_z0, ctx.pml_z1, ctx.pml_y0, ctx.pml_y1,
-                    ctx.pml_x0, ctx.pml_x1,
-                    *ctx.fd_pad,
-                    ctx.ca_batched, ctx.cb_batched,
-                    ctx.dca_batched, ctx.dcb_batched,
-                )
-                ext.born_adjoint_e_stage2(
-                    work_hy_z, work_hz_y, work_hz_x,
-                    work_hx_z, work_hx_y, work_hy_x,
-                    work_dhy_z, work_dhz_y, work_dhz_x,
-                    work_dhx_z, work_dhx_y, work_dhy_x,
-                    lam_hy, lam_hz, lam_hx,
-                    lam_dhy, lam_dhz, lam_dhx,
-                    ctx.c, ctx.rdz, ctx.rdy, ctx.rdx,
-                    n_shots, nz, ny, nx,
-                    ctx.fd_pad[0], ctx.fd_pad[2], ctx.fd_pad[4],
-                )
-                ext.born_adjoint_h_stage1(
-                    cq_p, dcq_p,
-                    lam_hx, lam_hy, lam_hz,
-                    lam_dhx, lam_dhy, lam_dhz,
-                    m_lambda_ey_z, m_lambda_ez_y, m_lambda_ez_x,
-                    m_lambda_ex_z, m_lambda_ex_y, m_lambda_ey_x,
-                    dm_lambda_ey_z, dm_lambda_ez_y, dm_lambda_ez_x,
-                    dm_lambda_ex_z, dm_lambda_ex_y, dm_lambda_ey_x,
-                    work2_ey_z, work2_ez_y, work2_ez_x,
-                    work2_ex_z, work2_ex_y, work2_ey_x,
-                    work2_d_ey_z, work2_d_ez_y, work2_d_ez_x,
-                    work2_d_ex_z, work2_d_ex_y, work2_d_ey_x,
-                    azh, bzh, ayh, byh, axh, bxh, kzh, kyh, kxh,
-                    n_shots, nz, ny, nx,
-                    ctx.pml_z0, ctx.pml_z1, ctx.pml_y0, ctx.pml_y1,
-                    ctx.pml_x0, ctx.pml_x1,
-                    *ctx.fd_pad,
-                    ctx.cq_batched, ctx.dcq_batched,
-                )
-                if t % ctx.grad_stride == 0:
-                    ext.born_cq_grad(
-                        lam_hx, lam_hy, lam_hz,
-                        lam_dhx, lam_dhy, lam_dhz,
-                        dey_dz_store, dez_dy_store, dez_dx_store,
-                        dex_dz_store, dex_dy_store, dey_dx_store,
-                        ddey_dz_store, ddez_dy_store, ddez_dx_store,
-                        ddex_dz_store, ddex_dy_store, ddey_dx_store,
-                        grad_cq, grad_dcq,
-                        t, ctx.grad_stride, scale, snap_off,
-                        n_shots, nz, ny, nx,
-                        *ctx.fd_pad,
-                    )
-                ext.born_adjoint_h_stage2(
-                    work2_ey_z, work2_ez_y, work2_ez_x,
-                    work2_ex_z, work2_ex_y, work2_ey_x,
-                    work2_d_ey_z, work2_d_ez_y, work2_d_ez_x,
-                    work2_d_ex_z, work2_d_ex_y, work2_d_ey_x,
-                    lam_ex, lam_ey, lam_ez,
-                    lam_d_ex, lam_d_ey, lam_d_ez,
-                    ctx.c, ctx.rdz, ctx.rdy, ctx.rdx,
-                    n_shots, nz, ny, nx,
-                    ctx.fd_pad[0], ctx.fd_pad[2], ctx.fd_pad[4],
-                )
+            e_f = d_e_f = h_f = d_h_f = []
+            m_h_f = dm_h_f = m_e_f = dm_e_f = []
+        ext.adjoint_loop(
+            ca_p, cb_p, cq_p, dca_p, dcb_p, dcq_p,
+            lam_ex, lam_ey, lam_ez,
+            lam_d_ex, lam_d_ey, lam_d_ez,
+            lam_hx, lam_hy, lam_hz,
+            lam_dhx, lam_dhy, lam_dhz,
+            [m_lambda_hy_z, m_lambda_hz_y, m_lambda_hz_x,
+             m_lambda_hx_z, m_lambda_hx_y, m_lambda_hy_x],
+            [dm_lambda_hy_z, dm_lambda_hz_y, dm_lambda_hz_x,
+             dm_lambda_hx_z, dm_lambda_hx_y, dm_lambda_hy_x],
+            [work_hy_z, work_hz_y, work_hz_x, work_hx_z, work_hx_y, work_hy_x],
+            [work_dhy_z, work_dhz_y, work_dhz_x, work_dhx_z, work_dhx_y, work_dhy_x],
+            [m_lambda_ey_z, m_lambda_ez_y, m_lambda_ez_x,
+             m_lambda_ex_z, m_lambda_ex_y, m_lambda_ey_x],
+            [dm_lambda_ey_z, dm_lambda_ez_y, dm_lambda_ez_x,
+             dm_lambda_ex_z, dm_lambda_ex_y, dm_lambda_ey_x],
+            [work2_ey_z, work2_ez_y, work2_ez_x, work2_ex_z, work2_ex_y, work2_ey_x],
+            [work2_d_ey_z, work2_d_ez_y, work2_d_ez_x,
+             work2_d_ex_z, work2_d_ex_y, work2_d_ey_x],
+            [dey_dz_store, dez_dy_store, dez_dx_store,
+             dex_dz_store, dex_dy_store, dey_dx_store,
+             ddey_dz_store, ddez_dy_store, ddez_dx_store,
+             ddex_dz_store, ddex_dy_store, ddey_dx_store],
+            [ex_store, ey_store, ez_store,
+             curl_x_store, curl_y_store, curl_z_store,
+             dex_store, dey_store, dez_store,
+             dcurl_x_store, dcurl_y_store, dcurl_z_store],
+            profs_c,
+            ctx.c,
+            grad_r, rec_i,
+            grad_r_bg, bg_rec_i,
+            grad_f_bg, grad_f_sc, src_i,
+            f_bg, f_sc,
+            e_f, d_e_f, h_f, d_h_f, m_h_f, dm_h_f, m_e_f, dm_e_f,
+            grad_ca, grad_cb, grad_cq, grad_dca, grad_dcb, grad_dcq,
+            ctx.rdz, ctx.rdy, ctx.rdx, scale,
+            nt, ctx.grad_stride,
+            ctx.pml_z0, ctx.pml_z1, ctx.pml_y0, ctx.pml_y1,
+            ctx.pml_x0, ctx.pml_x1,
+            ctx.fd_pad,
+            ctx.ca_batched, ctx.cb_batched, ctx.cq_batched,
+            ctx.dca_batched, ctx.dcb_batched, ctx.dcq_batched,
+            ctx.source_component, ctx.receiver_component,
+            segments_t, ctx.ckpt_state,
+        )
 
         if not ctx.ca_batched:
             grad_ca = grad_ca.sum(0, keepdim=True)
@@ -907,7 +574,7 @@ class BornEM3DFunc(torch.autograd.Function):
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
-            None, None,
+            None, None, None, None, None, None,
         )
 
 
@@ -932,6 +599,10 @@ def em3d_born(
     ckpt_steps=None,
     source_component="ey",
     receiver_component="ey",
+    forward_callback=None,
+    callback_frequency=1,
+    return_state=False,
+    initial_state=None,
 ):
     """3D electromagnetic Born forward modelling / FWI primitive.
 
@@ -978,12 +649,35 @@ def em3d_born(
             or 'ez'; default 'ey', matching the maxwell3d default).
         receiver_component: Component recorded at the receivers (default
             'ey').
+        forward_callback: called every ``callback_frequency`` steps with a
+            ``CallbackState`` (deepwave-style) exposing the current padded
+            wavefields via ``state.get_wavefield(name, view)`` — useful for
+            RTM imaging conditions, illumination accumulation, monitoring.
+        callback_frequency: call ``forward_callback`` every N time steps.
+        return_state: if True, append a dict of the FINAL padded wavefield
+            state in N_STATE order
+            (keys ``ex``, ``ey``, ``ez``, ``hx``, ``hy``, ``hz``, the
+            bg/scatter PML memory variables, ``d_ex``, ``d_ey``, ``d_ez``,
+            ``d_hx``, ``d_hy``, ``d_hz``) suitable for continuation via
+            ``initial_state``.
+        initial_state: a dict of initial wavefield state (padded grid, keys
+            as in the ``return_state=True`` output) to continue a previous
+            run.  The 3D Born layout is a flat-buffer (non-ring) staggered
+            scheme with no "previous time" slot.  Missing keys are
+            zero-filled; a complete state dict (every key, including the PML
+            memory variables) makes a split run bitwise match a one-shot
+            run, while a partial dict restores only the given fields with
+            the remaining state starting from zero.
+            State I/O is for forward continuation; autograd does not propagate
+            across the boundary between runs.  State dicts are ephemeral
+            runtime snapshots: they may be passed back only to the same
+            propagator with the same model layout and nami version, and are
+            not a stable long-term checkpoint format.
 
     Returns:
-        (receiver_amplitudes, bg_receiver_amplitudes): the scattered
-        ``[nt, n_shots, n_rec]`` traces and the background
-        ``[nt, n_shots, n_bg_rec]`` traces (empty when
-        ``bg_receiver_locations`` is None).
+        Scattered ``[nt, n_shots, n_rec]`` traces.  When
+        ``bg_receiver_locations`` is provided, returns ``(r, r_bg)``;
+        with ``return_state=True`` the state dict is appended.
     """
     accuracy = check_accuracy(accuracy)
     if not isinstance(grid_spacing, (list, tuple)):
@@ -1083,15 +777,10 @@ def em3d_born(
 
     c = staggered_diff1_coeffs(accuracy, dtype, device)
 
-    if source_amplitudes is not None:
-        amp = source_amplitudes.to(device=device, dtype=dtype)
-        if amp.shape[0] != n_shots:
-            raise ValueError("source_amplitudes must have n_shots batches.")
-        if amp.shape[2] < nt_inner:
-            raise ValueError("source_amplitudes must have at least nt steps.")
-        amp = amp[:, :, :nt_inner]
-    else:
-        amp = torch.zeros(n_shots, 0, nt_inner, device=device, dtype=dtype)
+    amp = prepare_source_amplitudes(
+        source_amplitudes, n_shots, src_i.shape[1], nt_inner,
+        device=device, dtype=dtype,
+    )
 
     dz, dy, dx = grid_spacing
     source_coeff = -1.0 / (dz * dy * dx)
@@ -1108,12 +797,6 @@ def em3d_born(
         f_sc = (
             amp.permute(2, 0, 1) * dcb_at_src.unsqueeze(0) * source_coeff
         ).contiguous()
-    elif src_i.shape[1] > 0:
-        # located sources without amplitudes: inject zero (no-op) amplitudes
-        f_bg = torch.zeros(
-            nt_inner, n_shots, src_i.shape[1], device=device, dtype=dtype
-        )
-        f_sc = torch.zeros_like(f_bg)
     else:
         f_bg = torch.empty(0, device=device, dtype=dtype)
         f_sc = torch.empty(0, device=device, dtype=dtype)
@@ -1122,35 +805,14 @@ def em3d_born(
     pml_z0, pml_z1 = fd_pad[0] + pml_w[0], nz - fd_pad[1] - pml_w[1]
     pml_y0, pml_y1 = fd_pad[2] + pml_w[2], ny - fd_pad[3] - pml_w[3]
     pml_x0, pml_x1 = fd_pad[4] + pml_w[4], nx - fd_pad[5] - pml_w[5]
-    # Batched flags from the *user* models (before pad), same contract as
-    # em3d / em2d_tm_born / scalar / elastic.
-    ca_batched = 1 if (
-        epsilon.ndim == 4 and epsilon.shape[0] == n_shots and n_shots > 1
-    ) else 0
-    cb_batched = 1 if (
-        sigma.ndim == 4 and sigma.shape[0] == n_shots and n_shots > 1
-    ) else 0
-    cq_batched = 1 if (
-        mu.ndim == 4 and mu.shape[0] == n_shots and n_shots > 1
-    ) else 0
-    dca_batched = 1 if (
-        epsilon_scatter is not None
-        and epsilon_scatter.ndim == 4
-        and epsilon_scatter.shape[0] == n_shots
-        and n_shots > 1
-    ) else 0
-    dcb_batched = 1 if (
-        sigma_scatter is not None
-        and sigma_scatter.ndim == 4
-        and sigma_scatter.shape[0] == n_shots
-        and n_shots > 1
-    ) else 0
-    dcq_batched = 1 if (
-        mu_scatter is not None
-        and mu_scatter.ndim == 4
-        and mu_scatter.shape[0] == n_shots
-        and n_shots > 1
-    ) else 0
+    # Linearised coefficients combine background and scatter tensors, so use
+    # the post-broadcast tensors passed to CUDA to determine batching.
+    ca_batched = int(is_shot_batched(ca_p, n_shots, spatial_ndim=3))
+    cb_batched = int(is_shot_batched(cb_p, n_shots, spatial_ndim=3))
+    cq_batched = int(is_shot_batched(cq_p, n_shots, spatial_ndim=3))
+    dca_batched = int(is_shot_batched(dca_p, n_shots, spatial_ndim=3))
+    dcb_batched = int(is_shot_batched(dcb_p, n_shots, spatial_ndim=3))
+    dcq_batched = int(is_shot_batched(dcq_p, n_shots, spatial_ndim=3))
 
     storage_mode = resolve_storage(storage)
     grad_stride = check_sample_steps(sample_steps)
@@ -1220,6 +882,26 @@ def em3d_born(
         ddex_dz_storage = ddex_dy_storage = ddey_dx_storage = None
         ckpt_state = None
 
+    # Wavefield I/O (deepwave-style): continuation initial state, optional
+    # final-state output, and the per-step forward callback.
+    state_shape = (n_shots, nz, ny, nx)
+    init_state = prepare_initial_state(
+        initial_state, _WAVEFIELD_NAMES, state_shape, device=device, dtype=dtype,
+    )
+    final_state = allocate_final_state(
+        return_state, _WAVEFIELD_NAMES, state_shape, device=device, dtype=dtype,
+    )
+    callback_frequency = validate_callback_frequency(callback_frequency)
+    cb = (
+        wrap_forward_callback(
+            forward_callback,
+            _CALLBACK_FIELDS,
+            float(dt), fd_pad, list(pml_w),
+        )
+        if forward_callback is not None
+        else None
+    )
+
     r, r_bg = BornEM3DFunc.apply(
         ca_p, cb_p, cq_p, dca_p, dcb_p, dcq_p,
         f_bg, f_sc,
@@ -1241,5 +923,13 @@ def em3d_born(
         ddex_dz_storage, ddex_dy_storage, ddey_dx_storage,
         source_component, receiver_component,
         ckpt_state, checkpoint_every, segments,
+        init_state, final_state, cb, callback_frequency,
     )
-    return r, r_bg
+    if return_state:
+        state = unpack_state(final_state, _WAVEFIELD_NAMES)
+        if bg_receiver_locations is not None:
+            return r, r_bg, state
+        return r, state
+    if bg_receiver_locations is not None:
+        return r, r_bg
+    return r

@@ -34,16 +34,22 @@ import math
 import nami_em3d as _ext
 import torch
 
+from ..common.callback import validate_callback_frequency, wrap_forward_callback
 from ..common.cfl import check_cfl
 from ..common.fd import check_accuracy, staggered_diff1_coeffs
 from ..common.pml import set_pml_width
+from ..common.state import allocate_final_state, prepare_initial_state, unpack_state
 from ..common.storage import (
     SnapshotStorage,
     check_sample_steps,
     resolve_storage,
     storage_plan,
 )
-from ..common.survey import extract_survey_3d
+from ..common.survey import (
+    extract_survey_3d,
+    is_shot_batched,
+    prepare_source_amplitudes,
+)
 from ._common import EPS0, MU0, _compile_material_coefficients, _pml_profile_1d
 
 _COMPONENTS = ("ex", "ey", "ez")
@@ -57,6 +63,20 @@ _COMPONENTS = ("ex", "ey", "ez")
 #           m_hx_y, m_hy_x)
 N_STATE = 18
 N_STREAMS = 6
+
+# Full wavefield state layout (N_STATE order, saved at time t BEFORE step t):
+#   [0:3]   ex, ey, ez
+#   [3:6]   hx, hy, hz
+#   [6:12]  H-step memory variables (m_ey_z, m_ez_y, m_ez_x, m_ex_z,
+#           m_ex_y, m_ey_x)
+#   [12:18] E-step memory variables (m_hy_z, m_hz_y, m_hz_x, m_hx_z,
+#           m_hx_y, m_hy_x)
+_WAVEFIELD_NAMES = (
+    "ex", "ey", "ez", "hx", "hy", "hz",
+    "m_ey_z", "m_ez_y", "m_ez_x", "m_ex_z", "m_ex_y", "m_ey_x",
+    "m_hy_z", "m_hz_y", "m_hz_x", "m_hx_z", "m_hx_y", "m_hy_x",
+)
+_CALLBACK_FIELDS = ("ex", "ey", "ez", "hx", "hy", "hz")
 
 
 def _normalize_component(component, name):
@@ -97,6 +117,10 @@ class EM3DFunc(torch.autograd.Function):
         ckpt_state,          # [n_ckpt, N_STATE, n_shots, nz, ny, nx] or None
         checkpoint_every,    # 0 = full storage; N = checkpoint every N steps
         segments,            # [(s0, s1)] replay segments; [] = full storage
+        init_state,          # [N_STATE, n_shots, nz, ny, nx] initial state or None
+        final_state,         # [N_STATE, n_shots, nz, ny, nx] output buffer or None
+        forward_callback,    # cb(t, nt, ex, ey, ez, hx, hy, hz) or None
+        callback_frequency,  # call the callback every N steps
     ):
         ext = _ext
         device = ca_p.device
@@ -105,9 +129,7 @@ class EM3DFunc(torch.autograd.Function):
         dtype = ca_p.dtype
         n_shots = int(src_i.shape[0])
         nz, ny, nx = ca_p.shape[-3:]
-        n_src = src_i.shape[1]
         n_rec = rec_i.shape[1]
-        numel = nz * ny * nx
 
         ex = torch.zeros(n_shots, nz, ny, nx, device=device, dtype=dtype)
         ey = torch.zeros_like(ex)
@@ -147,66 +169,30 @@ class EM3DFunc(torch.autograd.Function):
 
         az, azh, ay, ayh, ax, axh, bz, bzh, by, byh, bx, bxh, \
             kz, kzh, ky, kyh, kx, kxh = [p.contiguous() for p in profs]
-        ckpt = ckpt_state is not None
-        for t in range(nt):
-            if ckpt and t > 0 and t % checkpoint_every == 0:
-                k = t // checkpoint_every - 1
-                ckpt_state[k, 0].copy_(ex)
-                ckpt_state[k, 1].copy_(ey)
-                ckpt_state[k, 2].copy_(ez)
-                ckpt_state[k, 3].copy_(hx)
-                ckpt_state[k, 4].copy_(hy)
-                ckpt_state[k, 5].copy_(hz)
-                ckpt_state[k, 6].copy_(m_ey_z)
-                ckpt_state[k, 7].copy_(m_ez_y)
-                ckpt_state[k, 8].copy_(m_ez_x)
-                ckpt_state[k, 9].copy_(m_ex_z)
-                ckpt_state[k, 10].copy_(m_ex_y)
-                ckpt_state[k, 11].copy_(m_ey_x)
-                ckpt_state[k, 12].copy_(m_hy_z)
-                ckpt_state[k, 13].copy_(m_hz_y)
-                ckpt_state[k, 14].copy_(m_hz_x)
-                ckpt_state[k, 15].copy_(m_hx_z)
-                ckpt_state[k, 16].copy_(m_hx_y)
-                ckpt_state[k, 17].copy_(m_hy_x)
-            if segments:
-                snap_off = 0
-            else:
-                snap_off = (
-                    ex_storage.snap_offset(t // grad_stride) if ex_storage else 0
-                )
-            ext.step_h(
-                cq_p, ex, ey, ez, hx, hy, hz,
-                m_ey_z, m_ez_y, m_ez_x, m_ex_z, m_ex_y, m_ey_x,
-                azh, bzh, ayh, byh, axh, bxh, kzh, kyh, kxh,
-                c,
-                rdz, rdy, rdx,
-                n_shots, nz, ny, nx,
-                pml_z0, pml_z1, pml_y0, pml_y1, pml_x0, pml_x1,
-                *fd_pad[0::2], cq_batched,
-            )
-            ext.step_e_storage(
-                ca_p, cb_p, hx, hy, hz, ex, ey, ez,
-                m_hy_z, m_hz_y, m_hz_x, m_hx_z, m_hx_y, m_hy_x,
-                ex_store, ey_store, ez_store,
-                curl_x_store, curl_y_store, curl_z_store,
-                az, bz, ay, by, ax, bx, kz, ky, kx,
-                c,
-                rdz, rdy, rdx, t, grad_stride, snap_off,
-                n_shots, nz, ny, nx,
-                pml_z0, pml_z1, pml_y0, pml_y1, pml_x0, pml_x1,
-                *fd_pad, ca_batched, cb_batched,
-            )
-            if n_src > 0:
-                ext.inject(
-                    (ex, ey, ez)[source_component], f, src_i,
-                    t, n_shots, n_src, numel,
-                )
-            if n_rec > 0:
-                ext.record(
-                    (ex, ey, ez)[receiver_component], r, rec_i,
-                    t, n_shots, n_rec, numel,
-                )
+        # checkpointed forward stores no snapshots (the backward replay
+        # regenerates them); full storage writes every sampled step.
+        store = 0 if segments else (1 if ex_storage is not None else 0)
+        ext.forward_loop(
+            ca_p, cb_p, cq_p,
+            [ex, ey, ez, hx, hy, hz,
+             m_ey_z, m_ez_y, m_ez_x, m_ex_z, m_ex_y, m_ey_x,
+             m_hy_z, m_hz_y, m_hz_x, m_hx_z, m_hx_y, m_hy_x],
+            az, bz, ay, by, ax, bx, kz, ky, kx,
+            azh, bzh, ayh, byh, axh, bxh, kzh, kyh, kxh,
+            ex_store, ey_store, ez_store,
+            curl_x_store, curl_y_store, curl_z_store,
+            f, src_i, r, rec_i,
+            c,
+            rdz, rdy, rdx,
+            nt, grad_stride,
+            pml_z0, pml_z1, pml_y0, pml_y1, pml_x0, pml_x1,
+            ca_batched, cb_batched, cq_batched,
+            fd_pad[0], fd_pad[1], fd_pad[2], fd_pad[3], fd_pad[4], fd_pad[5],
+            source_component, receiver_component,
+            store,
+            checkpoint_every, ckpt_state,
+            init_state, final_state, forward_callback, callback_frequency,
+        )
 
         ctx.ext = ext
         ctx.save_for_backward(ca_p, cb_p, cq_p, f, src_i, rec_i)
@@ -241,49 +227,6 @@ class EM3DFunc(torch.autograd.Function):
         return r
 
     @staticmethod
-    def _replay_segment(ctx, ext, ca_p, cb_p, cq_p, f, src_i, n_shots, n_src,
-                        ex, ey, ez, hx, hy, hz, m_ey_z, m_ez_y, m_ez_x,
-                        m_ex_z, m_ex_y, m_ey_x, m_hy_z, m_hz_y, m_hz_x,
-                        m_hx_z, m_hx_y, m_hy_x, ex_store, ey_store, ez_store,
-                        curl_x_store, curl_y_store, curl_z_store, numel,
-                        nz, ny, nx, s0, s1):
-        """Re-run forward steps [s0, s1), writing the w snapshots."""
-        az, azh, ay, ayh, ax, axh, bz, bzh, by, byh, bx, bxh, \
-            kz, kzh, ky, kyh, kx, kxh = [p.contiguous() for p in ctx.profs]
-        c = ctx.c
-        for t in range(s0, s1):
-            snap_off = ((t - s0) // ctx.grad_stride) * (n_shots * numel)
-            ext.step_h(
-                cq_p, ex, ey, ez, hx, hy, hz,
-                m_ey_z, m_ez_y, m_ez_x, m_ex_z, m_ex_y, m_ey_x,
-                azh, bzh, ayh, byh, axh, bxh, kzh, kyh, kxh,
-                c,
-                ctx.rdz, ctx.rdy, ctx.rdx,
-                n_shots, nz, ny, nx,
-                ctx.pml_z0, ctx.pml_z1, ctx.pml_y0, ctx.pml_y1,
-                ctx.pml_x0, ctx.pml_x1,
-                *ctx.fd_pad[0::2], ctx.cq_batched,
-            )
-            ext.step_e_storage(
-                ca_p, cb_p, hx, hy, hz, ex, ey, ez,
-                m_hy_z, m_hz_y, m_hz_x, m_hx_z, m_hx_y, m_hy_x,
-                ex_store, ey_store, ez_store,
-                curl_x_store, curl_y_store, curl_z_store,
-                az, bz, ay, by, ax, bx, kz, ky, kx,
-                c,
-                ctx.rdz, ctx.rdy, ctx.rdx, t, ctx.grad_stride, snap_off,
-                n_shots, nz, ny, nx,
-                ctx.pml_z0, ctx.pml_z1, ctx.pml_y0, ctx.pml_y1,
-                ctx.pml_x0, ctx.pml_x1,
-                *ctx.fd_pad, ctx.ca_batched, ctx.cb_batched,
-            )
-            if n_src > 0:
-                ext.inject(
-                    (ex, ey, ez)[ctx.source_component], f, src_i,
-                    t, n_shots, n_src, numel,
-                )
-
-    @staticmethod
     def backward(ctx, grad_r):
         ext = ctx.ext
         ca_p, cb_p, cq_p, f, src_i, rec_i = ctx.saved_tensors
@@ -312,8 +255,6 @@ class EM3DFunc(torch.autograd.Function):
         nz, ny, nx = ca_p.shape[-3:]
         n_src, n_rec = src_i.shape[1], rec_i.shape[1]
         nt = ctx.nt
-        numel = nz * ny * nx
-        shot_count = n_shots * numel
 
         if grad_r is None:
             grad_r = torch.zeros(nt, n_shots, n_rec, device=device, dtype=dtype)
@@ -365,11 +306,9 @@ class EM3DFunc(torch.autograd.Function):
         scale = float(ctx.grad_stride)
         segments = ctx.segments
         if segments:
-            # Checkpointed backward: per segment, restore the wavefield
-            # state, replay the forward steps to regenerate the w
-            # snapshots at segment-local offsets, then run the adjoint
-            # steps.  The adjoint state (lam + memory variables) carries
-            # across segments.
+            # Checkpointed backward replays each segment's forward pass in
+            # C++; these buffers hold the replayed wavefield state (the
+            # adjoint state, lam + memory variables, carries across segments).
             ex_f = torch.zeros(n_shots, nz, ny, nx, device=device, dtype=dtype)
             ey_f = torch.zeros_like(ex_f)
             ez_f = torch.zeros_like(ex_f)
@@ -388,211 +327,57 @@ class EM3DFunc(torch.autograd.Function):
             m_hx_z_f = torch.zeros_like(ex_f)
             m_hx_y_f = torch.zeros_like(ex_f)
             m_hy_x_f = torch.zeros_like(ex_f)
-            ckpt = ctx.ckpt_state
-            for k in range(len(segments) - 1, -1, -1):
-                s0, s1 = segments[k]
-                if s0 > 0:
-                    c = ckpt[k - 1]
-                    ex_f.copy_(c[0])
-                    ey_f.copy_(c[1])
-                    ez_f.copy_(c[2])
-                    hx_f.copy_(c[3])
-                    hy_f.copy_(c[4])
-                    hz_f.copy_(c[5])
-                    m_ey_z_f.copy_(c[6])
-                    m_ez_y_f.copy_(c[7])
-                    m_ez_x_f.copy_(c[8])
-                    m_ex_z_f.copy_(c[9])
-                    m_ex_y_f.copy_(c[10])
-                    m_ey_x_f.copy_(c[11])
-                    m_hy_z_f.copy_(c[12])
-                    m_hz_y_f.copy_(c[13])
-                    m_hz_x_f.copy_(c[14])
-                    m_hx_z_f.copy_(c[15])
-                    m_hx_y_f.copy_(c[16])
-                    m_hy_x_f.copy_(c[17])
-                else:
-                    for buf in (
-                        ex_f, ey_f, ez_f, hx_f, hy_f, hz_f,
-                        m_ey_z_f, m_ez_y_f, m_ez_x_f, m_ex_z_f, m_ex_y_f,
-                        m_ey_x_f, m_hy_z_f, m_hz_y_f, m_hz_x_f, m_hx_z_f,
-                        m_hx_y_f, m_hy_x_f,
-                    ):
-                        buf.zero_()
-                EM3DFunc._replay_segment(
-                    ctx, ext, ca_p, cb_p, cq_p, f, src_i, n_shots, n_src,
-                    ex_f, ey_f, ez_f, hx_f, hy_f, hz_f,
-                    m_ey_z_f, m_ez_y_f, m_ez_x_f, m_ex_z_f, m_ex_y_f,
-                    m_ey_x_f, m_hy_z_f, m_hz_y_f, m_hz_x_f, m_hx_z_f,
-                    m_hx_y_f, m_hy_x_f,
-                    ex_store, ey_store, ez_store,
-                    curl_x_store, curl_y_store, curl_z_store,
-                    numel, nz, ny, nx, s0, s1,
-                )
-                for t in range(s1 - 1, s0 - 1, -1):
-                    if n_rec > 0:
-                        ext.record_grad_r(
-                            (lam_ex, lam_ey, lam_ez)[ctx.receiver_component],
-                            grad_r, rec_i, t, n_shots, n_rec, numel,
-                        )
-                    if n_src > 0:
-                        ext.record_grad_f(
-                            (lam_ex, lam_ey, lam_ez)[ctx.source_component],
-                            grad_f, src_i, t, n_shots, n_src, numel,
-                        )
-                    snap_off = ((t - s0) // ctx.grad_stride) * shot_count
-                    if t % ctx.grad_stride == 0:
-                        ext.coeff_grad(
-                            lam_ex, lam_ey, lam_ez,
-                            ex_store, ey_store, ez_store,
-                            curl_x_store, curl_y_store, curl_z_store,
-                            grad_ca, grad_cb,
-                            scale, snap_off,
-                            n_shots, nz, ny, nx,
-                            *ctx.fd_pad,
-                        )
-                    ext.adjoint_e_stage1(
-                        ca_p, cb_p, lam_ex, lam_ey, lam_ez,
-                        m_lambda_hy_z, m_lambda_hz_y, m_lambda_hz_x,
-                        m_lambda_hx_z, m_lambda_hx_y, m_lambda_hy_x,
-                        work_hy_z, work_hz_y, work_hz_x,
-                        work_hx_z, work_hx_y, work_hy_x,
-                        az, bz, ay, by, ax, bx, kz, ky, kx,
-                        n_shots, nz, ny, nx,
-                        ctx.pml_z0, ctx.pml_z1, ctx.pml_y0, ctx.pml_y1,
-                        ctx.pml_x0, ctx.pml_x1,
-                        *ctx.fd_pad, ctx.ca_batched, ctx.cb_batched,
-                    )
-                    ext.adjoint_e_stage2(
-                        work_hy_z, work_hz_y, work_hz_x,
-                        work_hx_z, work_hx_y, work_hy_x,
-                        lam_hy, lam_hz, lam_hx, ctx.c,
-                        ctx.rdz, ctx.rdy, ctx.rdx,
-                        n_shots, nz, ny, nx,
-                        ctx.fd_pad[0], ctx.fd_pad[2], ctx.fd_pad[4],
-                    )
-                    ext.adjoint_h_stage1(
-                        cq_p, lam_hx, lam_hy, lam_hz,
-                        m_lambda_ey_z, m_lambda_ez_y, m_lambda_ez_x,
-                        m_lambda_ex_z, m_lambda_ex_y, m_lambda_ey_x,
-                        work2_ey_z, work2_ez_y, work2_ez_x,
-                        work2_ex_z, work2_ex_y, work2_ey_x,
-                        azh, bzh, ayh, byh, axh, bxh, kzh, kyh, kxh,
-                        n_shots, nz, ny, nx,
-                        ctx.pml_z0, ctx.pml_z1, ctx.pml_y0, ctx.pml_y1,
-                        ctx.pml_x0, ctx.pml_x1,
-                        *ctx.fd_pad, ctx.cq_batched,
-                    )
-                    if t % ctx.grad_stride == 0:
-                        ext.cq_grad(
-                            cq_p, lam_hx, lam_hy, lam_hz,
-                            ex_store, ey_store, ez_store,
-                            m_lambda_ey_z, m_lambda_ez_y, m_lambda_ez_x,
-                            m_lambda_ex_z, m_lambda_ex_y, m_lambda_ey_x,
-                            grad_cq,
-                            azh, kzh, ayh, kyh, axh, kxh,
-                            ctx.c,
-                            ctx.rdz, ctx.rdy, ctx.rdx,
-                            scale, snap_off,
-                            n_shots, nz, ny, nx,
-                            *ctx.fd_pad, ctx.cq_batched,
-                        )
-                    ext.adjoint_h_stage2(
-                        work2_ey_z, work2_ez_y, work2_ez_x,
-                        work2_ex_z, work2_ex_y, work2_ey_x,
-                        lam_ex, lam_ey, lam_ez, ctx.c,
-                        ctx.rdz, ctx.rdy, ctx.rdx,
-                        n_shots, nz, ny, nx,
-                        ctx.fd_pad[0], ctx.fd_pad[2], ctx.fd_pad[4],
-                    )
+            state_f = [
+                ex_f, ey_f, ez_f, hx_f, hy_f, hz_f,
+                m_ey_z_f, m_ez_y_f, m_ez_x_f, m_ex_z_f, m_ex_y_f, m_ey_x_f,
+                m_hy_z_f, m_hz_y_f, m_hz_x_f, m_hx_z_f, m_hx_y_f, m_hy_x_f,
+            ]
+            segments_t = torch.tensor(segments, dtype=torch.int64)
         else:
-            for t in range(nt - 1, -1, -1):
-                if n_rec > 0:
-                    ext.record_grad_r(
-                        (lam_ex, lam_ey, lam_ez)[ctx.receiver_component],
-                        grad_r, rec_i, t, n_shots, n_rec, numel,
-                    )
-                if n_src > 0:
-                    ext.record_grad_f(
-                        (lam_ex, lam_ey, lam_ez)[ctx.source_component],
-                        grad_f, src_i, t, n_shots, n_src, numel,
-                    )
-                snap_off = ex_storage.snap_offset(t // ctx.grad_stride)
-                if t % ctx.grad_stride == 0:
-                    ext.coeff_grad(
-                        lam_ex, lam_ey, lam_ez,
-                        ex_store, ey_store, ez_store,
-                        curl_x_store, curl_y_store, curl_z_store,
-                        grad_ca, grad_cb,
-                        scale, snap_off,
-                        n_shots, nz, ny, nx,
-                        *ctx.fd_pad,
-                    )
-                ext.adjoint_e_stage1(
-                    ca_p, cb_p, lam_ex, lam_ey, lam_ez,
-                    m_lambda_hy_z, m_lambda_hz_y, m_lambda_hz_x,
-                    m_lambda_hx_z, m_lambda_hx_y, m_lambda_hy_x,
-                    work_hy_z, work_hz_y, work_hz_x,
-                    work_hx_z, work_hx_y, work_hy_x,
-                    az, bz, ay, by, ax, bx, kz, ky, kx,
-                    n_shots, nz, ny, nx,
-                    ctx.pml_z0, ctx.pml_z1, ctx.pml_y0, ctx.pml_y1,
-                    ctx.pml_x0, ctx.pml_x1,
-                    *ctx.fd_pad, ctx.ca_batched, ctx.cb_batched,
-                )
-                ext.adjoint_e_stage2(
-                    work_hy_z, work_hz_y, work_hz_x,
-                    work_hx_z, work_hx_y, work_hy_x,
-                    lam_hy, lam_hz, lam_hx, ctx.c,
-                    ctx.rdz, ctx.rdy, ctx.rdx,
-                    n_shots, nz, ny, nx,
-                    ctx.fd_pad[0], ctx.fd_pad[2], ctx.fd_pad[4],
-                )
-                ext.adjoint_h_stage1(
-                    cq_p, lam_hx, lam_hy, lam_hz,
-                    m_lambda_ey_z, m_lambda_ez_y, m_lambda_ez_x,
-                    m_lambda_ex_z, m_lambda_ex_y, m_lambda_ey_x,
-                    work2_ey_z, work2_ez_y, work2_ez_x,
-                    work2_ex_z, work2_ex_y, work2_ey_x,
-                    azh, bzh, ayh, byh, axh, bxh, kzh, kyh, kxh,
-                    n_shots, nz, ny, nx,
-                    ctx.pml_z0, ctx.pml_z1, ctx.pml_y0, ctx.pml_y1,
-                    ctx.pml_x0, ctx.pml_x1,
-                    *ctx.fd_pad, ctx.cq_batched,
-                )
-                if t % ctx.grad_stride == 0:
-                    ext.cq_grad(
-                        cq_p, lam_hx, lam_hy, lam_hz,
-                        ex_store, ey_store, ez_store,
-                        m_lambda_ey_z, m_lambda_ez_y, m_lambda_ez_x,
-                        m_lambda_ex_z, m_lambda_ex_y, m_lambda_ey_x,
-                        grad_cq,
-                        azh, kzh, ayh, kyh, axh, kxh,
-                        ctx.c,
-                        ctx.rdz, ctx.rdy, ctx.rdx,
-                        scale, snap_off,
-                        n_shots, nz, ny, nx,
-                        *ctx.fd_pad, ctx.cq_batched,
-                    )
-                ext.adjoint_h_stage2(
-                    work2_ey_z, work2_ez_y, work2_ez_x,
-                    work2_ex_z, work2_ex_y, work2_ey_x,
-                    lam_ex, lam_ey, lam_ez, ctx.c,
-                    ctx.rdz, ctx.rdy, ctx.rdx,
-                    n_shots, nz, ny, nx,
-                    ctx.fd_pad[0], ctx.fd_pad[2], ctx.fd_pad[4],
-                )
+            state_f = []
+            segments_t = torch.empty(0, 2, dtype=torch.int64)
+        ext.adjoint_loop(
+            ca_p, cb_p, cq_p,
+            lam_ex, lam_ey, lam_ez, lam_hx, lam_hy, lam_hz,
+            m_lambda_hy_z, m_lambda_hz_y, m_lambda_hz_x,
+            m_lambda_hx_z, m_lambda_hx_y, m_lambda_hy_x,
+            work_hy_z, work_hz_y, work_hz_x,
+            work_hx_z, work_hx_y, work_hy_x,
+            m_lambda_ey_z, m_lambda_ez_y, m_lambda_ez_x,
+            m_lambda_ex_z, m_lambda_ex_y, m_lambda_ey_x,
+            work2_ey_z, work2_ez_y, work2_ez_x,
+            work2_ex_z, work2_ex_y, work2_ey_x,
+            az, bz, ay, by, ax, bx, kz, ky, kx,
+            azh, bzh, ayh, byh, axh, bxh, kzh, kyh, kxh,
+            ex_store, ey_store, ez_store,
+            curl_x_store, curl_y_store, curl_z_store,
+            grad_ca, grad_cb, grad_cq,
+            grad_r, rec_i, grad_f, src_i, f,
+            state_f,
+            ctx.c,
+            ctx.rdz, ctx.rdy, ctx.rdx, scale,
+            nt, ctx.grad_stride,
+            ctx.pml_z0, ctx.pml_z1, ctx.pml_y0, ctx.pml_y1,
+            ctx.pml_x0, ctx.pml_x1,
+            ctx.ca_batched, ctx.cb_batched, ctx.cq_batched,
+            ctx.fd_pad[0], ctx.fd_pad[1], ctx.fd_pad[2],
+            ctx.fd_pad[3], ctx.fd_pad[4], ctx.fd_pad[5],
+            ctx.source_component, ctx.receiver_component,
+            segments_t, ctx.ckpt_state,
+        )
 
         grad_ca = grad_ca if ctx.ca_batched else grad_ca.sum(0, keepdim=True)
         grad_cb = grad_cb if ctx.cb_batched else grad_cb.sum(0, keepdim=True)
         grad_cq = grad_cq if ctx.cq_batched else grad_cq.sum(0, keepdim=True)
 
+        # 38 forward() inputs: 3 model grads + grad_f + 34 x None
         return (
             grad_ca, grad_cb, grad_cq, grad_f,
             None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None,
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None,
+            None, None,
         )
 
 
@@ -613,6 +398,10 @@ def em3d(
     ckpt_steps=None,
     source_component="ey",
     receiver_component="ey",
+    forward_callback=None,
+    callback_frequency=1,
+    return_state=False,
+    initial_state=None,
 ):
     """3D electromagnetic (Ex/Ey/Ez-Hx/Hy/Hz) forward modelling / FWI primitive.
 
@@ -649,9 +438,33 @@ def em3d(
             or 'ez'; default 'ey', matching the maxwell3d default).
         receiver_component: Component recorded at the receivers (default
             'ey').
+        forward_callback: called every ``callback_frequency`` steps with a
+            ``CallbackState`` (deepwave-style) exposing the current padded
+            wavefields via ``state.get_wavefield(name, view)`` — useful for
+            RTM imaging conditions, illumination accumulation, monitoring.
+        callback_frequency: call ``forward_callback`` every N time steps.
+        return_state: if True, return ``(r, state)`` where ``state`` is a
+            dict of the FINAL padded wavefield state (keys ``ex``, ``ey``,
+            ``ez``, ``hx``, ``hy``, ``hz`` and the twelve PML memory
+            variables) suitable for continuation via ``initial_state``.
+        initial_state: a dict of initial wavefield state (padded grid, keys
+            as in the ``return_state=True`` output) to continue a previous
+            run.  The staggered Yee state before step 0 holds the E fields
+            at t = 0 (integer time) and the H fields at t = -1/2 (half
+            integer time).  Missing keys are zero-filled; a complete state
+            dict (every key, including the PML memory variables) makes a
+            split run bitwise match a one-shot run, while a partial dict
+            restores only the given fields with the remaining state starting
+            from zero.
+            State I/O is for forward continuation; autograd does not propagate
+            across the boundary between runs.  State dicts are ephemeral
+            runtime snapshots: they may be passed back only to the same
+            propagator with the same model layout and nami version, and are
+            not a stable long-term checkpoint format.
 
     Returns:
-        receiver_amplitudes [nt, n_shots, n_rec].
+        receiver_amplitudes [nt, n_shots, n_rec] (or ``(r, state)``
+        when ``return_state=True``).
     """
     accuracy = check_accuracy(accuracy)
     if not isinstance(grid_spacing, (list, tuple)):
@@ -708,15 +521,10 @@ def em3d(
 
     c = staggered_diff1_coeffs(accuracy, dtype, device)
 
-    if source_amplitudes is not None:
-        amp = source_amplitudes.to(device=device, dtype=dtype)
-        if amp.shape[0] != n_shots:
-            raise ValueError("source_amplitudes must have n_shots batches.")
-        if amp.shape[2] < nt_inner:
-            raise ValueError("source_amplitudes must have at least nt steps.")
-        amp = amp[:, :, :nt_inner]
-    else:
-        amp = torch.zeros(n_shots, 0, nt_inner, device=device, dtype=dtype)
+    amp = prepare_source_amplitudes(
+        source_amplitudes, n_shots, src_i.shape[1], nt_inner,
+        device=device, dtype=dtype,
+    )
 
     dz, dy, dx = grid_spacing
     source_coeff = -1.0 / (dz * dy * dx)
@@ -726,9 +534,6 @@ def em3d(
         cb_flat = cb_p.reshape(-1, nz * ny * nx).expand(n_shots, -1)
         cb_at_src = cb_flat.gather(1, src_i_masked)
         f = (amp.permute(2, 0, 1) * cb_at_src.unsqueeze(0) * source_coeff).contiguous()
-    elif src_i.shape[1] > 0:
-        # located sources without amplitudes: inject zero (no-op) amplitudes
-        f = torch.zeros(nt_inner, n_shots, src_i.shape[1], device=device, dtype=dtype)
     else:
         f = torch.empty(0, device=device, dtype=dtype)
 
@@ -736,17 +541,11 @@ def em3d(
     pml_z0, pml_z1 = fd_pad[0] + pml_w[0], nz - fd_pad[1] - pml_w[1]
     pml_y0, pml_y1 = fd_pad[2] + pml_w[2], ny - fd_pad[3] - pml_w[3]
     pml_x0, pml_x1 = fd_pad[4] + pml_w[4], nx - fd_pad[5] - pml_w[5]
-    # Batched flags from the *user* models (before pad), same contract as
-    # em2d_tm / scalar / elastic.
-    ca_batched = 1 if (
-        epsilon.ndim == 4 and epsilon.shape[0] == n_shots and n_shots > 1
-    ) else 0
-    cb_batched = 1 if (
-        sigma.ndim == 4 and sigma.shape[0] == n_shots and n_shots > 1
-    ) else 0
-    cq_batched = 1 if (
-        mu.ndim == 4 and mu.shape[0] == n_shots and n_shots > 1
-    ) else 0
+    # ca/cb both depend on epsilon and sigma; use the compiled tensor shapes
+    # after broadcasting to select the CUDA model slab.
+    ca_batched = int(is_shot_batched(ca_p, n_shots, spatial_ndim=3))
+    cb_batched = int(is_shot_batched(cb_p, n_shots, spatial_ndim=3))
+    cq_batched = int(is_shot_batched(cq_p, n_shots, spatial_ndim=3))
 
     storage_mode = resolve_storage(storage)
     grad_stride = check_sample_steps(sample_steps)
@@ -789,6 +588,26 @@ def em3d(
                 n_ckpt, N_STATE, n_shots, nz, ny, nx, device=device, dtype=dtype,
             )
 
+    # Wavefield I/O (deepwave-style): continuation initial state, optional
+    # final-state output, and the per-step forward callback.
+    state_shape = (n_shots, nz, ny, nx)
+    init_state = prepare_initial_state(
+        initial_state, _WAVEFIELD_NAMES, state_shape, device=device, dtype=dtype,
+    )
+    final_state = allocate_final_state(
+        return_state, _WAVEFIELD_NAMES, state_shape, device=device, dtype=dtype,
+    )
+    callback_frequency = validate_callback_frequency(callback_frequency)
+    cb = (
+        wrap_forward_callback(
+            forward_callback,
+            _CALLBACK_FIELDS,
+            float(dt), fd_pad, list(pml_w),
+        )
+        if forward_callback is not None
+        else None
+    )
+
     r = EM3DFunc.apply(
         ca_p, cb_p, cq_p, f, src_i, rec_i, profs, c, fd_pad,
         rdz, rdy, rdx, nt_inner,
@@ -799,7 +618,10 @@ def em3d(
         curl_x_storage, curl_y_storage, curl_z_storage,
         source_component, receiver_component,
         ckpt_state, checkpoint_every, segments,
+        init_state, final_state, cb, callback_frequency,
     )
+    if return_state:
+        return r, unpack_state(final_state, _WAVEFIELD_NAMES)
     return r
 
 

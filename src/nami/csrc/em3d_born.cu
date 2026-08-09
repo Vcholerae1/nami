@@ -37,9 +37,14 @@
  * stencil) -- the correctness baseline.
  *
  * Spatial FD order 2/4/6/8 via the ``fd.STAGGERED_DIFF1`` coefficient
- * tables: kernels are driven by the zero-padded coefficient array (max
- * radius 4) and the per-side FD padding ``fd_pad =
- * [accuracy // 2, accuracy // 2 - 1] * 3``.  Snapshots (24 streams:
+ * tables: the FD order is a compile-time template parameter (FD_PAD =
+ * accuracy // 2, the same stencil radius in all three directions), so the
+ * stencil loops fully unroll with constant offsets.  Coefficients and
+ * operation order are unchanged from the runtime-radius implementation, so
+ * results are bitwise identical.  The launcher functions dispatch on the
+ * runtime per-side padding ``fd_pad = [accuracy // 2, accuracy // 2 - 1] * 3``
+ * (all three directions have radius FD_PAD) and the kernels are driven by
+ * the zero-padded coefficient array (max radius 4).  Snapshots (24 streams:
  * pre-update E and PML-modified curls for both fields, plus the
  * PML-modified H-step E-derivatives for both fields) live in C++-owned
  * storage with device / pinned-cpu / disk offload and
@@ -49,73 +54,85 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
+#include <pybind11/stl.h>
 #include "storage.h"
 
 #define CHECK_CONTIG(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
 // ---------------- coefficient-driven staggered difference operators ----------------
-// Same conventions as em3d.cu / born_em_el.cu: ``diff_int_*`` evaluates a
+// Same conventions as em3d.cu / em2d_tm_born.cu: ``diff_int_*`` evaluates a
 // derivative at a half-integer grid point of an integer-stored field (H
 // step), ``diff_half_*`` at an integer grid point of a half-integer-stored
 // field (E step curl); the two are exact discrete transposes of each other
-// up to the curl sign.  The loop bound is the runtime stencil radius, never
-// a hardcoded maximum.
-template <typename T>
+// up to the curl sign.  ``c`` is the staggered-grid first-derivative
+// coefficient array (max radius 4, zero-padded for lower orders); the loop
+// bound is the compile-time stencil radius FD_PAD (== accuracy // 2, the
+// same in all three directions), so the loops fully unroll with constant
+// offsets and no out-of-bounds reads occur.  Coefficients and operation
+// order are unchanged from the runtime-radius version, so results are
+// bitwise identical.
+template <typename T, int FD_PAD>
 __device__ __forceinline__ T diff_int_x(const T* __restrict__ u, long off,
-                                        const T* __restrict__ c, T rdx, int radius)
+                                        const T* __restrict__ c, T rdx)
 {
     T d = (T)0;
-    for (int k = 1; k <= radius; ++k)
+#pragma unroll
+    for (int k = 1; k <= FD_PAD; ++k)
         d += c[k - 1] * (u[off + k] - u[off - k + 1]);
     return d * rdx;
 }
 
-template <typename T>
+template <typename T, int FD_PAD>
 __device__ __forceinline__ T diff_int_y(const T* __restrict__ u, long off,
-                                        const T* __restrict__ c, T rdy, int nx, int radius)
+                                        const T* __restrict__ c, T rdy, int nx)
 {
     T d = (T)0;
-    for (int k = 1; k <= radius; ++k)
+#pragma unroll
+    for (int k = 1; k <= FD_PAD; ++k)
         d += c[k - 1] * (u[off + k * nx] - u[off - (k - 1) * nx]);
     return d * rdy;
 }
 
-template <typename T>
+template <typename T, int FD_PAD>
 __device__ __forceinline__ T diff_int_z(const T* __restrict__ u, long off,
-                                        const T* __restrict__ c, T rdz, long ny_nx, int radius)
+                                        const T* __restrict__ c, T rdz, long ny_nx)
 {
     T d = (T)0;
-    for (int k = 1; k <= radius; ++k)
+#pragma unroll
+    for (int k = 1; k <= FD_PAD; ++k)
         d += c[k - 1] * (u[off + k * ny_nx] - u[off - (k - 1) * ny_nx]);
     return d * rdz;
 }
 
-template <typename T>
+template <typename T, int FD_PAD>
 __device__ __forceinline__ T diff_half_x(const T* __restrict__ u, long off,
-                                         const T* __restrict__ c, T rdx, int radius)
+                                         const T* __restrict__ c, T rdx)
 {
     T d = (T)0;
-    for (int k = 1; k <= radius; ++k)
+#pragma unroll
+    for (int k = 1; k <= FD_PAD; ++k)
         d += c[k - 1] * (u[off + k - 1] - u[off - k]);
     return d * rdx;
 }
 
-template <typename T>
+template <typename T, int FD_PAD>
 __device__ __forceinline__ T diff_half_y(const T* __restrict__ u, long off,
-                                         const T* __restrict__ c, T rdy, int nx, int radius)
+                                         const T* __restrict__ c, T rdy, int nx)
 {
     T d = (T)0;
-    for (int k = 1; k <= radius; ++k)
+#pragma unroll
+    for (int k = 1; k <= FD_PAD; ++k)
         d += c[k - 1] * (u[off + (k - 1) * nx] - u[off - k * nx]);
     return d * rdy;
 }
 
-template <typename T>
+template <typename T, int FD_PAD>
 __device__ __forceinline__ T diff_half_z(const T* __restrict__ u, long off,
-                                         const T* __restrict__ c, T rdz, long ny_nx, int radius)
+                                         const T* __restrict__ c, T rdz, long ny_nx)
 {
     T d = (T)0;
-    for (int k = 1; k <= radius; ++k)
+#pragma unroll
+    for (int k = 1; k <= FD_PAD; ++k)
         d += c[k - 1] * (u[off + (k - 1) * ny_nx] - u[off - k * ny_nx]);
     return d * rdz;
 }
@@ -126,7 +143,7 @@ __device__ __forceinline__ T diff_half_z(const T* __restrict__ u, long off,
 // (``dcq*deriv(E_bg)`` when mu is perturbed).  The six PML-modified
 // derivatives of both E fields are snapshotted on the sampling interval for
 // the cq/dcq model gradients.
-template <typename T>
+template <typename T, int FD_PAD>
 __global__ void born_step_h_kernel(
     const T* __restrict__ cq, const T* __restrict__ dcq,
     const T* __restrict__ ex, const T* __restrict__ ey, const T* __restrict__ ez,
@@ -152,7 +169,6 @@ __global__ void born_step_h_kernel(
     int t, int interval, int64_t snap_off,
     int n_shots, int nz, int ny, int nx,
     int pml_z0, int pml_z1, int pml_y0, int pml_y1, int pml_x0, int pml_x1,
-    int fd_pad_z0, int fd_pad_y0, int fd_pad_x0,
     int cq_batched, int dcq_batched, int store)
 {
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -184,18 +200,18 @@ __global__ void born_step_h_kernel(
     T dEx_dz = (T)0;
     T dEx_dy = (T)0;
     T dEy_dx = (T)0;
-    if (z >= fd_pad_z0 && z < nz - fd_pad_z0)
-        dEy_dz = diff_int_z(ey, i, c, rdz, ny_nx, fd_pad_z0);
-    if (y >= fd_pad_y0 && y < ny - fd_pad_y0)
-        dEz_dy = diff_int_y(ez, i, c, rdy, nx, fd_pad_y0);
-    if (x >= fd_pad_x0 && x < nx - fd_pad_x0)
-        dEz_dx = diff_int_x(ez, i, c, rdx, fd_pad_x0);
-    if (z >= fd_pad_z0 && z < nz - fd_pad_z0)
-        dEx_dz = diff_int_z(ex, i, c, rdz, ny_nx, fd_pad_z0);
-    if (y >= fd_pad_y0 && y < ny - fd_pad_y0)
-        dEx_dy = diff_int_y(ex, i, c, rdy, nx, fd_pad_y0);
-    if (x >= fd_pad_x0 && x < nx - fd_pad_x0)
-        dEy_dx = diff_int_x(ey, i, c, rdx, fd_pad_x0);
+    if (z >= FD_PAD && z < nz - FD_PAD)
+        dEy_dz = diff_int_z<T, FD_PAD>(ey, i, c, rdz, ny_nx);
+    if (y >= FD_PAD && y < ny - FD_PAD)
+        dEz_dy = diff_int_y<T, FD_PAD>(ez, i, c, rdy, nx);
+    if (x >= FD_PAD && x < nx - FD_PAD)
+        dEz_dx = diff_int_x<T, FD_PAD>(ez, i, c, rdx);
+    if (z >= FD_PAD && z < nz - FD_PAD)
+        dEx_dz = diff_int_z<T, FD_PAD>(ex, i, c, rdz, ny_nx);
+    if (y >= FD_PAD && y < ny - FD_PAD)
+        dEx_dy = diff_int_y<T, FD_PAD>(ex, i, c, rdy, nx);
+    if (x >= FD_PAD && x < nx - FD_PAD)
+        dEy_dx = diff_int_x<T, FD_PAD>(ey, i, c, rdx);
 
     T ddEy_dz = (T)0;
     T ddEz_dy = (T)0;
@@ -203,18 +219,18 @@ __global__ void born_step_h_kernel(
     T ddEx_dz = (T)0;
     T ddEx_dy = (T)0;
     T ddEy_dx = (T)0;
-    if (z >= fd_pad_z0 && z < nz - fd_pad_z0)
-        ddEy_dz = diff_int_z(dEy, i, c, rdz, ny_nx, fd_pad_z0);
-    if (y >= fd_pad_y0 && y < ny - fd_pad_y0)
-        ddEz_dy = diff_int_y(dEz, i, c, rdy, nx, fd_pad_y0);
-    if (x >= fd_pad_x0 && x < nx - fd_pad_x0)
-        ddEz_dx = diff_int_x(dEz, i, c, rdx, fd_pad_x0);
-    if (z >= fd_pad_z0 && z < nz - fd_pad_z0)
-        ddEx_dz = diff_int_z(dEx, i, c, rdz, ny_nx, fd_pad_z0);
-    if (y >= fd_pad_y0 && y < ny - fd_pad_y0)
-        ddEx_dy = diff_int_y(dEx, i, c, rdy, nx, fd_pad_y0);
-    if (x >= fd_pad_x0 && x < nx - fd_pad_x0)
-        ddEy_dx = diff_int_x(dEy, i, c, rdx, fd_pad_x0);
+    if (z >= FD_PAD && z < nz - FD_PAD)
+        ddEy_dz = diff_int_z<T, FD_PAD>(dEy, i, c, rdz, ny_nx);
+    if (y >= FD_PAD && y < ny - FD_PAD)
+        ddEz_dy = diff_int_y<T, FD_PAD>(dEz, i, c, rdy, nx);
+    if (x >= FD_PAD && x < nx - FD_PAD)
+        ddEz_dx = diff_int_x<T, FD_PAD>(dEz, i, c, rdx);
+    if (z >= FD_PAD && z < nz - FD_PAD)
+        ddEx_dz = diff_int_z<T, FD_PAD>(dEx, i, c, rdz, ny_nx);
+    if (y >= FD_PAD && y < ny - FD_PAD)
+        ddEx_dy = diff_int_y<T, FD_PAD>(dEx, i, c, rdy, nx);
+    if (x >= FD_PAD && x < nx - FD_PAD)
+        ddEy_dx = diff_int_x<T, FD_PAD>(dEy, i, c, rdx);
 
     if (z < pml_z0 || z >= pml_z1h) {
         m_ey_z[i] = bzh[z] * m_ey_z[i] + azh[z] * dEy_dz;
@@ -279,7 +295,7 @@ __global__ void born_step_h_kernel(
 //   dEx = ca*dEx + cb*dcurl_x + dca*ex_old + dcb*curl_x
 // (and the y/z analogues).  Only the FD interior is updated (E fields
 // outside it are zero, mirroring em3d).
-template <typename T>
+template <typename T, int FD_PAD>
 __global__ void born_step_e_kernel(
     const T* __restrict__ ca, const T* __restrict__ cb,
     const T* __restrict__ dca, const T* __restrict__ dcb,
@@ -306,8 +322,6 @@ __global__ void born_step_e_kernel(
     int t, int interval, int64_t snap_off,
     int n_shots, int nz, int ny, int nx,
     int pml_z0, int pml_z1, int pml_y0, int pml_y1, int pml_x0, int pml_x1,
-    int fd_pad_z0, int fd_pad_z1, int fd_pad_y0, int fd_pad_y1,
-    int fd_pad_x0, int fd_pad_x1,
     int ca_batched, int cb_batched, int dca_batched, int dcb_batched)
 {
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -319,8 +333,8 @@ __global__ void born_step_e_kernel(
     const int y = (int)((i / nx) % ny);
     const int z = (int)((i / ((long)nx * ny)) % nz);
     const int s = (int)(i / ((long)nx * ny * nz));
-    if (z < fd_pad_z0 || z >= nz - fd_pad_z1 || y < fd_pad_y0 ||
-        y >= ny - fd_pad_y1 || x < fd_pad_x0 || x >= nx - fd_pad_x1)
+    if (z < FD_PAD || z >= nz - (FD_PAD - 1) || y < FD_PAD ||
+        y >= ny - (FD_PAD - 1) || x < FD_PAD || x >= nx - (FD_PAD - 1))
         return;
     const long j = (long)z * ny_nx + (long)y * nx + x;
     const T ca_val = ca_batched ? ca[i] : ca[j];
@@ -328,19 +342,19 @@ __global__ void born_step_e_kernel(
     const T dca_val = dca_batched ? dca[i] : dca[j];
     const T dcb_val = dcb_batched ? dcb[i] : dcb[j];
 
-    T dHy_dz = diff_half_z(hy, i, c, rdz, ny_nx, fd_pad_z0);
-    T dHz_dy = diff_half_y(hz, i, c, rdy, nx, fd_pad_y0);
-    T dHz_dx = diff_half_x(hz, i, c, rdx, fd_pad_x0);
-    T dHx_dz = diff_half_z(hx, i, c, rdz, ny_nx, fd_pad_z0);
-    T dHx_dy = diff_half_y(hx, i, c, rdy, nx, fd_pad_y0);
-    T dHy_dx = diff_half_x(hy, i, c, rdx, fd_pad_x0);
+    T dHy_dz = diff_half_z<T, FD_PAD>(hy, i, c, rdz, ny_nx);
+    T dHz_dy = diff_half_y<T, FD_PAD>(hz, i, c, rdy, nx);
+    T dHz_dx = diff_half_x<T, FD_PAD>(hz, i, c, rdx);
+    T dHx_dz = diff_half_z<T, FD_PAD>(hx, i, c, rdz, ny_nx);
+    T dHx_dy = diff_half_y<T, FD_PAD>(hx, i, c, rdy, nx);
+    T dHy_dx = diff_half_x<T, FD_PAD>(hy, i, c, rdx);
 
-    T ddHy_dz = diff_half_z(dHy, i, c, rdz, ny_nx, fd_pad_z0);
-    T ddHz_dy = diff_half_y(dHz, i, c, rdy, nx, fd_pad_y0);
-    T ddHz_dx = diff_half_x(dHz, i, c, rdx, fd_pad_x0);
-    T ddHx_dz = diff_half_z(dHx, i, c, rdz, ny_nx, fd_pad_z0);
-    T ddHx_dy = diff_half_y(dHx, i, c, rdy, nx, fd_pad_y0);
-    T ddHy_dx = diff_half_x(dHy, i, c, rdx, fd_pad_x0);
+    T ddHy_dz = diff_half_z<T, FD_PAD>(dHy, i, c, rdz, ny_nx);
+    T ddHz_dy = diff_half_y<T, FD_PAD>(dHz, i, c, rdy, nx);
+    T ddHz_dx = diff_half_x<T, FD_PAD>(dHz, i, c, rdx);
+    T ddHx_dz = diff_half_z<T, FD_PAD>(dHx, i, c, rdz, ny_nx);
+    T ddHx_dy = diff_half_y<T, FD_PAD>(dHx, i, c, rdy, nx);
+    T ddHy_dx = diff_half_x<T, FD_PAD>(dHy, i, c, rdx);
 
     if (z < pml_z0 || z >= pml_z1) {
         m_hy_z[i] = bz[z] * m_hy_z[i] + az[z] * dHy_dz;
@@ -481,7 +495,7 @@ __global__ void born_record_grad_f_kernel(
 }
 
 // ==================== backward: ca/cb/dca/dcb model gradients ====================
-template <typename T>
+template <typename T, int FD_PAD>
 __global__ void born_coeff_grad_kernel(
     const T* __restrict__ lam_ex, const T* __restrict__ lam_ey,
     const T* __restrict__ lam_ez,
@@ -498,9 +512,7 @@ __global__ void born_coeff_grad_kernel(
     T* __restrict__ grad_ca, T* __restrict__ grad_cb,
     T* __restrict__ grad_dca, T* __restrict__ grad_dcb,
     T scale, int64_t snap_off,
-    int n_shots, int nz, int ny, int nx,
-    int fd_pad_z0, int fd_pad_z1, int fd_pad_y0, int fd_pad_y1,
-    int fd_pad_x0, int fd_pad_x1)
+    int n_shots, int nz, int ny, int nx)
 {
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t total = (int64_t)n_shots * nz * ny * nx;
@@ -509,8 +521,8 @@ __global__ void born_coeff_grad_kernel(
     const int x = (int)(i % nx);
     const int y = (int)((i / nx) % ny);
     const int z = (int)((i / ((long)nx * ny)) % nz);
-    if (z < fd_pad_z0 || z >= nz - fd_pad_z1 || y < fd_pad_y0 ||
-        y >= ny - fd_pad_y1 || x < fd_pad_x0 || x >= nx - fd_pad_x1)
+    if (z < FD_PAD || z >= nz - (FD_PAD - 1) || y < FD_PAD ||
+        y >= ny - (FD_PAD - 1) || x < FD_PAD || x >= nx - (FD_PAD - 1))
         return;
     const int64_t soff = snap_off + i;
     const T lex = lam_ex[i] * scale;
@@ -535,7 +547,7 @@ __global__ void born_coeff_grad_kernel(
 //   lam_E  = ca*lam_E  + dca*lam_dE     lam_dE = ca*lam_dE
 // and builds the twelve work arrays (the PML-modified curls applied to the
 // g values) with the time-reversed integer-profile memory recursions.
-template <typename T>
+template <typename T, int FD_PAD>
 __global__ void born_adjoint_e_stage1_kernel(
     const T* __restrict__ ca, const T* __restrict__ cb,
     const T* __restrict__ dca, const T* __restrict__ dcb,
@@ -559,8 +571,6 @@ __global__ void born_adjoint_e_stage1_kernel(
     const T* __restrict__ kz, const T* __restrict__ ky, const T* __restrict__ kx,
     int n_shots, int nz, int ny, int nx,
     int pml_z0, int pml_z1, int pml_y0, int pml_y1, int pml_x0, int pml_x1,
-    int fd_pad_z0, int fd_pad_z1, int fd_pad_y0, int fd_pad_y1,
-    int fd_pad_x0, int fd_pad_x1,
     int ca_batched, int cb_batched, int dca_batched, int dcb_batched)
 {
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -573,8 +583,8 @@ __global__ void born_adjoint_e_stage1_kernel(
     const int z = (int)((i / ((long)nx * ny)) % nz);
     const int s = (int)(i / ((long)nx * ny * nz));
     const long j = (long)z * ny_nx + (long)y * nx + x;
-    const bool active = z >= fd_pad_z0 && z < nz - fd_pad_z1 && y >= fd_pad_y0 &&
-                        y < ny - fd_pad_y1 && x >= fd_pad_x0 && x < nx - fd_pad_x1;
+    const bool active = z >= FD_PAD && z < nz - (FD_PAD - 1) && y >= FD_PAD &&
+                        y < ny - (FD_PAD - 1) && x >= FD_PAD && x < nx - (FD_PAD - 1);
     if (!active) {
         work_hy_z[i] = (T)0; work_hz_y[i] = (T)0; work_hz_x[i] = (T)0;
         work_hx_z[i] = (T)0; work_hx_y[i] = (T)0; work_hy_x[i] = (T)0;
@@ -675,7 +685,7 @@ __global__ void born_adjoint_e_stage1_kernel(
 // curls applied to the work arrays (the transpose of diff_half), summed per
 // H component.  No interior guard: boundary cells get zero contributions
 // from the zeroed work arrays.
-template <typename T>
+template <typename T, int FD_PAD>
 __global__ void born_adjoint_e_stage2_kernel(
     const T* __restrict__ work_hy_z, const T* __restrict__ work_hz_y,
     const T* __restrict__ work_hz_x, const T* __restrict__ work_hx_z,
@@ -687,8 +697,7 @@ __global__ void born_adjoint_e_stage2_kernel(
     T* __restrict__ lam_dhy, T* __restrict__ lam_dhz, T* __restrict__ lam_dhx,
     const T* __restrict__ c,
     T rdz, T rdy, T rdx,
-    int n_shots, int nz, int ny, int nx,
-    int fd_pad_z0, int fd_pad_y0, int fd_pad_x0)
+    int n_shots, int nz, int ny, int nx)
 {
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t total = (int64_t)n_shots * nz * ny * nx;
@@ -700,7 +709,7 @@ __global__ void born_adjoint_e_stage2_kernel(
     const int z = (int)((i / ((long)nx * ny)) % nz);
     T acc_z = (T)0;
     T acc_dz = (T)0;
-    for (int k = 1; k <= fd_pad_z0; ++k) {
+    for (int k = 1; k <= FD_PAD; ++k) {
         const T ck = c[k - 1];
         if (z - k + 1 >= 0) {
             acc_z += ck * work_hy_z[i - (long)(k - 1) * ny_nx];
@@ -715,7 +724,7 @@ __global__ void born_adjoint_e_stage2_kernel(
     lam_dhy[i] += acc_dz * rdz;
     T acc_hy_x = (T)0;
     T acc_dhy_x = (T)0;
-    for (int k = 1; k <= fd_pad_x0; ++k) {
+    for (int k = 1; k <= FD_PAD; ++k) {
         const T ck = c[k - 1];
         if (x - k + 1 >= 0) {
             acc_hy_x += ck * work_hy_x[i - k + 1];
@@ -731,7 +740,7 @@ __global__ void born_adjoint_e_stage2_kernel(
 
     T acc_y = (T)0;
     T acc_dy = (T)0;
-    for (int k = 1; k <= fd_pad_y0; ++k) {
+    for (int k = 1; k <= FD_PAD; ++k) {
         const T ck = c[k - 1];
         if (y - k + 1 >= 0) {
             acc_y += ck * work_hz_y[i - (long)(k - 1) * nx];
@@ -746,7 +755,7 @@ __global__ void born_adjoint_e_stage2_kernel(
     lam_dhz[i] += acc_dy * rdy;
     T acc_hz_x = (T)0;
     T acc_dhz_x = (T)0;
-    for (int k = 1; k <= fd_pad_x0; ++k) {
+    for (int k = 1; k <= FD_PAD; ++k) {
         const T ck = c[k - 1];
         if (x - k + 1 >= 0) {
             acc_hz_x += ck * work_hz_x[i - k + 1];
@@ -762,7 +771,7 @@ __global__ void born_adjoint_e_stage2_kernel(
 
     T acc_hx_z = (T)0;
     T acc_dhx_z = (T)0;
-    for (int k = 1; k <= fd_pad_z0; ++k) {
+    for (int k = 1; k <= FD_PAD; ++k) {
         const T ck = c[k - 1];
         if (z - k + 1 >= 0) {
             acc_hx_z += ck * work_hx_z[i - (long)(k - 1) * ny_nx];
@@ -777,7 +786,7 @@ __global__ void born_adjoint_e_stage2_kernel(
     lam_dhx[i] += acc_dhx_z * rdz;
     T acc_hx_y = (T)0;
     T acc_dhx_y = (T)0;
-    for (int k = 1; k <= fd_pad_y0; ++k) {
+    for (int k = 1; k <= FD_PAD; ++k) {
         const T ck = c[k - 1];
         if (y - k + 1 >= 0) {
             acc_hx_y += ck * work_hx_y[i - (long)(k - 1) * nx];
@@ -799,7 +808,7 @@ __global__ void born_adjoint_e_stage2_kernel(
 // source is also linear in the background E field; the bg work arrays get
 // both contributions through the bg half-integer memory, the sc arrays only
 // the cq part through the sc memory.
-template <typename T>
+template <typename T, int FD_PAD>
 __global__ void born_adjoint_h_stage1_kernel(
     const T* __restrict__ cq, const T* __restrict__ dcq,
     const T* __restrict__ lam_hx, const T* __restrict__ lam_hy,
@@ -824,8 +833,6 @@ __global__ void born_adjoint_h_stage1_kernel(
     const T* __restrict__ kzh, const T* __restrict__ kyh, const T* __restrict__ kxh,
     int n_shots, int nz, int ny, int nx,
     int pml_z0, int pml_z1, int pml_y0, int pml_y1, int pml_x0, int pml_x1,
-    int fd_pad_z0, int fd_pad_z1, int fd_pad_y0, int fd_pad_y1,
-    int fd_pad_x0, int fd_pad_x1,
     int cq_batched, int dcq_batched)
 {
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -838,8 +845,8 @@ __global__ void born_adjoint_h_stage1_kernel(
     const int z = (int)((i / ((long)nx * ny)) % nz);
     const int s = (int)(i / ((long)nx * ny * nz));
     const long j = (long)z * ny_nx + (long)y * nx + x;
-    const bool active = z >= fd_pad_z0 && z < nz - fd_pad_z1 && y >= fd_pad_y0 &&
-                        y < ny - fd_pad_y1 && x >= fd_pad_x0 && x < nx - fd_pad_x1;
+    const bool active = z >= FD_PAD && z < nz - (FD_PAD - 1) && y >= FD_PAD &&
+                        y < ny - (FD_PAD - 1) && x >= FD_PAD && x < nx - (FD_PAD - 1);
     if (!active) {
         work2_ey_z[i] = (T)0; work2_ez_y[i] = (T)0; work2_ez_x[i] = (T)0;
         work2_ex_z[i] = (T)0; work2_ex_y[i] = (T)0; work2_ey_x[i] = (T)0;
@@ -861,7 +868,7 @@ __global__ void born_adjoint_h_stage1_kernel(
         pml_x1h = pml_x0;
 
     // dEy_dz feeds Hx with -cq (and dcq*lam_dhx via the dcq source)
-    if (z < nz - fd_pad_z0) {
+    if (z < nz - FD_PAD) {
         const T g2 = -cq_val * lam_hx[i] - dcq_val * lam_dhx[i];
         const T g2d = -cq_val * lam_dhx[i];
         if (z < pml_z0 || z >= pml_z1h) {
@@ -880,7 +887,7 @@ __global__ void born_adjoint_h_stage1_kernel(
         work2_dEy_z[i] = (T)0;
     }
     // dEz_dy feeds Hx with +cq
-    if (y < ny - fd_pad_y0) {
+    if (y < ny - FD_PAD) {
         const T g2 = cq_val * lam_hx[i] + dcq_val * lam_dhx[i];
         const T g2d = cq_val * lam_dhx[i];
         if (y < pml_y0 || y >= pml_y1h) {
@@ -899,7 +906,7 @@ __global__ void born_adjoint_h_stage1_kernel(
         work2_dEz_y[i] = (T)0;
     }
     // dEz_dx feeds Hy with -cq
-    if (x < nx - fd_pad_x0) {
+    if (x < nx - FD_PAD) {
         const T g2 = -cq_val * lam_hy[i] - dcq_val * lam_dhy[i];
         const T g2d = -cq_val * lam_dhy[i];
         if (x < pml_x0 || x >= pml_x1h) {
@@ -918,7 +925,7 @@ __global__ void born_adjoint_h_stage1_kernel(
         work2_dEz_x[i] = (T)0;
     }
     // dEx_dz feeds Hy with +cq
-    if (z < nz - fd_pad_z0) {
+    if (z < nz - FD_PAD) {
         const T g2 = cq_val * lam_hy[i] + dcq_val * lam_dhy[i];
         const T g2d = cq_val * lam_dhy[i];
         if (z < pml_z0 || z >= pml_z1h) {
@@ -937,7 +944,7 @@ __global__ void born_adjoint_h_stage1_kernel(
         work2_dEx_z[i] = (T)0;
     }
     // dEx_dy feeds Hz with -cq
-    if (y < ny - fd_pad_y0) {
+    if (y < ny - FD_PAD) {
         const T g2 = -cq_val * lam_hz[i] - dcq_val * lam_dhz[i];
         const T g2d = -cq_val * lam_dhz[i];
         if (y < pml_y0 || y >= pml_y1h) {
@@ -956,7 +963,7 @@ __global__ void born_adjoint_h_stage1_kernel(
         work2_dEx_y[i] = (T)0;
     }
     // dEy_dx feeds Hz with +cq
-    if (x < nx - fd_pad_x0) {
+    if (x < nx - FD_PAD) {
         const T g2 = cq_val * lam_hz[i] + dcq_val * lam_dhz[i];
         const T g2d = cq_val * lam_dhz[i];
         if (x < pml_x0 || x >= pml_x1h) {
@@ -980,7 +987,7 @@ __global__ void born_adjoint_h_stage1_kernel(
 // Uses the snapshotted PML-modified H-step E-derivatives, so no diff
 // recomputation is needed: grad_cq gets the bg and sc contributions,
 // grad_dcq only the ``dcq*deriv(E_bg)`` terms.
-template <typename T>
+template <typename T, int FD_PAD>
 __global__ void born_cq_grad_kernel(
     const T* __restrict__ lam_hx, const T* __restrict__ lam_hy,
     const T* __restrict__ lam_hz,
@@ -994,9 +1001,7 @@ __global__ void born_cq_grad_kernel(
     const T* __restrict__ ddex_dy_store, const T* __restrict__ ddey_dx_store,
     T* __restrict__ grad_cq, T* __restrict__ grad_dcq,
     int t, int interval, T scale, int64_t snap_off,
-    int n_shots, int nz, int ny, int nx,
-    int fd_pad_z0, int fd_pad_z1, int fd_pad_y0, int fd_pad_y1,
-    int fd_pad_x0, int fd_pad_x1)
+    int n_shots, int nz, int ny, int nx)
 {
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t total = (int64_t)n_shots * nz * ny * nx;
@@ -1005,13 +1010,13 @@ __global__ void born_cq_grad_kernel(
     const int x = (int)(i % nx);
     const int y = (int)((i / nx) % ny);
     const int z = (int)((i / ((long)nx * ny)) % nz);
-    if (z < fd_pad_z0 || z >= nz - fd_pad_z1 || y < fd_pad_y0 ||
-        y >= ny - fd_pad_y1 || x < fd_pad_x0 || x >= nx - fd_pad_x1)
+    if (z < FD_PAD || z >= nz - (FD_PAD - 1) || y < FD_PAD ||
+        y >= ny - (FD_PAD - 1) || x < FD_PAD || x >= nx - (FD_PAD - 1))
         return;
     const int64_t soff = snap_off + i;
     T term_cq = (T)0;
     T term_dcq = (T)0;
-    if (z < nz - fd_pad_z0) {
+    if (z < nz - FD_PAD) {
         const T dyz = dey_dz_store[soff];
         const T ddyz = ddey_dz_store[soff];
         term_cq += -lam_hx[i] * dyz - lam_dhx[i] * ddyz;
@@ -1021,7 +1026,7 @@ __global__ void born_cq_grad_kernel(
         term_cq += lam_hy[i] * dxz + lam_dhy[i] * ddxz;
         term_dcq += lam_dhy[i] * dxz;
     }
-    if (y < ny - fd_pad_y0) {
+    if (y < ny - FD_PAD) {
         const T dzy = dez_dy_store[soff];
         const T ddzy = ddez_dy_store[soff];
         term_cq += lam_hx[i] * dzy + lam_dhx[i] * ddzy;
@@ -1031,7 +1036,7 @@ __global__ void born_cq_grad_kernel(
         term_cq += -lam_hz[i] * dxy - lam_dhz[i] * ddxy;
         term_dcq += -lam_dhz[i] * dxy;
     }
-    if (x < nx - fd_pad_x0) {
+    if (x < nx - FD_PAD) {
         const T dzx = dez_dx_store[soff];
         const T ddzx = ddez_dx_store[soff];
         term_cq += -lam_hy[i] * dzx - lam_dhy[i] * ddzx;
@@ -1049,7 +1054,7 @@ __global__ void born_cq_grad_kernel(
 // lam_ex/ey/ez and lam_dEx/dEy/dEz += the transposes of the six integer-grid
 // H curls (the transpose of diff_int applied to each work2 array, summed per
 // E component).
-template <typename T>
+template <typename T, int FD_PAD>
 __global__ void born_adjoint_h_stage2_kernel(
     const T* __restrict__ work2_ey_z, const T* __restrict__ work2_ez_y,
     const T* __restrict__ work2_ez_x, const T* __restrict__ work2_ex_z,
@@ -1061,8 +1066,7 @@ __global__ void born_adjoint_h_stage2_kernel(
     T* __restrict__ lam_dEx, T* __restrict__ lam_dEy, T* __restrict__ lam_dEz,
     const T* __restrict__ c,
     T rdz, T rdy, T rdx,
-    int n_shots, int nz, int ny, int nx,
-    int fd_pad_z0, int fd_pad_y0, int fd_pad_x0)
+    int n_shots, int nz, int ny, int nx)
 {
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t total = (int64_t)n_shots * nz * ny * nx;
@@ -1074,7 +1078,7 @@ __global__ void born_adjoint_h_stage2_kernel(
     const int z = (int)((i / ((long)nx * ny)) % nz);
     T sum_ey_z = (T)0;
     T sum_dEy_z = (T)0;
-    for (int k = 1; k <= fd_pad_z0; ++k) {
+    for (int k = 1; k <= FD_PAD; ++k) {
         const T ck = c[k - 1];
         if (z >= k) {
             sum_ey_z += ck * work2_ey_z[i - (long)k * ny_nx];
@@ -1089,7 +1093,7 @@ __global__ void born_adjoint_h_stage2_kernel(
     lam_dEy[i] += sum_dEy_z * rdz;
     T sum_ey_x = (T)0;
     T sum_dEy_x = (T)0;
-    for (int k = 1; k <= fd_pad_x0; ++k) {
+    for (int k = 1; k <= FD_PAD; ++k) {
         const T ck = c[k - 1];
         if (x >= k) {
             sum_ey_x += ck * work2_ey_x[i - k];
@@ -1105,7 +1109,7 @@ __global__ void born_adjoint_h_stage2_kernel(
 
     T sum_ex_z = (T)0;
     T sum_dEx_z = (T)0;
-    for (int k = 1; k <= fd_pad_z0; ++k) {
+    for (int k = 1; k <= FD_PAD; ++k) {
         const T ck = c[k - 1];
         if (z >= k) {
             sum_ex_z += ck * work2_ex_z[i - (long)k * ny_nx];
@@ -1120,7 +1124,7 @@ __global__ void born_adjoint_h_stage2_kernel(
     lam_dEx[i] += sum_dEx_z * rdz;
     T sum_ex_y = (T)0;
     T sum_dEx_y = (T)0;
-    for (int k = 1; k <= fd_pad_y0; ++k) {
+    for (int k = 1; k <= FD_PAD; ++k) {
         const T ck = c[k - 1];
         if (y >= k) {
             sum_ex_y += ck * work2_ex_y[i - (long)k * nx];
@@ -1136,7 +1140,7 @@ __global__ void born_adjoint_h_stage2_kernel(
 
     T sum_ez_y = (T)0;
     T sum_dEz_y = (T)0;
-    for (int k = 1; k <= fd_pad_y0; ++k) {
+    for (int k = 1; k <= FD_PAD; ++k) {
         const T ck = c[k - 1];
         if (y >= k) {
             sum_ez_y += ck * work2_ez_y[i - (long)k * nx];
@@ -1151,7 +1155,7 @@ __global__ void born_adjoint_h_stage2_kernel(
     lam_dEz[i] += sum_dEz_y * rdy;
     T sum_ez_x = (T)0;
     T sum_dEz_x = (T)0;
-    for (int k = 1; k <= fd_pad_x0; ++k) {
+    for (int k = 1; k <= FD_PAD; ++k) {
         const T ck = c[k - 1];
         if (x >= k) {
             sum_ez_x += ck * work2_ez_x[i - k];
@@ -1167,16 +1171,31 @@ __global__ void born_adjoint_h_stage2_kernel(
 }
 
 // ---------------- launchers ----------------
-#define LAUNCH_FLAT(KERN, T, N, ...)                                           \
+#define LAUNCH_FLAT_FD(KERN, T, FP, N, ...)                                    \
     {                                                                          \
         const int64_t _n = (N);                                                \
         if (_n > 0) {                                                          \
             const int threads = 256;                                           \
             const int blocks = (int)((_n + threads - 1) / threads);            \
-            KERN<T><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>( \
+            KERN<T, FP><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>( \
                 __VA_ARGS__);                                                  \
             TORCH_CHECK(cudaGetLastError() == cudaSuccess,                     \
                         "nami em3d_born " #KERN " failed");                    \
+        }                                                                      \
+    }
+
+// Dispatch the compile-time-FD_PAD kernel variants for the runtime fd_pad =
+// [accuracy/2, accuracy/2 - 1]*3: all three directions have stencil radius
+// fd_pad_z0 = fd_pad_y0 = fd_pad_x0 = accuracy/2, so FD_PAD 1..4 cover
+// accuracy 2/4/6/8.
+#define LAUNCH_EM3D_BORN(KERN, T, N, ...)                                      \
+    {                                                                          \
+        switch ((int)fd_pad_z0) {                                              \
+            case 1: LAUNCH_FLAT_FD(KERN, T, 1, N, __VA_ARGS__); break;         \
+            case 2: LAUNCH_FLAT_FD(KERN, T, 2, N, __VA_ARGS__); break;         \
+            case 3: LAUNCH_FLAT_FD(KERN, T, 3, N, __VA_ARGS__); break;         \
+            case 4: LAUNCH_FLAT_FD(KERN, T, 4, N, __VA_ARGS__); break;         \
+            default: TORCH_CHECK(false, "nami em3d_born: unsupported fd_pad"); \
         }                                                                      \
     }
 
@@ -1226,7 +1245,7 @@ void born_step_h(
     const int64_t total = field_numel(ex);
     CHECK_CONTIG(c);
     AT_DISPATCH_FLOATING_TYPES(ex.scalar_type(), "em3d_born_born_step_h", [&] {
-        LAUNCH_FLAT(born_step_h_kernel, scalar_t, total,
+        LAUNCH_EM3D_BORN(born_step_h_kernel, scalar_t, total,
             cq.data_ptr<scalar_t>(), dcq.data_ptr<scalar_t>(),
             ex.data_ptr<scalar_t>(), ey.data_ptr<scalar_t>(), ez.data_ptr<scalar_t>(),
             dEx.data_ptr<scalar_t>(), dEy.data_ptr<scalar_t>(), dEz.data_ptr<scalar_t>(),
@@ -1255,7 +1274,6 @@ void born_step_h(
             (int)n_shots, (int)nz, (int)ny, (int)nx,
             (int)pml_z0, (int)pml_z1, (int)pml_y0, (int)pml_y1,
             (int)pml_x0, (int)pml_x1,
-            (int)fd_pad_z0, (int)fd_pad_y0, (int)fd_pad_x0,
             (int)cq_batched, (int)dcq_batched, (int)store);
     });
 }
@@ -1293,7 +1311,7 @@ void born_step_e(
     const int64_t total = field_numel(ex);
     CHECK_CONTIG(c);
     AT_DISPATCH_FLOATING_TYPES(ex.scalar_type(), "em3d_born_born_step_e", [&] {
-        LAUNCH_FLAT(born_step_e_kernel, scalar_t, total,
+        LAUNCH_EM3D_BORN(born_step_e_kernel, scalar_t, total,
             ca.data_ptr<scalar_t>(), cb.data_ptr<scalar_t>(),
             dca.data_ptr<scalar_t>(), dcb.data_ptr<scalar_t>(),
             hx.data_ptr<scalar_t>(), hy.data_ptr<scalar_t>(), hz.data_ptr<scalar_t>(),
@@ -1325,8 +1343,6 @@ void born_step_e(
             (int)n_shots, (int)nz, (int)ny, (int)nx,
             (int)pml_z0, (int)pml_z1, (int)pml_y0, (int)pml_y1,
             (int)pml_x0, (int)pml_x1,
-            (int)fd_pad_z0, (int)fd_pad_z1, (int)fd_pad_y0, (int)fd_pad_y1,
-            (int)fd_pad_x0, (int)fd_pad_x1,
             (int)ca_batched, (int)cb_batched,
             (int)dca_batched, (int)dcb_batched);
     });
@@ -1402,7 +1418,7 @@ void born_coeff_grad(
 {
     const int64_t total = field_numel(lam_ex);
     AT_DISPATCH_FLOATING_TYPES(lam_ex.scalar_type(), "em3d_born_born_coeff_grad", [&] {
-        LAUNCH_FLAT(born_coeff_grad_kernel, scalar_t, total,
+        LAUNCH_EM3D_BORN(born_coeff_grad_kernel, scalar_t, total,
             lam_ex.data_ptr<scalar_t>(), lam_ey.data_ptr<scalar_t>(),
             lam_ez.data_ptr<scalar_t>(),
             lam_dEx.data_ptr<scalar_t>(), lam_dEy.data_ptr<scalar_t>(),
@@ -1418,9 +1434,7 @@ void born_coeff_grad(
             grad_ca.data_ptr<scalar_t>(), grad_cb.data_ptr<scalar_t>(),
             grad_dca.data_ptr<scalar_t>(), grad_dcb.data_ptr<scalar_t>(),
             (scalar_t)scale, (int64_t)snap_off,
-            (int)n_shots, (int)nz, (int)ny, (int)nx,
-            (int)fd_pad_z0, (int)fd_pad_z1, (int)fd_pad_y0, (int)fd_pad_y1,
-            (int)fd_pad_x0, (int)fd_pad_x1);
+            (int)n_shots, (int)nz, (int)ny, (int)nx);
     });
 }
 
@@ -1453,7 +1467,7 @@ void born_adjoint_e_stage1(
 {
     const int64_t total = field_numel(lam_ex);
     AT_DISPATCH_FLOATING_TYPES(lam_ex.scalar_type(), "em3d_born_born_adjoint_e_stage1", [&] {
-        LAUNCH_FLAT(born_adjoint_e_stage1_kernel, scalar_t, total,
+        LAUNCH_EM3D_BORN(born_adjoint_e_stage1_kernel, scalar_t, total,
             ca.data_ptr<scalar_t>(), cb.data_ptr<scalar_t>(),
             dca.data_ptr<scalar_t>(), dcb.data_ptr<scalar_t>(),
             lam_ex.data_ptr<scalar_t>(), lam_ey.data_ptr<scalar_t>(),
@@ -1480,8 +1494,6 @@ void born_adjoint_e_stage1(
             (int)n_shots, (int)nz, (int)ny, (int)nx,
             (int)pml_z0, (int)pml_z1, (int)pml_y0, (int)pml_y1,
             (int)pml_x0, (int)pml_x1,
-            (int)fd_pad_z0, (int)fd_pad_z1, (int)fd_pad_y0, (int)fd_pad_y1,
-            (int)fd_pad_x0, (int)fd_pad_x1,
             (int)ca_batched, (int)cb_batched,
             (int)dca_batched, (int)dcb_batched);
     });
@@ -1504,7 +1516,7 @@ void born_adjoint_e_stage2(
     const int64_t total = field_numel(lam_hy);
     CHECK_CONTIG(c);
     AT_DISPATCH_FLOATING_TYPES(lam_hy.scalar_type(), "em3d_born_born_adjoint_e_stage2", [&] {
-        LAUNCH_FLAT(born_adjoint_e_stage2_kernel, scalar_t, total,
+        LAUNCH_EM3D_BORN(born_adjoint_e_stage2_kernel, scalar_t, total,
             work_hy_z.data_ptr<scalar_t>(), work_hz_y.data_ptr<scalar_t>(),
             work_hz_x.data_ptr<scalar_t>(), work_hx_z.data_ptr<scalar_t>(),
             work_hx_y.data_ptr<scalar_t>(), work_hy_x.data_ptr<scalar_t>(),
@@ -1517,8 +1529,7 @@ void born_adjoint_e_stage2(
             lam_dhx.data_ptr<scalar_t>(),
             c.data_ptr<scalar_t>(),
             (scalar_t)rdz, (scalar_t)rdy, (scalar_t)rdx,
-            (int)n_shots, (int)nz, (int)ny, (int)nx,
-            (int)fd_pad_z0, (int)fd_pad_y0, (int)fd_pad_x0);
+            (int)n_shots, (int)nz, (int)ny, (int)nx);
     });
 }
 
@@ -1550,7 +1561,7 @@ void born_adjoint_h_stage1(
 {
     const int64_t total = field_numel(lam_hx);
     AT_DISPATCH_FLOATING_TYPES(lam_hx.scalar_type(), "em3d_born_born_adjoint_h_stage1", [&] {
-        LAUNCH_FLAT(born_adjoint_h_stage1_kernel, scalar_t, total,
+        LAUNCH_EM3D_BORN(born_adjoint_h_stage1_kernel, scalar_t, total,
             cq.data_ptr<scalar_t>(), dcq.data_ptr<scalar_t>(),
             lam_hx.data_ptr<scalar_t>(), lam_hy.data_ptr<scalar_t>(),
             lam_hz.data_ptr<scalar_t>(),
@@ -1576,8 +1587,6 @@ void born_adjoint_h_stage1(
             (int)n_shots, (int)nz, (int)ny, (int)nx,
             (int)pml_z0, (int)pml_z1, (int)pml_y0, (int)pml_y1,
             (int)pml_x0, (int)pml_x1,
-            (int)fd_pad_z0, (int)fd_pad_z1, (int)fd_pad_y0, (int)fd_pad_y1,
-            (int)fd_pad_x0, (int)fd_pad_x1,
             (int)cq_batched, (int)dcq_batched);
     });
 }
@@ -1599,7 +1608,7 @@ void born_cq_grad(
 {
     const int64_t total = field_numel(lam_hx);
     AT_DISPATCH_FLOATING_TYPES(lam_hx.scalar_type(), "em3d_born_born_cq_grad", [&] {
-        LAUNCH_FLAT(born_cq_grad_kernel, scalar_t, total,
+        LAUNCH_EM3D_BORN(born_cq_grad_kernel, scalar_t, total,
             lam_hx.data_ptr<scalar_t>(), lam_hy.data_ptr<scalar_t>(),
             lam_hz.data_ptr<scalar_t>(),
             lam_dhx.data_ptr<scalar_t>(), lam_dhy.data_ptr<scalar_t>(),
@@ -1612,9 +1621,7 @@ void born_cq_grad(
             ddex_dy_store.data_ptr<scalar_t>(), ddey_dx_store.data_ptr<scalar_t>(),
             grad_cq.data_ptr<scalar_t>(), grad_dcq.data_ptr<scalar_t>(),
             (int)t, (int)interval, (scalar_t)scale, (int64_t)snap_off,
-            (int)n_shots, (int)nz, (int)ny, (int)nx,
-            (int)fd_pad_z0, (int)fd_pad_z1, (int)fd_pad_y0, (int)fd_pad_y1,
-            (int)fd_pad_x0, (int)fd_pad_x1);
+            (int)n_shots, (int)nz, (int)ny, (int)nx);
     });
 }
 
@@ -1635,7 +1642,7 @@ void born_adjoint_h_stage2(
     const int64_t total = field_numel(lam_ey);
     CHECK_CONTIG(c);
     AT_DISPATCH_FLOATING_TYPES(lam_ey.scalar_type(), "em3d_born_born_adjoint_h_stage2", [&] {
-        LAUNCH_FLAT(born_adjoint_h_stage2_kernel, scalar_t, total,
+        LAUNCH_EM3D_BORN(born_adjoint_h_stage2_kernel, scalar_t, total,
             work2_ey_z.data_ptr<scalar_t>(), work2_ez_y.data_ptr<scalar_t>(),
             work2_ez_x.data_ptr<scalar_t>(), work2_ex_z.data_ptr<scalar_t>(),
             work2_ex_y.data_ptr<scalar_t>(), work2_ey_x.data_ptr<scalar_t>(),
@@ -1648,9 +1655,367 @@ void born_adjoint_h_stage2(
             lam_dEz.data_ptr<scalar_t>(),
             c.data_ptr<scalar_t>(),
             (scalar_t)rdz, (scalar_t)rdy, (scalar_t)rdx,
-            (int)n_shots, (int)nz, (int)ny, (int)nx,
-            (int)fd_pad_z0, (int)fd_pad_y0, (int)fd_pad_x0);
+            (int)n_shots, (int)nz, (int)ny, (int)nx);
     });
+}
+
+// ---------------- whole-loop drivers ----------------
+// One pybind call runs the entire forward/adjoint pass (deepwave-style):
+// the per-step functions above are reused unchanged with the same argument
+// order the Python loop used, so results are bitwise identical.
+
+using nami_storage::ckpt_restore;
+using nami_storage::ckpt_save;
+using nami_storage::zero_buffers;
+
+// Checkpoint/replay state layout (N_STATE = 36), matching the N_STATE
+// comment in em3d_born.py:
+//   [0:3]   ex, ey, ez            [3:6]   hx, hy, hz
+//   [6:12]  bg H-mem              [12:18] bg E-mem
+//   [18:21] d_ex, d_ey, d_ez      [21:24] d_hx, d_hy, d_hz
+//   [24:30] scatter H-mem         [30:36] scatter E-mem
+void forward_loop(
+    torch::Tensor ca_p, torch::Tensor cb_p, torch::Tensor cq_p,
+    torch::Tensor dca_p, torch::Tensor dcb_p, torch::Tensor dcq_p,
+    std::vector<torch::Tensor> e,       // ex, ey, ez
+    std::vector<torch::Tensor> d_e,     // d_ex, d_ey, d_ez
+    std::vector<torch::Tensor> h,       // hx, hy, hz
+    std::vector<torch::Tensor> d_h,     // d_hx, d_hy, d_hz
+    std::vector<torch::Tensor> m_h,     // m_ey_z, m_ez_y, m_ez_x, m_ex_z, m_ex_y, m_ey_x
+    std::vector<torch::Tensor> dm_h,    // scattered counterparts
+    std::vector<torch::Tensor> m_e,     // m_hy_z, m_hz_y, m_hz_x, m_hx_z, m_hx_y, m_hy_x
+    std::vector<torch::Tensor> dm_e,    // scattered counterparts
+    std::vector<torch::Tensor> h_stores,  // dey_dz, dez_dy, dez_dx, dex_dz, dex_dy,
+                                          // dey_dx + dde* counterparts (12)
+    std::vector<torch::Tensor> e_stores,  // ex, ey, ez, curl_x, curl_y, curl_z,
+                                          // dex, dey, dez, dcurl_x, dcurl_y, dcurl_z
+    std::vector<torch::Tensor> profs,   // az, azh, ay, ayh, ax, axh, bz, bzh, by, byh,
+                                        // bx, bxh, kz, kzh, ky, kyh, kx, kxh
+    torch::Tensor c,
+    torch::Tensor f_bg, torch::Tensor f_sc, torch::Tensor src_i,
+    torch::Tensor r, torch::Tensor rec_i,
+    torch::Tensor r_bg, torch::Tensor bg_rec_i,
+    double rdz, double rdy, double rdx,
+    int64_t nt, int64_t interval,
+    int64_t pml_z0, int64_t pml_z1, int64_t pml_y0, int64_t pml_y1,
+    int64_t pml_x0, int64_t pml_x1,
+    std::vector<int64_t> fd_pad,
+    int64_t ca_batched, int64_t cb_batched, int64_t cq_batched,
+    int64_t dca_batched, int64_t dcb_batched, int64_t dcq_batched,
+    int64_t store, int64_t source_component, int64_t receiver_component,
+    int64_t checkpoint_every, c10::optional<torch::Tensor> ckpt_state,
+    // Wavefield I/O (deepwave-style): init_state/final_state use the N_STATE
+    // layout of the comment above (same as ckpt).
+    c10::optional<torch::Tensor> init_state,
+    c10::optional<torch::Tensor> final_state,
+    // Per-step forward callback: called every `callback_frequency` steps as
+    // callback(t, nt, background E/H fields..., scattered E/H fields...) —
+    // live padded CUDA buffers; PML memory variables remain internal.
+    py::object callback, int64_t callback_frequency)
+{
+    TORCH_CHECK(e.size() == 3 && d_e.size() == 3 && h.size() == 3 && d_h.size() == 3 &&
+                m_h.size() == 6 && dm_h.size() == 6 && m_e.size() == 6 && dm_e.size() == 6 &&
+                h_stores.size() == 12 && e_stores.size() == 12 && profs.size() == 18 &&
+                fd_pad.size() == 6,
+                "nami em3d_born forward_loop: bad buffer counts");
+    const int64_t n_shots = src_i.size(0);
+    const int64_t nz = e[0].size(1), ny = e[0].size(2), nx = e[0].size(3);
+    const int64_t n_src = src_i.size(1), n_rec = rec_i.size(1);
+    const int64_t n_bg_rec = bg_rec_i.size(1);
+    const int64_t numel = nz * ny * nx;
+    const int64_t shot_count = n_shots * numel;
+    const bool ckpt = ckpt_state.has_value() && checkpoint_every > 0;
+    const bool has_cb = !callback.is_none();
+
+    const std::vector<const torch::Tensor*> state = {
+        &e[0], &e[1], &e[2], &h[0], &h[1], &h[2],
+        &m_h[0], &m_h[1], &m_h[2], &m_h[3], &m_h[4], &m_h[5],
+        &m_e[0], &m_e[1], &m_e[2], &m_e[3], &m_e[4], &m_e[5],
+        &d_e[0], &d_e[1], &d_e[2], &d_h[0], &d_h[1], &d_h[2],
+        &dm_h[0], &dm_h[1], &dm_h[2], &dm_h[3], &dm_h[4], &dm_h[5],
+        &dm_e[0], &dm_e[1], &dm_e[2], &dm_e[3], &dm_e[4], &dm_e[5],
+    };
+    // Optional initial state (continuation runs): the buffers are FLAT (no
+    // time rings), so the full N_STATE state is restored verbatim, in the
+    // checkpoint order above.
+    if (init_state.has_value()) {
+        auto c = *init_state;
+        for (size_t j = 0; j < state.size(); ++j)
+            state[j]->copy_(c[(int64_t)j]);
+    }
+    for (int64_t t = 0; t < nt; ++t) {
+        if (ckpt && t > 0 && t % checkpoint_every == 0)
+            ckpt_save(*ckpt_state, t / checkpoint_every - 1, state);
+        if (has_cb && t % callback_frequency == 0) {
+            py::gil_scoped_acquire gil;
+            callback(t, nt,
+                     e[0], e[1], e[2], h[0], h[1], h[2],
+                     d_e[0], d_e[1], d_e[2], d_h[0], d_h[1], d_h[2]);
+        }
+        const int64_t snap_off = store ? (t / interval) * shot_count : 0;
+        born_step_h(
+            cq_p, dcq_p, e[0], e[1], e[2], d_e[0], d_e[1], d_e[2],
+            h[0], h[1], h[2], d_h[0], d_h[1], d_h[2],
+            m_h[0], m_h[1], m_h[2], m_h[3], m_h[4], m_h[5],
+            dm_h[0], dm_h[1], dm_h[2], dm_h[3], dm_h[4], dm_h[5],
+            h_stores[0], h_stores[1], h_stores[2],
+            h_stores[3], h_stores[4], h_stores[5],
+            h_stores[6], h_stores[7], h_stores[8],
+            h_stores[9], h_stores[10], h_stores[11],
+            profs[1], profs[7], profs[3], profs[9], profs[5], profs[11],
+            profs[13], profs[15], profs[17],
+            c, rdz, rdy, rdx, t, interval, snap_off,
+            n_shots, nz, ny, nx,
+            pml_z0, pml_z1, pml_y0, pml_y1, pml_x0, pml_x1,
+            fd_pad[0], fd_pad[2], fd_pad[4],
+            cq_batched, dcq_batched, store);
+        born_step_e(
+            ca_p, cb_p, dca_p, dcb_p,
+            h[0], h[1], h[2], d_h[0], d_h[1], d_h[2],
+            e[0], e[1], e[2], d_e[0], d_e[1], d_e[2],
+            m_e[0], m_e[1], m_e[2], m_e[3], m_e[4], m_e[5],
+            dm_e[0], dm_e[1], dm_e[2], dm_e[3], dm_e[4], dm_e[5],
+            e_stores[0], e_stores[1], e_stores[2],
+            e_stores[3], e_stores[4], e_stores[5],
+            e_stores[6], e_stores[7], e_stores[8],
+            e_stores[9], e_stores[10], e_stores[11],
+            profs[0], profs[6], profs[2], profs[8], profs[4], profs[10],
+            profs[12], profs[14], profs[16],
+            c, rdz, rdy, rdx, t, interval, snap_off,
+            n_shots, nz, ny, nx,
+            pml_z0, pml_z1, pml_y0, pml_y1, pml_x0, pml_x1,
+            fd_pad[0], fd_pad[1], fd_pad[2], fd_pad[3], fd_pad[4], fd_pad[5],
+            ca_batched, cb_batched, dca_batched, dcb_batched);
+        if (n_src > 0)
+            born_inject(
+                e[source_component], d_e[source_component],
+                f_bg, f_sc, src_i, t, n_shots, n_src, numel);
+        if (n_rec > 0)
+            born_record(
+                d_e[receiver_component], r, rec_i, t, n_shots, n_rec, numel);
+        if (n_bg_rec > 0)
+            born_record(
+                e[receiver_component], r_bg, bg_rec_i, t, n_shots, n_bg_rec, numel);
+    }
+
+    // Optional final state (continuation): the buffers are FLAT, so the full
+    // N_STATE state after the last forward step is copied verbatim.  This
+    // makes a split run (continuation via init_state) bitwise match a
+    // one-shot run.
+    if (final_state.has_value()) {
+        auto c = *final_state;
+        for (size_t j = 0; j < state.size(); ++j)
+            c[(int64_t)j].copy_(*state[j]);
+    }
+}
+
+void adjoint_loop(
+    torch::Tensor ca_p, torch::Tensor cb_p, torch::Tensor cq_p,
+    torch::Tensor dca_p, torch::Tensor dcb_p, torch::Tensor dcq_p,
+    torch::Tensor lam_ex, torch::Tensor lam_ey, torch::Tensor lam_ez,
+    torch::Tensor lam_d_ex, torch::Tensor lam_d_ey, torch::Tensor lam_d_ez,
+    torch::Tensor lam_hx, torch::Tensor lam_hy, torch::Tensor lam_hz,
+    torch::Tensor lam_dhx, torch::Tensor lam_dhy, torch::Tensor lam_dhz,
+    std::vector<torch::Tensor> m_lam_e,    // E-stage-1 memory (integer profiles)
+    std::vector<torch::Tensor> dm_lam_e,   // scattered counterparts
+    std::vector<torch::Tensor> work,       // E-stage-1 work arrays
+    std::vector<torch::Tensor> dwork,      // scattered counterparts
+    std::vector<torch::Tensor> m_lam_h,    // H-stage-1 memory (half-integer profiles)
+    std::vector<torch::Tensor> dm_lam_h,   // scattered counterparts
+    std::vector<torch::Tensor> work2,      // H-stage-1 work arrays
+    std::vector<torch::Tensor> dwork2,     // scattered counterparts
+    std::vector<torch::Tensor> h_stores, std::vector<torch::Tensor> e_stores,
+    std::vector<torch::Tensor> profs,
+    torch::Tensor c,
+    torch::Tensor grad_r, torch::Tensor rec_i,
+    torch::Tensor grad_r_bg, torch::Tensor bg_rec_i,
+    torch::Tensor grad_f_bg, torch::Tensor grad_f_sc, torch::Tensor src_i,
+    torch::Tensor f_bg, torch::Tensor f_sc,
+    std::vector<torch::Tensor> e_f, std::vector<torch::Tensor> d_e_f,
+    std::vector<torch::Tensor> h_f, std::vector<torch::Tensor> d_h_f,
+    std::vector<torch::Tensor> m_h_f, std::vector<torch::Tensor> dm_h_f,
+    std::vector<torch::Tensor> m_e_f, std::vector<torch::Tensor> dm_e_f,
+    torch::Tensor grad_ca, torch::Tensor grad_cb, torch::Tensor grad_cq,
+    torch::Tensor grad_dca, torch::Tensor grad_dcb, torch::Tensor grad_dcq,
+    double rdz, double rdy, double rdx, double scale,
+    int64_t nt, int64_t interval,
+    int64_t pml_z0, int64_t pml_z1, int64_t pml_y0, int64_t pml_y1,
+    int64_t pml_x0, int64_t pml_x1,
+    std::vector<int64_t> fd_pad,
+    int64_t ca_batched, int64_t cb_batched, int64_t cq_batched,
+    int64_t dca_batched, int64_t dcb_batched, int64_t dcq_batched,
+    int64_t source_component, int64_t receiver_component,
+    torch::Tensor segments,              // int64 [n_seg, 2] on CPU; empty = full storage
+    c10::optional<torch::Tensor> ckpt_state)
+{
+    TORCH_CHECK(m_lam_e.size() == 6 && dm_lam_e.size() == 6 &&
+                work.size() == 6 && dwork.size() == 6 &&
+                m_lam_h.size() == 6 && dm_lam_h.size() == 6 &&
+                work2.size() == 6 && dwork2.size() == 6 &&
+                h_stores.size() == 12 && e_stores.size() == 12 &&
+                profs.size() == 18 && fd_pad.size() == 6,
+                "nami em3d_born adjoint_loop: bad buffer counts");
+    const int64_t n_shots = src_i.size(0);
+    const int64_t nz = lam_ex.size(1), ny = lam_ex.size(2), nx = lam_ex.size(3);
+    const int64_t n_src = src_i.size(1), n_rec = rec_i.size(1);
+    const int64_t n_bg_rec = bg_rec_i.size(1);
+    const int64_t numel = nz * ny * nx;
+    const int64_t shot_count = n_shots * numel;
+    const torch::Tensor lams_e[3] = {lam_ex, lam_ey, lam_ez};
+    const torch::Tensor lams_d[3] = {lam_d_ex, lam_d_ey, lam_d_ez};
+
+    auto adjoint_at = [&](int64_t t, int64_t snap_off) {
+        if (n_rec > 0)
+            born_record_grad_r(
+                lams_d[receiver_component], grad_r, rec_i,
+                t, n_shots, n_rec, numel);
+        if (n_bg_rec > 0)
+            born_record_grad_r(
+                lams_e[receiver_component], grad_r_bg, bg_rec_i,
+                t, n_shots, n_bg_rec, numel);
+        if (n_src > 0)
+            born_record_grad_f(
+                lams_e[source_component], lams_d[source_component],
+                grad_f_bg, grad_f_sc, src_i, t, n_shots, n_src, numel);
+        if (t % interval == 0)
+            born_coeff_grad(
+                lam_ex, lam_ey, lam_ez, lam_d_ex, lam_d_ey, lam_d_ez,
+                e_stores[0], e_stores[1], e_stores[2],
+                e_stores[3], e_stores[4], e_stores[5],
+                e_stores[6], e_stores[7], e_stores[8],
+                e_stores[9], e_stores[10], e_stores[11],
+                grad_ca, grad_cb, grad_dca, grad_dcb,
+                scale, snap_off,
+                n_shots, nz, ny, nx,
+                fd_pad[0], fd_pad[1], fd_pad[2], fd_pad[3], fd_pad[4], fd_pad[5]);
+        born_adjoint_e_stage1(
+            ca_p, cb_p, dca_p, dcb_p,
+            lam_ex, lam_ey, lam_ez, lam_d_ex, lam_d_ey, lam_d_ez,
+            m_lam_e[0], m_lam_e[1], m_lam_e[2], m_lam_e[3], m_lam_e[4], m_lam_e[5],
+            dm_lam_e[0], dm_lam_e[1], dm_lam_e[2], dm_lam_e[3], dm_lam_e[4], dm_lam_e[5],
+            work[0], work[1], work[2], work[3], work[4], work[5],
+            dwork[0], dwork[1], dwork[2], dwork[3], dwork[4], dwork[5],
+            profs[0], profs[6], profs[2], profs[8], profs[4], profs[10],
+            profs[12], profs[14], profs[16],
+            n_shots, nz, ny, nx,
+            pml_z0, pml_z1, pml_y0, pml_y1, pml_x0, pml_x1,
+            fd_pad[0], fd_pad[1], fd_pad[2], fd_pad[3], fd_pad[4], fd_pad[5],
+            ca_batched, cb_batched, dca_batched, dcb_batched);
+        born_adjoint_e_stage2(
+            work[0], work[1], work[2], work[3], work[4], work[5],
+            dwork[0], dwork[1], dwork[2], dwork[3], dwork[4], dwork[5],
+            lam_hy, lam_hz, lam_hx,
+            lam_dhy, lam_dhz, lam_dhx,
+            c, rdz, rdy, rdx,
+            n_shots, nz, ny, nx,
+            fd_pad[0], fd_pad[2], fd_pad[4]);
+        born_adjoint_h_stage1(
+            cq_p, dcq_p,
+            lam_hx, lam_hy, lam_hz,
+            lam_dhx, lam_dhy, lam_dhz,
+            m_lam_h[0], m_lam_h[1], m_lam_h[2], m_lam_h[3], m_lam_h[4], m_lam_h[5],
+            dm_lam_h[0], dm_lam_h[1], dm_lam_h[2], dm_lam_h[3], dm_lam_h[4], dm_lam_h[5],
+            work2[0], work2[1], work2[2], work2[3], work2[4], work2[5],
+            dwork2[0], dwork2[1], dwork2[2], dwork2[3], dwork2[4], dwork2[5],
+            profs[1], profs[7], profs[3], profs[9], profs[5], profs[11],
+            profs[13], profs[15], profs[17],
+            n_shots, nz, ny, nx,
+            pml_z0, pml_z1, pml_y0, pml_y1, pml_x0, pml_x1,
+            fd_pad[0], fd_pad[1], fd_pad[2], fd_pad[3], fd_pad[4], fd_pad[5],
+            cq_batched, dcq_batched);
+        if (t % interval == 0)
+            born_cq_grad(
+                lam_hx, lam_hy, lam_hz,
+                lam_dhx, lam_dhy, lam_dhz,
+                h_stores[0], h_stores[1], h_stores[2],
+                h_stores[3], h_stores[4], h_stores[5],
+                h_stores[6], h_stores[7], h_stores[8],
+                h_stores[9], h_stores[10], h_stores[11],
+                grad_cq, grad_dcq,
+                t, interval, scale, snap_off,
+                n_shots, nz, ny, nx,
+                fd_pad[0], fd_pad[1], fd_pad[2], fd_pad[3], fd_pad[4], fd_pad[5]);
+        born_adjoint_h_stage2(
+            work2[0], work2[1], work2[2], work2[3], work2[4], work2[5],
+            dwork2[0], dwork2[1], dwork2[2], dwork2[3], dwork2[4], dwork2[5],
+            lam_ex, lam_ey, lam_ez,
+            lam_d_ex, lam_d_ey, lam_d_ez,
+            c, rdz, rdy, rdx,
+            n_shots, nz, ny, nx,
+            fd_pad[0], fd_pad[2], fd_pad[4]);
+    };
+
+    if (segments.numel() == 0) {
+        for (int64_t t = nt - 1; t >= 0; --t)
+            adjoint_at(t, (t / interval) * shot_count);
+        return;
+    }
+
+    // Checkpointed backward: per segment, restore the forward state, replay
+    // the forward steps to regenerate the snapshots, then run the adjoint.
+    TORCH_CHECK(e_f.size() == 3 && d_e_f.size() == 3 && h_f.size() == 3 && d_h_f.size() == 3 &&
+                m_h_f.size() == 6 && dm_h_f.size() == 6 && m_e_f.size() == 6 && dm_e_f.size() == 6,
+                "nami em3d_born adjoint_loop: bad replay buffer counts");
+    const std::vector<torch::Tensor*> state_f = {
+        &e_f[0], &e_f[1], &e_f[2], &h_f[0], &h_f[1], &h_f[2],
+        &m_h_f[0], &m_h_f[1], &m_h_f[2], &m_h_f[3], &m_h_f[4], &m_h_f[5],
+        &m_e_f[0], &m_e_f[1], &m_e_f[2], &m_e_f[3], &m_e_f[4], &m_e_f[5],
+        &d_e_f[0], &d_e_f[1], &d_e_f[2], &d_h_f[0], &d_h_f[1], &d_h_f[2],
+        &dm_h_f[0], &dm_h_f[1], &dm_h_f[2], &dm_h_f[3], &dm_h_f[4], &dm_h_f[5],
+        &dm_e_f[0], &dm_e_f[1], &dm_e_f[2], &dm_e_f[3], &dm_e_f[4], &dm_e_f[5],
+    };
+    auto seg = segments.accessor<int64_t, 2>();
+    const int64_t n_seg = segments.size(0);
+    for (int64_t k = n_seg - 1; k >= 0; --k) {
+        const int64_t s0 = seg[k][0], s1 = seg[k][1];
+        if (s0 > 0) {
+            ckpt_restore(*ckpt_state, k - 1, state_f);
+        } else {
+            zero_buffers(state_f);
+        }
+        for (int64_t t = s0; t < s1; ++t) {
+            const int64_t snap_off = ((t - s0) / interval) * shot_count;
+            born_step_h(
+                cq_p, dcq_p, e_f[0], e_f[1], e_f[2], d_e_f[0], d_e_f[1], d_e_f[2],
+                h_f[0], h_f[1], h_f[2], d_h_f[0], d_h_f[1], d_h_f[2],
+                m_h_f[0], m_h_f[1], m_h_f[2], m_h_f[3], m_h_f[4], m_h_f[5],
+                dm_h_f[0], dm_h_f[1], dm_h_f[2], dm_h_f[3], dm_h_f[4], dm_h_f[5],
+                h_stores[0], h_stores[1], h_stores[2],
+                h_stores[3], h_stores[4], h_stores[5],
+                h_stores[6], h_stores[7], h_stores[8],
+                h_stores[9], h_stores[10], h_stores[11],
+                profs[1], profs[7], profs[3], profs[9], profs[5], profs[11],
+                profs[13], profs[15], profs[17],
+                c, rdz, rdy, rdx, t, interval, snap_off,
+                n_shots, nz, ny, nx,
+                pml_z0, pml_z1, pml_y0, pml_y1, pml_x0, pml_x1,
+                fd_pad[0], fd_pad[2], fd_pad[4],
+                cq_batched, dcq_batched, 1);
+            born_step_e(
+                ca_p, cb_p, dca_p, dcb_p,
+                h_f[0], h_f[1], h_f[2], d_h_f[0], d_h_f[1], d_h_f[2],
+                e_f[0], e_f[1], e_f[2], d_e_f[0], d_e_f[1], d_e_f[2],
+                m_e_f[0], m_e_f[1], m_e_f[2], m_e_f[3], m_e_f[4], m_e_f[5],
+                dm_e_f[0], dm_e_f[1], dm_e_f[2], dm_e_f[3], dm_e_f[4], dm_e_f[5],
+                e_stores[0], e_stores[1], e_stores[2],
+                e_stores[3], e_stores[4], e_stores[5],
+                e_stores[6], e_stores[7], e_stores[8],
+                e_stores[9], e_stores[10], e_stores[11],
+                profs[0], profs[6], profs[2], profs[8], profs[4], profs[10],
+                profs[12], profs[14], profs[16],
+                c, rdz, rdy, rdx, t, interval, snap_off,
+                n_shots, nz, ny, nx,
+                pml_z0, pml_z1, pml_y0, pml_y1, pml_x0, pml_x1,
+                fd_pad[0], fd_pad[1], fd_pad[2], fd_pad[3], fd_pad[4], fd_pad[5],
+                ca_batched, cb_batched, dca_batched, dcb_batched);
+            if (n_src > 0)
+                born_inject(
+                    e_f[source_component], d_e_f[source_component],
+                    f_bg, f_sc, src_i, t, n_shots, n_src, numel);
+        }
+        for (int64_t t = s1 - 1; t >= s0; --t)
+            adjoint_at(t, ((t - s0) / interval) * shot_count);
+    }
 }
 
 // ---------------- pybind11 bindings ----------------
@@ -1667,5 +2032,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("born_adjoint_h_stage1", &born_adjoint_h_stage1);
     m.def("born_cq_grad", &born_cq_grad);
     m.def("born_adjoint_h_stage2", &born_adjoint_h_stage2);
+    m.def("forward_loop", &forward_loop);
+    m.def("adjoint_loop", &adjoint_loop);
     NAMI_STORAGE_PYBIND(m);
 }

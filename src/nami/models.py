@@ -5,7 +5,7 @@ PyTorch functions that return receiver amplitudes and support autograd.
 This module wraps them in small ``nn.Module``s that reproduce the classic
 FWI workflow:
 
-    model = Scalar(v, dx, dt, pml_width=20)
+    model = Scalar(v, grid_spacing, dt, pml_width=20)
     rec = model.forward(amp, srcs, recs)     # receiver amplitudes [nt, 1, n_rec]
     loss = (rec - observed).square().mean()
     grad = model.backward(loss)              # d loss / d v
@@ -18,6 +18,11 @@ writes the gradient into each model parameter's ``.grad`` and returns it
 (also available as ``.grad``).  The model is held as an ``nn.Parameter``, so
 ``.parameters()`` / ``.named_parameters()`` work and optimisers can be used
 directly.
+
+``forward`` also forwards ``forward_callback`` / ``callback_frequency`` /
+``return_state`` / ``initial_state`` to the underlying propagator, with the
+same semantics as the functional API; with ``return_state=True`` it returns
+``(receiver_amplitudes, state)`` and caches the state on ``.last_state``.
 """
 
 import torch
@@ -50,6 +55,7 @@ class _FWIModule(nn.Module):
         self.sample_steps = sample_steps
         self.ckpt_steps = ckpt_steps
         self.receiver_amplitudes = None
+        self.last_state = None
         self._model_grad = None
 
     def _register_model(self, name, value):
@@ -58,16 +64,36 @@ class _FWIModule(nn.Module):
     def _model_params(self):
         return [getattr(self, n) for n in self._model_names]
 
-    def _run(self, amp, srcs, recs, nt):
+    def _run(self, amp, srcs, recs, nt, state_io):
         raise NotImplementedError
 
     def forward(self, source_amplitudes=None, source_locations=None,
-                receiver_locations=None, nt=None):
-        """Run the forward model and cache the receiver amplitudes."""
+                receiver_locations=None, nt=None, forward_callback=None,
+                callback_frequency=1, return_state=False, initial_state=None):
+        """Run the forward model and cache the receiver amplitudes.
+
+        ``forward_callback`` / ``callback_frequency`` / ``return_state`` /
+        ``initial_state`` are forwarded to the underlying propagator with
+        the same semantics as the functional API.  With ``return_state=True``
+        the return value is ``(receiver_amplitudes, state)`` and the state
+        is also cached on ``.last_state``; ``.receiver_amplitudes`` always
+        holds just the receiver amplitudes, so ``backward`` is unaffected.
+        """
         self._model_grad = None
-        self.receiver_amplitudes = self._run(
-            source_amplitudes, source_locations, receiver_locations, nt
+        self.last_state = None
+        state_io = {
+            "forward_callback": forward_callback,
+            "callback_frequency": callback_frequency,
+            "return_state": return_state,
+            "initial_state": initial_state,
+        }
+        out = self._run(
+            source_amplitudes, source_locations, receiver_locations, nt, state_io
         )
+        if return_state:
+            self.receiver_amplitudes, self.last_state = out
+            return self.receiver_amplitudes, self.last_state
+        self.receiver_amplitudes = out
         return self.receiver_amplitudes
 
     def backward(self, loss):
@@ -114,24 +140,26 @@ class _FWIModule(nn.Module):
         return g
 
 class Scalar(_FWIModule):
-    """2D acoustic FWI: ``Scalar(v, dx, dt)`` with ``.forward/.backward/.grad``."""
+    """2D acoustic FWI: ``Scalar(v, grid_spacing, dt)`` with
+    ``.forward/.backward/.grad``."""
 
     _model_names = ("v",)
 
-    def __init__(self, v, dx, dt, accuracy=2, pml_width=20, pml_freq=25.0,
+    def __init__(self, v, grid_spacing, dt, accuracy=2, pml_width=20,
+                 pml_freq=25.0,
                  requires_grad=True, storage="auto", sample_steps=1,
                  ckpt_steps=None):
         super().__init__(dt, accuracy, pml_width, pml_freq, requires_grad,
                          storage, sample_steps, ckpt_steps)
-        self.dx = dx
+        self.grid_spacing = grid_spacing
         self._register_model("v", v)
 
-    def _run(self, amp, srcs, recs, nt):
+    def _run(self, amp, srcs, recs, nt, state_io):
         from .scalar.scalar2d import scalar2d
 
         return scalar2d(
             self.v,
-            self.dx,
+            self.grid_spacing,
             self.dt,
             source_amplitudes=amp,
             source_locations=srcs,
@@ -143,6 +171,7 @@ class Scalar(_FWIModule):
             storage=self.storage,
             sample_steps=self.sample_steps,
             ckpt_steps=self.ckpt_steps,
+            **state_io,
         )
 
 
@@ -160,7 +189,7 @@ class Scalar3D(_FWIModule):
         self.grid_spacing = grid_spacing
         self._register_model("v", v)
 
-    def _run(self, amp, srcs, recs, nt):
+    def _run(self, amp, srcs, recs, nt, state_io):
         from .scalar.scalar3d import scalar3d
 
         return scalar3d(
@@ -177,6 +206,7 @@ class Scalar3D(_FWIModule):
             storage=self.storage,
             sample_steps=self.sample_steps,
             ckpt_steps=self.ckpt_steps,
+            **state_io,
         )
 
 
@@ -199,7 +229,7 @@ class Elastic(_FWIModule):
         self._register_model("mu", mu)
         self._register_model("buoyancy", buoyancy)
 
-    def _run(self, amp, srcs, recs, nt):
+    def _run(self, amp, srcs, recs, nt, state_io):
         from .elastic.elastic2d import elastic2d
 
         return elastic2d(
@@ -218,6 +248,7 @@ class Elastic(_FWIModule):
             storage=self.storage,
             sample_steps=self.sample_steps,
             ckpt_steps=self.ckpt_steps,
+            **state_io,
         )
 
 
@@ -240,7 +271,7 @@ class TM2D(_FWIModule):
         self._register_model("sigma", sigma)
         self._register_model("mu", mu)
 
-    def _run(self, amp, srcs, recs, nt):
+    def _run(self, amp, srcs, recs, nt, state_io):
         from .em.em2d_tm import em2d_tm
 
         return em2d_tm(
@@ -258,6 +289,7 @@ class TM2D(_FWIModule):
             storage=self.storage,
             sample_steps=self.sample_steps,
             ckpt_steps=self.ckpt_steps,
+            **state_io,
         )
 
 
@@ -283,7 +315,7 @@ class EM3D(_FWIModule):
         self._register_model("sigma", sigma)
         self._register_model("mu", mu)
 
-    def _run(self, amp, srcs, recs, nt):
+    def _run(self, amp, srcs, recs, nt, state_io):
         from .em.em3d import em3d
 
         return em3d(
@@ -303,6 +335,7 @@ class EM3D(_FWIModule):
             ckpt_steps=self.ckpt_steps,
             source_component=self.source_component,
             receiver_component=self.receiver_component,
+            **state_io,
         )
 
 

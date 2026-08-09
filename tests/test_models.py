@@ -9,6 +9,23 @@ import pytest
 import torch
 
 
+def test_normalized_scalar_public_signatures():
+    """Scalar APIs use grid_spacing and derive Born max velocity internally."""
+    from inspect import signature
+
+    from nami import Scalar
+    from nami.scalar.scalar2d import scalar2d
+    from nami.scalar.scalar2d_born import scalar2d_born
+    from nami.scalar.scalar3d_born import scalar3d_born
+
+    assert "grid_spacing" in signature(scalar2d).parameters
+    assert "grid_spacing" in signature(Scalar).parameters
+    assert "dx" not in signature(scalar2d).parameters
+    assert "dx" not in signature(Scalar).parameters
+    assert "max_vel" not in signature(scalar2d_born).parameters
+    assert "max_vel" not in signature(scalar3d_born).parameters
+
+
 def _scalar_case(device="cuda:0"):
     from tests.test_scalar2d import build_case
 
@@ -506,3 +523,154 @@ def test_em3d_components():
         source_component="ex", receiver_component="ez",
     )
     assert torch.equal(rec_cls, rec_fn)
+
+
+def test_class_forward_callback_and_return_state():
+    """The class API forwards callback/state args to the propagator, caches
+    the state on ``.last_state``, and ``backward`` still works."""
+    from nami.models import Scalar
+    from nami.scalar.scalar2d import scalar2d
+
+    c = _scalar_case()
+    dev = c["device"]
+    v = c["v"].to(dev)
+    amp = c["amp"].to(dev)
+    srcs, recs = c["srcs"].to(dev), c["recs"].to(dev)
+
+    steps = []
+
+    def cb(state):
+        steps.append(state.step)
+        state.get_wavefield("u")
+
+    model = Scalar(v.clone(), c["dx"], c["dt"], pml_width=c["pml"])
+    rec_cls, state = model.forward(
+        amp, srcs, recs,
+        forward_callback=cb, callback_frequency=2, return_state=True,
+    )
+    assert steps == list(range(0, c["nt"], 2))
+    assert model.last_state is state
+    assert model.receiver_amplitudes is rec_cls
+    assert isinstance(state, dict) and state
+
+    rec_fn, state_fn = scalar2d(
+        v.clone(), c["dx"], c["dt"],
+        source_amplitudes=amp, source_locations=srcs,
+        receiver_locations=recs, accuracy=2, pml_width=c["pml"], nt=c["nt"],
+        return_state=True,
+    )
+    assert torch.equal(rec_cls, rec_fn)
+    assert state.keys() == state_fn.keys()
+    for key in state:
+        assert torch.equal(state[key], state_fn[key])
+
+    g = model.backward(rec_cls.square().sum())
+    assert g is not None
+
+
+def test_class_forward_continuation_matches_one_shot():
+    """A class-API split run (return_state -> initial_state) bitwise matches
+    the one-shot functional run."""
+    from nami.models import Scalar
+    from nami.scalar.scalar2d import scalar2d
+
+    c = _scalar_case()
+    dev = c["device"]
+    v = c["v"].to(dev)
+    amp = c["amp"].to(dev)
+    srcs, recs = c["srcs"].to(dev), c["recs"].to(dev)
+    amp2 = torch.cat((amp, amp), dim=-1)
+
+    rec_full = scalar2d(
+        v.clone(), c["dx"], c["dt"],
+        source_amplitudes=amp2, source_locations=srcs,
+        receiver_locations=recs, accuracy=2, pml_width=c["pml"],
+    )
+
+    model = Scalar(v.clone(), c["dx"], c["dt"], pml_width=c["pml"])
+    rec1, state = model.forward(amp, srcs, recs, return_state=True)
+    rec2 = model.forward(amp, srcs, recs, initial_state=state)
+    assert model.last_state is None
+    assert torch.equal(torch.cat((rec1, rec2), dim=0), rec_full)
+
+
+def _class_smoke_case(name):
+    """Return ``(model, amp, srcs, recs, nt)`` for each of the five wrappers."""
+    if name == "scalar":
+        from nami.models import Scalar
+
+        c = _scalar_case()
+        dev = c["device"]
+        model = Scalar(c["v"].to(dev), c["dx"], c["dt"], pml_width=c["pml"])
+    elif name == "scalar3d":
+        from nami.models import Scalar3D
+
+        c = _scalar3d_case()
+        dev = c["device"]
+        model = Scalar3D(
+            c["v"].to(dev), c["grid_spacing"], c["dt"], pml_width=c["pml"]
+        )
+    elif name == "elastic":
+        from nami.models import Elastic
+
+        c = _elastic_case()
+        dev = c["device"]
+        model = Elastic(
+            c["lamb"].to(dev), c["mu"].to(dev), c["buoy"].to(dev),
+            c["dx"], c["dt"], pml_width=c["pml"],
+        )
+    elif name == "tm2d":
+        from nami.models import TM2D
+
+        c = _em_case()
+        dev = c["device"]
+        model = TM2D(
+            c["eps"].to(dev), c["sig"].to(dev), c["mu"].to(dev),
+            c["dx"], c["dt"], pml_width=c["pml"],
+        )
+    else:
+        from nami.models import EM3D
+
+        c = _em3d_case()
+        dev = c["device"]
+        model = EM3D(
+            c["eps"].to(dev), c["sig"].to(dev), c["mu"].to(dev),
+            c["dx"], c["dt"], pml_width=c["pml"],
+        )
+    return (
+        model,
+        c["amp"].to(dev),
+        c["srcs"].to(dev),
+        c["recs"].to(dev),
+        c["nt"],
+    )
+
+
+@pytest.mark.parametrize(
+    "name", ["scalar", "scalar3d", "elastic", "tm2d", "em3d"]
+)
+def test_all_classes_forward_callback_and_state_smoke(name):
+    """Every wrapper forwards callback/state args identically: the callback
+    fires every ``callback_frequency`` steps, ``return_state=True`` returns
+    ``(rec, state)`` with the state cached on ``.last_state``, and the
+    returned state can be passed back as ``initial_state``."""
+    model, amp, srcs, recs, nt = _class_smoke_case(name)
+
+    steps = []
+    rec, state = model.forward(
+        amp, srcs, recs,
+        forward_callback=lambda s: steps.append(s.step),
+        callback_frequency=2,
+        return_state=True,
+    )
+    assert steps == list(range(0, nt, 2))
+    assert model.last_state is state
+    assert model.receiver_amplitudes is rec
+    assert isinstance(state, dict) and state
+
+    rec_plain = model.forward(amp, srcs, recs)
+    assert model.last_state is None
+    assert torch.equal(rec, rec_plain)
+
+    rec_cont = model.forward(amp, srcs, recs, initial_state=state)
+    assert rec_cont.shape == rec.shape

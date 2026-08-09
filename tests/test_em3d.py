@@ -117,9 +117,9 @@ def test_gradcheck():
 
 
 def test_gradcheck_higher_order():
-    """Numerical gradient check at accuracy 4 and 6 on a larger grid."""
+    """Numerical gradient check at accuracy 4, 6, and 8 on a larger grid."""
     dtype = torch.float64
-    for acc in (4, 6):
+    for acc in (4, 6, 8):
         c = build_case(
             dtype=dtype, nz=14, ny=16, nx=16, nt=8, pml=4,
             device="cuda:0", seed=acc,
@@ -602,3 +602,44 @@ def test_multi_shot_batched_model():
         assert rel0 < 1e-10 and rel1 < 1e-10, (
             f"batched-model grad_{name} rel err ({rel0}, {rel1})"
         )
+
+
+def test_multi_shot_mixed_model_batching():
+    dtype = torch.float64
+    c0 = build_case(dtype=dtype, nz=10, ny=12, nx=12, nt=10, pml=3,
+                    device="cuda:0", seed=1)
+    c1 = build_case(dtype=dtype, nz=10, ny=12, nx=12, nt=10, pml=3,
+                    device="cuda:0", seed=2)
+    dev = c0["device"]
+    nz, ny, nx = c0["eps"].shape
+    nt = c0["nt"]
+    srcs, recs, amp = _multi_shot_survey(nz, ny, nx, nt, dtype)
+
+    def run(eps, sig, mu, shot=None):
+        sl = slice(None) if shot is None else slice(shot, shot + 1)
+        return em3d(
+            eps, sig, mu, c0["dx"], c0["dt"],
+            source_amplitudes=amp[sl].to(dev),
+            source_locations=srcs[sl].to(dev),
+            receiver_locations=recs[sl].to(dev),
+            accuracy=2, pml_width=c0["pml"], nt=nt,
+        )
+
+    eps = c0["eps"].to(dev, dtype).requires_grad_(True)
+    sig = torch.stack([c0["sig"], c1["sig"]]).to(dev, dtype).requires_grad_(True)
+    mu = c0["mu"].to(dev, dtype).requires_grad_(True)
+    singles = [
+        [x.detach().clone().requires_grad_(True) for x in (eps, sig[i], mu)]
+        for i in range(2)
+    ]
+    r = run(eps, sig, mu)
+    r0, r1 = run(*singles[0], 0), run(*singles[1], 1)
+    torch.testing.assert_close(r[:, 0], r0[:, 0], rtol=0, atol=0)
+    torch.testing.assert_close(r[:, 1], r1[:, 0], rtol=0, atol=0)
+    grads = torch.autograd.grad(r.square().sum(), (eps, sig, mu))
+    g0 = torch.autograd.grad(r0.square().sum(), singles[0])
+    g1 = torch.autograd.grad(r1.square().sum(), singles[1])
+    torch.testing.assert_close(grads[0], g0[0] + g1[0], rtol=1e-10, atol=1e-20)
+    torch.testing.assert_close(grads[1][0], g0[1], rtol=1e-10, atol=1e-20)
+    torch.testing.assert_close(grads[1][1], g1[1], rtol=1e-10, atol=1e-20)
+    torch.testing.assert_close(grads[2], g0[2] + g1[2], rtol=1e-10, atol=1e-20)

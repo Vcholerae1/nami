@@ -24,18 +24,24 @@ to both the background models and the scatter models.
 Return convention: ``[nt, n_shots, n_rec]`` scattered receiver traces.
 """
 
-import nami_born_em_el as _ext
+import nami_em2d_tm_born as _ext
 import torch
 
+from ..common.callback import validate_callback_frequency, wrap_forward_callback
 from ..common.fd import check_accuracy, staggered_diff1_coeffs
 from ..common.pml import set_pml_width
+from ..common.state import allocate_final_state, prepare_initial_state, unpack_state
 from ..common.storage import (
     SnapshotStorage,
     check_sample_steps,
     resolve_storage,
     storage_plan,
 )
-from ..common.survey import extract_survey_2d
+from ..common.survey import (
+    extract_survey_2d,
+    is_shot_batched,
+    prepare_source_amplitudes,
+)
 from ._common import EPS0, _compile_material_coefficients
 from .em2d_tm import _set_em_pml_profiles
 
@@ -57,6 +63,15 @@ from .em2d_tm import _set_em_pml_profiles
 N_STATE = 14
 N_STREAMS = 8
 
+# Full N_STATE names: keys of the state dicts returned by ``return_state``
+# and accepted by ``initial_state`` (for split-run continuation).
+_WAVEFIELD_NAMES = (
+    "ey", "d_ey", "hx", "hz", "d_hx", "d_hz",
+    "m_ey_z", "m_ey_x", "dm_ey_z", "dm_ey_x",
+    "m_hx_z", "m_hz_x", "dm_hx_z", "dm_hz_x",
+)
+_CALLBACK_FIELDS = ("ey", "hx", "hz", "d_ey", "d_hx", "d_hz")
+
 
 class BornEMFunc(torch.autograd.Function):
     @staticmethod
@@ -65,7 +80,7 @@ class BornEMFunc(torch.autograd.Function):
         ca_p, cb_p, cq_p,           # [n_shots, ny, nx] or [1, ny, nx] padded bg
         dca_p, dcb_p, dcq_p,        # padded scatter coefficient linearizations
         f_bg, f_sc,                 # [nt, n_shots, n_src] pre-scaled sources
-        src_i, rec_i,
+        src_i, rec_i, bg_rec_i,
         profs, c, fd_pad,
         rdy, rdx,
         nt, pml_y0, pml_y1, pml_x0, pml_x1,
@@ -76,6 +91,10 @@ class BornEMFunc(torch.autograd.Function):
         ckpt_state,      # [n_ckpt, N_STATE, n_shots, ny, nx] or None
         checkpoint_every,  # 0 = full storage; N = checkpoint every N steps
         segments,        # [(s0, s1)] replay segments; [] = full storage
+        init_state,      # [N_STATE, n_shots, ny, nx] initial wavefield or None
+        final_state,     # [N_STATE, n_shots, ny, nx] output buffer or None
+        forward_callback,  # cb(t, nt, ey, hx, hz, d_ey, d_hx, d_hz) or None
+        callback_frequency,  # call the callback every N steps
     ):
         ext = _ext
         device = ca_p.device
@@ -88,6 +107,7 @@ class BornEMFunc(torch.autograd.Function):
         ny, nx = ca_p.shape[-2:]
         n_src = src_i.shape[1]
         n_rec = rec_i.shape[1]
+        n_bg_rec = bg_rec_i.shape[1]
         ny_nx = ny * nx
         shot_count = n_shots * ny_nx
 
@@ -100,6 +120,7 @@ class BornEMFunc(torch.autograd.Function):
         dm_ey_z, dm_ey_x = z(n_shots, ny, nx), z(n_shots, ny, nx)
         dm_hx_z, dm_hz_x = z(n_shots, ny, nx), z(n_shots, ny, nx)
         r = z(nt, n_shots, n_rec)
+        r_bg = z(nt, n_shots, n_bg_rec)
         if storage is not None:
             (ey_store, curl_store, d_ey_store, dcurl_store,
              dey_dy_store, dey_dx_store, ddey_dy_store, ddey_dx_store) = [
@@ -115,62 +136,37 @@ class BornEMFunc(torch.autograd.Function):
         ay, ayh, ax, axh, by, byh, bx, bxh, ky, kyh, kx, kxh = [
             p.contiguous() for p in profs
         ]
-        ckpt = ckpt_state is not None
-        for t in range(nt):
-            # snapshot the full wavefield state before step t at every
-            # checkpoint boundary (only in checkpointed mode)
-            if ckpt and t > 0 and t % checkpoint_every == 0:
-                k = t // checkpoint_every - 1
-                ckpt_state[k, 0].copy_(ey)
-                ckpt_state[k, 1].copy_(d_ey)
-                ckpt_state[k, 2].copy_(hx)
-                ckpt_state[k, 3].copy_(hz)
-                ckpt_state[k, 4].copy_(d_hx)
-                ckpt_state[k, 5].copy_(d_hz)
-                ckpt_state[k, 6].copy_(m_ey_z)
-                ckpt_state[k, 7].copy_(m_ey_x)
-                ckpt_state[k, 8].copy_(dm_ey_z)
-                ckpt_state[k, 9].copy_(dm_ey_x)
-                ckpt_state[k, 10].copy_(m_hx_z)
-                ckpt_state[k, 11].copy_(m_hz_x)
-                ckpt_state[k, 12].copy_(dm_hx_z)
-                ckpt_state[k, 13].copy_(dm_hz_x)
-            # Checkpointed forward skips global snapshot writes; replay
-            # regenerates segment-local snaps via snap_off.
-            store = 0 if segments else (1 if storage is not None else 0)
-            snap_off = (
-                storage[0].snap_offset(t // grad_stride) if store else 0
-            )
-            ext.born_step_h(
-                cq_p, dcq_p, ey, d_ey, hx, hz, d_hx, d_hz,
-                m_ey_z, m_ey_x, dm_ey_z, dm_ey_x,
-                dey_dy_store, dey_dx_store, ddey_dy_store, ddey_dx_store,
-                ayh, byh, axh, bxh, kyh, kxh, c,
-                rdy, rdx, t, grad_stride,
-                pml_y0, pml_y1, pml_x0, pml_x1,
-                fd_pad[0], fd_pad[2],
-                cq_batched, dcq_batched, store, snap_off,
-            )
-            ext.born_step_e(
-                ca_p, cb_p, dca_p, dcb_p,
-                hx, hz, d_hx, d_hz, ey, d_ey,
-                m_hx_z, m_hz_x, dm_hx_z, dm_hz_x,
-                ey_store, curl_store, d_ey_store, dcurl_store,
-                ay, by, ax, bx, ky, kx, c,
-                rdy, rdx, t, grad_stride,
-                pml_y0, pml_y1, pml_x0, pml_x1,
-                fd_pad[0], fd_pad[1], fd_pad[2], fd_pad[3],
-                ca_batched, cb_batched, dca_batched, dcb_batched,
-                store, snap_off,
-            )
-            if n_src > 0:
-                ext.born_inject(ey, d_ey, f_bg, f_sc, src_i, t, n_shots, n_src, ny_nx)
-            if n_rec > 0:
-                ext.born_record(d_ey, r, rec_i, t, n_shots, n_rec, ny_nx)
+        # N_STATE layout: [0] ey [1] d_ey [2] hx [3] hz [4] d_hx [5] d_hz
+        # [6] m_ey_z [7] m_ey_x [8] dm_ey_z [9] dm_ey_x
+        # [10] m_hx_z [11] m_hz_x [12] dm_hx_z [13] dm_hz_x
+        state = [
+            ey, d_ey, hx, hz, d_hx, d_hz,
+            m_ey_z, m_ey_x, dm_ey_z, dm_ey_x,
+            m_hx_z, m_hz_x, dm_hx_z, dm_hz_x,
+        ]
+        # Checkpointed forward skips global snapshot writes; replay
+        # regenerates segment-local snaps via snap_off.
+        store = 0 if segments else (1 if storage is not None else 0)
+        ext.born_em_forward_loop(
+            ca_p, cb_p, cq_p, dca_p, dcb_p, dcq_p,
+            state,
+            ey_store, curl_store, d_ey_store, dcurl_store,
+            dey_dy_store, dey_dx_store, ddey_dy_store, ddey_dx_store,
+            ay, ayh, ax, axh, by, byh, bx, bxh, ky, kyh, kx, kxh,
+            c,
+            f_bg, f_sc, src_i, r, rec_i, r_bg, bg_rec_i,
+            rdy, rdx, nt, grad_stride,
+            pml_y0, pml_y1, pml_x0, pml_x1,
+            fd_pad[0], fd_pad[1], fd_pad[2], fd_pad[3],
+            ca_batched, cb_batched, cq_batched,
+            dca_batched, dcb_batched, dcq_batched,
+            store, checkpoint_every, ckpt_state,
+            init_state, final_state, forward_callback, callback_frequency,
+        )
 
         ctx.save_for_backward(
             ca_p, cb_p, cq_p, dca_p, dcb_p, dcq_p, f_bg, f_sc,
-            src_i, rec_i,
+            src_i, rec_i, bg_rec_i,
         )
         ctx.profs = profs
         ctx.c = c
@@ -180,7 +176,7 @@ class BornEMFunc(torch.autograd.Function):
         ctx.n_shots = n_shots
         ctx.ny, ctx.nx, ctx.ny_nx = ny, nx, ny_nx
         ctx.shot_count = shot_count
-        ctx.n_src, ctx.n_rec = n_src, n_rec
+        ctx.n_src, ctx.n_rec, ctx.n_bg_rec = n_src, n_rec, n_bg_rec
         ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1 = (
             pml_y0, pml_y1, pml_x0, pml_x1,
         )
@@ -195,56 +191,13 @@ class BornEMFunc(torch.autograd.Function):
         ctx.ckpt_state = ckpt_state
         ctx.checkpoint_every = checkpoint_every
         ctx.segments = segments
-        return r
+        return r, r_bg
 
     @staticmethod
-    def _replay_segment(ext, ctx, ca_p, cb_p, cq_p, dca_p, dcb_p, dcq_p,
-                        f_bg, f_sc, src_i, n_shots, n_src,
-                        ey_f, d_ey_f, hx_f, hz_f, d_hx_f, d_hz_f,
-                        m_ey_z_f, m_ey_x_f, dm_ey_z_f, dm_ey_x_f,
-                        m_hx_z_f, m_hz_x_f, dm_hx_z_f, dm_hz_x_f,
-                        ey_store, curl_store, d_ey_store, dcurl_store,
-                        dey_dy_store, dey_dx_store, ddey_dy_store,
-                        ddey_dx_store,
-                        ayh, byh, axh, bxh, kyh, kxh,
-                        ay, by, ax, bx, ky, kx,
-                        ny_nx, shot_count, s0, s1):
-        """Re-run forward steps [s0, s1), writing segment-local snapshots."""
-        for t in range(s0, s1):
-            snap_off = ((t - s0) // ctx.grad_stride) * shot_count
-            ext.born_step_h(
-                cq_p, dcq_p, ey_f, d_ey_f, hx_f, hz_f, d_hx_f, d_hz_f,
-                m_ey_z_f, m_ey_x_f, dm_ey_z_f, dm_ey_x_f,
-                dey_dy_store, dey_dx_store, ddey_dy_store, ddey_dx_store,
-                ayh, byh, axh, bxh, kyh, kxh, ctx.c,
-                ctx.rdy, ctx.rdx, t, ctx.grad_stride,
-                ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
-                ctx.fd_pad[0], ctx.fd_pad[2],
-                ctx.cq_batched, ctx.dcq_batched, 1, snap_off,
-            )
-            ext.born_step_e(
-                ca_p, cb_p, dca_p, dcb_p,
-                hx_f, hz_f, d_hx_f, d_hz_f, ey_f, d_ey_f,
-                m_hx_z_f, m_hz_x_f, dm_hx_z_f, dm_hz_x_f,
-                ey_store, curl_store, d_ey_store, dcurl_store,
-                ay, by, ax, bx, ky, kx, ctx.c,
-                ctx.rdy, ctx.rdx, t, ctx.grad_stride,
-                ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
-                ctx.fd_pad[0], ctx.fd_pad[1], ctx.fd_pad[2], ctx.fd_pad[3],
-                ctx.ca_batched, ctx.cb_batched,
-                ctx.dca_batched, ctx.dcb_batched, 1, snap_off,
-            )
-            if n_src > 0:
-                ext.born_inject(
-                    ey_f, d_ey_f, f_bg, f_sc, src_i, t, n_shots, n_src, ny_nx,
-                )
-
-    @staticmethod
-    def backward(ctx, grad_r):
+    def backward(ctx, grad_r, grad_r_bg):
         ext = _ext
-        (ca_p, cb_p, cq_p, dca_p, dcb_p, dcq_p, f_bg, f_sc, src_i, rec_i) = (
-            ctx.saved_tensors
-        )
+        (ca_p, cb_p, cq_p, dca_p, dcb_p, dcq_p, f_bg, f_sc,
+         src_i, rec_i, bg_rec_i) = ctx.saved_tensors
         if ctx.storage is None:
             raise RuntimeError(
                 "em2d_tm_born backward() requires snapshot storage: run the "
@@ -261,14 +214,18 @@ class BornEMFunc(torch.autograd.Function):
             torch.cuda.set_device(device)
         dtype = ca_p.dtype
         n_shots = ctx.n_shots
-        ny, nx, ny_nx = ctx.ny, ctx.nx, ctx.ny_nx
-        n_src, n_rec = ctx.n_src, ctx.n_rec
+        ny, nx = ctx.ny, ctx.nx
+        n_src, n_rec, n_bg_rec = ctx.n_src, ctx.n_rec, ctx.n_bg_rec
         nt = ctx.nt
-        shot_count = ctx.shot_count
 
         if grad_r is None:
             grad_r = torch.zeros(nt, n_shots, n_rec, device=device, dtype=dtype)
         grad_r = grad_r.contiguous()
+        if grad_r_bg is None:
+            grad_r_bg = torch.zeros(
+                nt, n_shots, n_bg_rec, device=device, dtype=dtype
+            )
+        grad_r_bg = grad_r_bg.contiguous()
         grad_f_bg = torch.zeros(nt, n_shots, n_src, device=device, dtype=dtype)
         grad_f_sc = torch.zeros_like(grad_f_bg)
         grad_ca = torch.zeros(n_shots, ny, nx, device=device, dtype=dtype)
@@ -299,12 +256,15 @@ class BornEMFunc(torch.autograd.Function):
         # `grad_stride` time steps of the model-gradient integral.
         scale = float(grad_stride)
         segments = ctx.segments
+        # Checkpointed backward: per segment the C++ loop restores the
+        # wavefield state, replays the forward steps to regenerate the
+        # snapshots, then runs the adjoint.  Full storage: straight adjoint.
+        segments_t = (
+            torch.tensor(segments, dtype=torch.int64)
+            if segments
+            else torch.empty(0, 2, dtype=torch.int64)
+        )
         if segments:
-            # Checkpointed backward: per segment, restore the wavefield
-            # state, replay the forward steps to regenerate the snapshots,
-            # then run the adjoint steps.  The adjoint state (lambda +
-            # memory variables) carries across segments.
-            # Snapshots use snap_off (same layout as em2d_tm full-wave).
             ey_f, d_ey_f = z(n_shots, ny, nx), z(n_shots, ny, nx)
             hx_f, hz_f = z(n_shots, ny, nx), z(n_shots, ny, nx)
             d_hx_f, d_hz_f = z(n_shots, ny, nx), z(n_shots, ny, nx)
@@ -312,172 +272,38 @@ class BornEMFunc(torch.autograd.Function):
             dm_ey_z_f, dm_ey_x_f = z(n_shots, ny, nx), z(n_shots, ny, nx)
             m_hx_z_f, m_hz_x_f = z(n_shots, ny, nx), z(n_shots, ny, nx)
             dm_hx_z_f, dm_hz_x_f = z(n_shots, ny, nx), z(n_shots, ny, nx)
-            fwd_bufs = (
+            state_f = [
                 ey_f, d_ey_f, hx_f, hz_f, d_hx_f, d_hz_f,
                 m_ey_z_f, m_ey_x_f, dm_ey_z_f, dm_ey_x_f,
                 m_hx_z_f, m_hz_x_f, dm_hx_z_f, dm_hz_x_f,
-            )
-            ckpt = ctx.ckpt_state
-            for k in range(len(segments) - 1, -1, -1):
-                s0, s1 = segments[k]
-                if s0 > 0:
-                    c = ckpt[k - 1]
-                    ey_f.copy_(c[0])
-                    d_ey_f.copy_(c[1])
-                    hx_f.copy_(c[2])
-                    hz_f.copy_(c[3])
-                    d_hx_f.copy_(c[4])
-                    d_hz_f.copy_(c[5])
-                    m_ey_z_f.copy_(c[6])
-                    m_ey_x_f.copy_(c[7])
-                    dm_ey_z_f.copy_(c[8])
-                    dm_ey_x_f.copy_(c[9])
-                    m_hx_z_f.copy_(c[10])
-                    m_hz_x_f.copy_(c[11])
-                    dm_hx_z_f.copy_(c[12])
-                    dm_hz_x_f.copy_(c[13])
-                else:
-                    for buf in fwd_bufs:
-                        buf.zero_()
-                BornEMFunc._replay_segment(
-                    ext, ctx, ca_p, cb_p, cq_p, dca_p, dcb_p, dcq_p,
-                    f_bg, f_sc, src_i, n_shots, n_src,
-                    ey_f, d_ey_f, hx_f, hz_f, d_hx_f, d_hz_f,
-                    m_ey_z_f, m_ey_x_f, dm_ey_z_f, dm_ey_x_f,
-                    m_hx_z_f, m_hz_x_f, dm_hx_z_f, dm_hz_x_f,
-                    ey_store, curl_store, d_ey_store, dcurl_store,
-                    dey_dy_store, dey_dx_store, ddey_dy_store, ddey_dx_store,
-                    ayh, byh, axh, bxh, kyh, kxh,
-                    ay, by, ax, bx, ky, kx,
-                    ny_nx, shot_count, s0, s1,
-                )
-                for t in range(s1 - 1, s0 - 1, -1):
-                    snap_off = ((t - s0) // grad_stride) * shot_count
-                    if n_rec > 0:
-                        ext.born_record_grad_r(
-                            lam_d_ey, grad_r, rec_i, t, n_shots, n_rec, ny_nx,
-                        )
-                    if n_src > 0:
-                        ext.born_record_grad_f(
-                            lam_ey, lam_d_ey, grad_f_bg, grad_f_sc,
-                            src_i, t, n_shots, n_src, ny_nx,
-                        )
-                    if t % grad_stride == 0:
-                        ext.born_coeff_grad(
-                            lam_ey, lam_d_ey, ey_store, curl_store,
-                            d_ey_store, dcurl_store,
-                            grad_ca, grad_cb, grad_dca, grad_dcb,
-                            t, grad_stride, scale, snap_off,
-                            ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
-                            *ctx.fd_pad,
-                        )
-                    ext.born_adjoint_e_stage1(
-                        ca_p, cb_p, dca_p, dcb_p,
-                        lam_ey, lam_d_ey,
-                        m_lambda_hx_z, m_lambda_hz_x,
-                        dm_lambda_hx_z, dm_lambda_hz_x,
-                        work_x, work_y, work_dx, work_dy,
-                        ay, by, ax, bx, ky, kx,
-                        ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
-                        *ctx.fd_pad,
-                        ctx.ca_batched, ctx.cb_batched,
-                        ctx.dca_batched, ctx.dcb_batched,
-                    )
-                    ext.born_adjoint_e_stage2(
-                        work_x, work_y, work_dx, work_dy,
-                        lam_hx, lam_hz, lam_dhx, lam_dhz,
-                        ctx.c, ctx.rdy, ctx.rdx, ctx.fd_pad[0], ctx.fd_pad[2],
-                    )
-                    ext.born_adjoint_h_stage1(
-                        cq_p, dcq_p,
-                        lam_hx, lam_hz, lam_dhx, lam_dhz,
-                        m_lambda_ey_x, m_lambda_ey_z,
-                        dm_lambda_ey_x, dm_lambda_ey_z,
-                        work2_x, work2_y, work2_dx, work2_dy,
-                        ayh, byh, axh, bxh, kyh, kxh,
-                        ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
-                        *ctx.fd_pad,
-                        ctx.cq_batched, ctx.dcq_batched,
-                    )
-                    if t % grad_stride == 0:
-                        ext.born_cq_grad(
-                            lam_hx, lam_hz, lam_dhx, lam_dhz,
-                            dey_dy_store, dey_dx_store, ddey_dy_store,
-                            ddey_dx_store,
-                            grad_cq, grad_dcq,
-                            t, grad_stride, scale, snap_off,
-                            ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
-                            *ctx.fd_pad,
-                        )
-                    ext.born_adjoint_h_stage2(
-                        work2_x, work2_y, work2_dx, work2_dy,
-                        lam_ey, lam_d_ey,
-                        ctx.c, ctx.rdy, ctx.rdx, ctx.fd_pad[0], ctx.fd_pad[2],
-                    )
+            ]
         else:
-            for t in range(nt - 1, -1, -1):
-                snap_off = storage[0].snap_offset(t // grad_stride)
-                if n_rec > 0:
-                    ext.born_record_grad_r(
-                        lam_d_ey, grad_r, rec_i, t, n_shots, n_rec, ny_nx,
-                    )
-                if n_src > 0:
-                    ext.born_record_grad_f(
-                        lam_ey, lam_d_ey, grad_f_bg, grad_f_sc,
-                        src_i, t, n_shots, n_src, ny_nx,
-                    )
-                if t % grad_stride == 0:
-                    ext.born_coeff_grad(
-                        lam_ey, lam_d_ey, ey_store, curl_store,
-                        d_ey_store, dcurl_store,
-                        grad_ca, grad_cb, grad_dca, grad_dcb,
-                        t, grad_stride, scale, snap_off,
-                        ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
-                        *ctx.fd_pad,
-                    )
-                ext.born_adjoint_e_stage1(
-                    ca_p, cb_p, dca_p, dcb_p,
-                    lam_ey, lam_d_ey,
-                    m_lambda_hx_z, m_lambda_hz_x,
-                    dm_lambda_hx_z, dm_lambda_hz_x,
-                    work_x, work_y, work_dx, work_dy,
-                    ay, by, ax, bx, ky, kx,
-                    ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
-                    *ctx.fd_pad,
-                    ctx.ca_batched, ctx.cb_batched,
-                    ctx.dca_batched, ctx.dcb_batched,
-                )
-                ext.born_adjoint_e_stage2(
-                    work_x, work_y, work_dx, work_dy,
-                    lam_hx, lam_hz, lam_dhx, lam_dhz,
-                    ctx.c, ctx.rdy, ctx.rdx, ctx.fd_pad[0], ctx.fd_pad[2],
-                )
-                ext.born_adjoint_h_stage1(
-                    cq_p, dcq_p,
-                    lam_hx, lam_hz, lam_dhx, lam_dhz,
-                    m_lambda_ey_x, m_lambda_ey_z,
-                    dm_lambda_ey_x, dm_lambda_ey_z,
-                    work2_x, work2_y, work2_dx, work2_dy,
-                    ayh, byh, axh, bxh, kyh, kxh,
-                    ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
-                    *ctx.fd_pad,
-                    ctx.cq_batched, ctx.dcq_batched,
-                )
-                if t % grad_stride == 0:
-                    ext.born_cq_grad(
-                        lam_hx, lam_hz, lam_dhx, lam_dhz,
-                        dey_dy_store, dey_dx_store, ddey_dy_store,
-                        ddey_dx_store,
-                        grad_cq, grad_dcq,
-                        t, grad_stride, scale, snap_off,
-                        ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
-                        *ctx.fd_pad,
-                    )
-                ext.born_adjoint_h_stage2(
-                    work2_x, work2_y, work2_dx, work2_dy,
-                    lam_ey, lam_d_ey,
-                    ctx.c, ctx.rdy, ctx.rdx, ctx.fd_pad[0], ctx.fd_pad[2],
-                )
+            state_f = []
+        ext.born_em_adjoint_loop(
+            ca_p, cb_p, cq_p, dca_p, dcb_p, dcq_p,
+            ey_store, curl_store, d_ey_store, dcurl_store,
+            dey_dy_store, dey_dx_store, ddey_dy_store, ddey_dx_store,
+            grad_ca, grad_cb, grad_cq, grad_dca, grad_dcb, grad_dcq,
+            grad_f_bg, grad_f_sc, grad_r, grad_r_bg,
+            src_i, rec_i, bg_rec_i,
+            f_bg, f_sc,
+            lam_ey, lam_d_ey,
+            lam_hx, lam_hz, lam_dhx, lam_dhz,
+            m_lambda_hx_z, m_lambda_hz_x, dm_lambda_hx_z, dm_lambda_hz_x,
+            m_lambda_ey_x, m_lambda_ey_z, dm_lambda_ey_x, dm_lambda_ey_z,
+            work_x, work_y, work_dx, work_dy,
+            work2_x, work2_y, work2_dx, work2_dy,
+            state_f,
+            ay, ayh, ax, axh, by, byh, bx, bxh, ky, kyh, kx, kxh,
+            ctx.c,
+            ctx.rdy, ctx.rdx, scale,
+            nt, grad_stride,
+            ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
+            *ctx.fd_pad,
+            ctx.ca_batched, ctx.cb_batched, ctx.cq_batched,
+            ctx.dca_batched, ctx.dcb_batched, ctx.dcq_batched,
+            segments_t, ctx.ckpt_state,
+        )
 
         if not ctx.ca_batched:
             grad_ca = grad_ca.sum(0, keepdim=True)
@@ -492,12 +318,13 @@ class BornEMFunc(torch.autograd.Function):
         if not ctx.dcq_batched:
             grad_dcq = grad_dcq.sum(0, keepdim=True)
 
+        # 36 forward() inputs: coefficient/source grads + 28 x None.
         return (
             grad_ca, grad_cb, grad_cq, grad_dca, grad_dcb, grad_dcq,
             grad_f_bg, grad_f_sc,
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None,
-            None, None, None, None,
+            None, None, None, None, None, None, None, None, None,
         )
 
 
@@ -513,12 +340,17 @@ def em2d_tm_born(
     source_amplitudes=None,
     source_locations=None,
     receiver_locations=None,
+    bg_receiver_locations=None,
     accuracy=2,
     pml_width=20,
     nt=None,
     storage="auto",
     sample_steps=1,
     ckpt_steps=None,
+    forward_callback=None,
+    callback_frequency=1,
+    return_state=False,
+    initial_state=None,
 ):
     """2D TM Maxwell Born forward + adjoint (torch in/out).
 
@@ -541,8 +373,33 @@ def em2d_tm_born(
             ~sqrt(nt), 0 = full storage (every sampled step), N = save wavefield
             state every N steps and replay on backward.  Same gradients as full
             storage at the same sample_steps.
+        forward_callback: called every ``callback_frequency`` steps with a
+            ``CallbackState`` (deepwave-style) exposing the current padded
+            wavefields via ``state.get_wavefield(name, view)`` — useful for
+            RTM imaging conditions, illumination accumulation, monitoring.
+            The available wavefields are ``ey``, ``hx``, ``hz`` and their
+            scattered ``d_*`` counterparts.
+        callback_frequency: call ``forward_callback`` every N time steps.
+        return_state: if True, append the final state dict to the outputs.
+            The state is a
+            dict of the FINAL padded wavefield state (keys ``ey``, ``d_ey``,
+            ``hx``, ``hz``, ``d_hx``, ``d_hz``, plus the PML memory
+            variables) suitable for continuation via ``initial_state``.
+        initial_state: a dict of initial wavefield state (padded grid, keys
+            as in the ``return_state=True`` output) to continue a previous
+            run.  Missing keys are zero-filled; a complete state dict (every
+            key, including the PML memory variables) makes a split run
+            bitwise match a one-shot run, while a partial dict restores only
+            the given fields with the remaining state starting from zero.
+            State I/O is for forward continuation; autograd does not propagate
+            across the boundary between runs.  State dicts are ephemeral
+            runtime snapshots: they may be passed back only to the same
+            propagator with the same model layout and nami version, and are
+            not a stable long-term checkpoint format.
 
-    Returns scattered receiver traces ``[nt, n_shots, n_rec]``.
+    Returns scattered receiver traces ``[nt, n_shots, n_rec]``.  When
+    ``bg_receiver_locations`` is provided, returns ``(r, r_bg)``; with
+    ``return_state=True`` the state dict is appended.
     """
     accuracy = check_accuracy(accuracy)
     if not isinstance(grid_spacing, (list, tuple)):
@@ -577,6 +434,13 @@ def em2d_tm_born(
         device,
         dtype,
     )
+    if bg_receiver_locations is not None:
+        (_,), _, bg_rec_i = extract_survey_2d(
+            [epsilon], None, bg_receiver_locations, fd_pad, pml_w,
+            n_shots, device, dtype,
+        )
+    else:
+        bg_rec_i = torch.empty((n_shots, 0), dtype=torch.int64, device=device)
 
     def _pad_scatter(model):
         if model is None:
@@ -614,15 +478,10 @@ def em2d_tm_born(
     )
     c = staggered_diff1_coeffs(accuracy, dtype, device)
 
-    if source_amplitudes is not None:
-        amp = source_amplitudes.to(device=device, dtype=dtype)
-        if amp.shape[0] != n_shots:
-            raise ValueError("source_amplitudes must have n_shots batches.")
-        if amp.shape[2] < nt_inner:
-            raise ValueError("source_amplitudes must have at least nt steps.")
-        amp = amp[:, :, :nt_inner]
-    else:
-        amp = torch.zeros(n_shots, 0, nt_inner, device=device, dtype=dtype)
+    amp = prepare_source_amplitudes(
+        source_amplitudes, n_shots, src_i.shape[1], nt_inner,
+        device=device, dtype=dtype,
+    )
 
     source_coeff = -1.0 / (grid_spacing[0] * grid_spacing[1])
     if amp.numel() > 0:
@@ -645,36 +504,14 @@ def em2d_tm_born(
     rdy, rdx = 1.0 / grid_spacing[0], 1.0 / grid_spacing[1]
     pml_y0, pml_y1 = fd_pad[0] + pml_w[0], ny - fd_pad[1] - pml_w[1]
     pml_x0, pml_x1 = fd_pad[2] + pml_w[2], nx - fd_pad[3] - pml_w[3]
-    # Batched flags from the *user* models (before pad), same contract as
-    # em2d_tm / scalar / elastic: shared models stay rank-1 and kernels
-    # index slab 0; per-shot grads are summed in backward.
-    ca_batched = 1 if (
-        epsilon.ndim == 3 and epsilon.shape[0] == n_shots and n_shots > 1
-    ) else 0
-    cb_batched = 1 if (
-        sigma.ndim == 3 and sigma.shape[0] == n_shots and n_shots > 1
-    ) else 0
-    cq_batched = 1 if (
-        mu.ndim == 3 and mu.shape[0] == n_shots and n_shots > 1
-    ) else 0
-    dca_batched = 1 if (
-        epsilon_scatter is not None
-        and epsilon_scatter.ndim == 3
-        and epsilon_scatter.shape[0] == n_shots
-        and n_shots > 1
-    ) else 0
-    dcb_batched = 1 if (
-        sigma_scatter is not None
-        and sigma_scatter.ndim == 3
-        and sigma_scatter.shape[0] == n_shots
-        and n_shots > 1
-    ) else 0
-    dcq_batched = 1 if (
-        mu_scatter is not None
-        and mu_scatter.ndim == 3
-        and mu_scatter.shape[0] == n_shots
-        and n_shots > 1
-    ) else 0
+    # Linearised coefficients combine background and scatter tensors, so
+    # their actual post-broadcast shapes are the only reliable batch flags.
+    ca_batched = int(is_shot_batched(ca_p, n_shots))
+    cb_batched = int(is_shot_batched(cb_p, n_shots))
+    cq_batched = int(is_shot_batched(cq_p, n_shots))
+    dca_batched = int(is_shot_batched(dca_p, n_shots))
+    dcb_batched = int(is_shot_batched(dcb_p, n_shots))
+    dcq_batched = int(is_shot_batched(dcq_p, n_shots))
 
     storage_mode = resolve_storage(storage)
     grad_stride = check_sample_steps(sample_steps)
@@ -702,14 +539,43 @@ def em2d_tm_born(
                 n_ckpt, N_STATE, n_shots, ny, nx, device=device, dtype=dtype,
             )
 
-    r = BornEMFunc.apply(
+    # Wavefield I/O (deepwave-style): continuation initial state, optional
+    # final-state output, and the per-step forward callback.
+    state_shape = (n_shots, ny, nx)
+    init_state = prepare_initial_state(
+        initial_state, _WAVEFIELD_NAMES, state_shape, device=device, dtype=dtype,
+    )
+    final_state = allocate_final_state(
+        return_state, _WAVEFIELD_NAMES, state_shape, device=device, dtype=dtype,
+    )
+    callback_frequency = validate_callback_frequency(callback_frequency)
+    cb = (
+        wrap_forward_callback(
+            forward_callback,
+            _CALLBACK_FIELDS,
+            float(dt), fd_pad, list(pml_w),
+        )
+        if forward_callback is not None
+        else None
+    )
+
+    r, r_bg = BornEMFunc.apply(
         ca_p, cb_p, cq_p, dca_p, dcb_p, dcq_p, f_bg, f_sc,
-        src_i, rec_i, profs, c, fd_pad,
+        src_i, rec_i, bg_rec_i, profs, c, fd_pad,
         rdy, rdx, nt_inner,
         pml_y0, pml_y1, pml_x0, pml_x1,
         ca_batched, cb_batched, cq_batched,
         dca_batched, dcb_batched, dcq_batched,
         grad_stride,
         stores, ckpt_state, checkpoint_every, segments,
+        init_state, final_state, cb, callback_frequency,
     )
+
+    if return_state:
+        state = unpack_state(final_state, _WAVEFIELD_NAMES)
+        if bg_receiver_locations is not None:
+            return r, r_bg, state
+        return r, state
+    if bg_receiver_locations is not None:
+        return r, r_bg
     return r

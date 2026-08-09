@@ -16,6 +16,45 @@ from collections.abc import Sequence
 import torch
 
 
+def prepare_source_amplitudes(
+    source_amplitudes,
+    n_shots,
+    n_sources,
+    nt,
+    *,
+    device,
+    dtype,
+):
+    """Validate and materialise ``[shot, source, time]`` amplitudes.
+
+    Located sources without amplitudes become explicit zeros. Native loops
+    derive ``n_sources`` from locations, so they must not receive an empty
+    source buffer when locations are present. Explicit amplitudes must cover
+    every requested time step; otherwise a native loop could read beyond the
+    tensor allocation.
+    """
+    if source_amplitudes is None:
+        return torch.zeros(
+            n_shots, n_sources, nt, device=device, dtype=dtype,
+        )
+    if not isinstance(source_amplitudes, torch.Tensor):
+        raise TypeError("source_amplitudes must be a torch.Tensor")
+    if source_amplitudes.ndim != 3:
+        raise ValueError(
+            "source_amplitudes must have shape [n_shots, n_sources, nt]."
+        )
+    if source_amplitudes.shape[0] != n_shots:
+        raise ValueError("source_amplitudes must have n_shots batches.")
+    if source_amplitudes.shape[1] != n_sources:
+        raise ValueError(
+            "source_amplitudes and source_locations must have the same "
+            "number of sources."
+        )
+    if source_amplitudes.shape[2] < nt:
+        raise ValueError("source_amplitudes must have at least nt steps.")
+    return source_amplitudes.to(device=device, dtype=dtype)[:, :, :nt].contiguous()
+
+
 def is_shot_batched(model, n_shots, spatial_ndim=2):
     """True if ``model`` is an explicit per-shot batch.
 
@@ -32,28 +71,33 @@ def is_shot_batched(model, n_shots, spatial_ndim=2):
     )
 
 
-def check_model_batching(models, names, n_shots, spatial_ndim=2):
-    """Require a uniform shot-batch form within a multi-parameter group.
+def materialize_batched_group(models, n_shots, spatial_ndim=2):
+    """Give a native single-flag model group one safe shot-batch layout.
 
-    Some kernels take a single ``*_batched`` flag for several models (e.g.
-    elastic ``lamb``/``mu``/``buoyancy``).  Mixing a batched tensor with a
-    shared one would index the shared slab at ``s ≥ 1`` (OOB).  ``None``
-    counts as shared (defaults to zeros of the background form).
+    Every entry must already be a tensor; callers must replace optional
+    ``None`` models with their concrete zero tensors before calling this
+    helper.  Native kernels cannot consume ``None`` group members.
 
-    Call this on the *user* tensors before pad, never on padded buffers.
+    If every tensor is shared, return the inputs unchanged with flag 0.  If
+    any tensor is per-shot, materialise the shared tensors across shots and
+    return flag 1.  Autograd reduces gradients through ``expand`` back to the
+    original shared inputs.
     """
-    flags = [is_shot_batched(m, n_shots, spatial_ndim) for m in models]
-    if any(flags) and not all(flags):
-        parts = []
-        for name, m in zip(names, models, strict=True):
-            if m is None:
-                parts.append(f"{name} None (shared zeros)")
-            else:
-                parts.append(f"{name} {tuple(m.shape)}")
-        raise ValueError(
-            "models must be all shared ([spatial]/[1, spatial] or None) "
-            f"or all batched ([n_shots, spatial]); got {', '.join(parts)}."
+    if any(model is None for model in models):
+        raise TypeError(
+            "materialize_batched_group requires tensors; replace optional "
+            "None models with concrete zero tensors first."
         )
+    flags = [is_shot_batched(model, n_shots, spatial_ndim) for model in models]
+    if not any(flags):
+        return models, 0
+    expanded = [
+        model
+        if batched
+        else model.expand(n_shots, *([-1] * spatial_ndim)).contiguous()
+        for model, batched in zip(models, flags, strict=True)
+    ]
+    return expanded, 1
 
 
 def extract_survey_2d(
@@ -105,6 +149,10 @@ def extract_survey_2d(
         if locations is None:
             return torch.empty((n_shots, 0), dtype=torch.int64, device=device)
         loc = locations.to(torch.int64)
+        if loc.device.type != "cpu":
+            # Survey tensors are tiny; computing on the CPU avoids ~10 tiny
+            # kernel launches and the GPU->CPU syncs of the bounds checks.
+            loc = loc.cpu()
         if loc.ndim != 3 or loc.shape[0] != n_shots:
             raise ValueError("locations must have shape [n_shots, n_loc, 2].")
         valid = (loc[..., 0] >= 0) & (loc[..., 1] >= 0)
@@ -217,6 +265,10 @@ def extract_survey_3d(
         if locations is None:
             return torch.empty((n_shots, 0), dtype=torch.int64, device=device)
         loc = locations.to(torch.int64)
+        if loc.device.type != "cpu":
+            # Survey tensors are tiny; computing on the CPU avoids the tiny
+            # kernel launches and the GPU->CPU syncs of the bounds checks.
+            loc = loc.cpu()
         if loc.ndim != 3 or loc.shape[0] != n_shots or loc.shape[2] != 3:
             raise ValueError("locations must have shape [n_shots, n_loc, 3].")
         valid = torch.ones(loc.shape[:2], dtype=torch.bool, device=loc.device)

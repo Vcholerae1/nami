@@ -29,6 +29,10 @@ place.
 
 Kernels are intentionally unoptimised (one launch per step, naive stencil)
 — that is the correctness baseline; performance work lands on top later.
+The time-stepping loop itself runs inside the extension
+(``forward_loop`` / ``adjoint_loop``): one pybind call per pass, with
+checkpoint save/restore, m_sigma bank alternation, and snapshot offsets
+computed in C++.
 """
 
 import math
@@ -36,16 +40,22 @@ import math
 import nami_elastic2d as _ext
 import torch
 
+from ..common.callback import validate_callback_frequency, wrap_forward_callback
 from ..common.cfl import check_cfl
 from ..common.fd import check_accuracy, staggered_diff1_coeffs
 from ..common.pml import set_pml_width
+from ..common.state import allocate_final_state, prepare_initial_state, unpack_state
 from ..common.storage import (
     SnapshotStorage,
     check_sample_steps,
     resolve_storage,
     storage_plan,
 )
-from ..common.survey import check_model_batching, extract_survey_2d
+from ..common.survey import (
+    extract_survey_2d,
+    materialize_batched_group,
+    prepare_source_amplitudes,
+)
 
 # Checkpoint state layout for the elastic velocity-stress field (the buffers
 # are updated in place, so they ARE the wavefield state at time t):
@@ -64,6 +74,18 @@ from ..common.survey import check_model_batching, extract_survey_2d
 #   [12] m_sigmaxxx   velocity-memory (sxx, x)
 N_STATE = 13
 N_STREAMS = 5
+
+# Full N_STATE names: keys of the state dicts returned by ``return_state``
+# and accepted by ``initial_state`` (a complete dict makes a split run
+# bitwise match a one-shot run).
+_WAVEFIELD_NAMES = (
+    "vy", "vx", "syy", "sxx", "sxy",
+    "m_vyy", "m_vxx", "m_vxy", "m_vyx",
+    "m_sigmayyy", "m_sigmaxyx", "m_sigmaxyy", "m_sigmaxxx",
+)
+# Physics fields exposed to `forward_callback` (the PML memory variables are
+# not passed).
+_CALLBACK_FIELDS = ("vy", "vx", "syy", "sxx", "sxy")
 
 
 class Elastic2DFunc(torch.autograd.Function):
@@ -87,6 +109,10 @@ class Elastic2DFunc(torch.autograd.Function):
         ckpt_state,      # [n_ckpt, N_STATE, n_shots, ny, nx] or None
         checkpoint_every,  # 0 = full storage; N = checkpoint every N steps
         segments,        # [(s0, s1)] replay segments; [] = full storage
+        init_state,      # [N_STATE, n_shots, ny, nx] initial wavefield or None
+        final_state,     # [N_STATE, n_shots, ny, nx] output buffer or None
+        forward_callback,  # cb(t, nt, vy, vx, syy, sxx, sxy) or None
+        callback_frequency,  # call the callback every N steps
     ):
         ext = _ext
         device = lamb.device
@@ -121,42 +147,27 @@ class Elastic2DFunc(torch.autograd.Function):
 
         ayh, byh, ay, by, axh, bxh, ax, bx = profs
         pml_y0, pml_y1, pml_x0, pml_x1 = ext.get_pml_box(by, bx, ny, nx)
-        ckpt = ckpt_state is not None
-        for t in range(nt):
-            if ckpt and t > 0 and t % checkpoint_every == 0:
-                k = t // checkpoint_every - 1
-                ckpt_state[k, 0].copy_(vy)
-                ckpt_state[k, 1].copy_(vx)
-                ckpt_state[k, 2].copy_(syy)
-                ckpt_state[k, 3].copy_(sxx)
-                ckpt_state[k, 4].copy_(sxy)
-                ckpt_state[k, 5].copy_(m_vyy)
-                ckpt_state[k, 6].copy_(m_vxx)
-                ckpt_state[k, 7].copy_(m_vxy)
-                ckpt_state[k, 8].copy_(m_vyx)
-                ckpt_state[k, 9].copy_(m_sigmayyy)
-                ckpt_state[k, 10].copy_(m_sigmaxyx)
-                ckpt_state[k, 11].copy_(m_sigmaxyy)
-                ckpt_state[k, 12].copy_(m_sigmaxxx)
-            if segments:
-                store = 0
-                snap_off = 0
-            else:
-                store = 1 if storage is not None else 0
-                snap_off = storage[0].snap_offset(t // grad_stride) if storage else 0
-            ext.forward_step(
-                vy, vx, syy, sxx, sxy,
-                m_sigmayyy, m_sigmaxyx, m_sigmaxyy, m_sigmaxxx,
-                buoyancy_y, buoyancy_x, dvydb_store, dvxdb_store,
-                m_vyy, m_vxx, m_vxy, m_vyx,
-                lamb, mu, mu_yx, dvydy_store, dvxdx_store, dvxy_store,
-                ayh, byh, ay, by, axh, bxh, ax, bx,
-                c, f, src_i, rec_i, r,
-                fd_pad_y0, fd_pad_y1, fd_pad_x0, fd_pad_x1,
-                rdy, rdx, dtv, t, grad_stride, snap_off,
-                n_shots, ny, nx, ny_nx, n_src, n_rec, model_batched, store, 1,
-                pml_y0, pml_y1, pml_x0, pml_x1,
-            )
+        # 13 flat state buffers (no rings, updated in place) in N_STATE order
+        state = [
+            vy, vx, syy, sxx, sxy,
+            m_vyy, m_vxx, m_vxy, m_vyx,
+            m_sigmayyy, m_sigmaxyx, m_sigmaxyy, m_sigmaxxx,
+        ]
+        # checkpointed forward stores no snapshots (the backward replay
+        # regenerates them); full storage writes every sampled step.
+        store = 0 if segments else (1 if storage is not None else 0)
+        ext.forward_loop(
+            state, lamb, mu, mu_yx, buoyancy_y, buoyancy_x,
+            dvydy_store, dvxdx_store, dvxy_store, dvydb_store, dvxdb_store,
+            ayh, byh, ay, by, axh, bxh, ax, bx,
+            c, f, src_i, rec_i, r,
+            fd_pad_y0, fd_pad_y1, fd_pad_x0, fd_pad_x1,
+            rdy, rdx, dtv,
+            nt, grad_stride, store, model_batched,
+            pml_y0, pml_y1, pml_x0, pml_x1,
+            checkpoint_every, ckpt_state,
+            init_state, final_state, forward_callback, callback_frequency,
+        )
 
         ctx.ext = ext
         ctx.save_for_backward(
@@ -193,12 +204,15 @@ class Elastic2DFunc(torch.autograd.Function):
         if device.type == "cuda":
             torch.cuda.set_device(device)
         dtype = lamb.dtype
-        n_shots, ny, nx, ny_nx = ctx.n_shots, ctx.ny, ctx.nx, ctx.ny_nx
+        n_shots, ny, nx = ctx.n_shots, ctx.ny, ctx.nx
         nt, grad_stride = ctx.nt, ctx.grad_stride
         scale = float(grad_stride)
 
         if grad_r is None:
             grad_r = torch.zeros(nt, n_shots, ctx.n_rec, device=device, dtype=dtype)
+        # grad_r arrives from autograd and may be a non-contiguous broadcast
+        # view; the kernels use flat row-major indexing, so materialise it.
+        grad_r = grad_r.contiguous()
         grad_f = torch.zeros(nt, n_shots, ctx.n_src, device=device, dtype=dtype)
         grad_lamb = torch.zeros(n_shots, ny, nx, device=device, dtype=dtype)
         grad_mu = torch.zeros(n_shots, ny, nx, device=device, dtype=dtype)
@@ -218,97 +232,30 @@ class Elastic2DFunc(torch.autograd.Function):
         ayh, byh, ay, by, axh, bxh, ax, bx = ctx.profs
         segments = ctx.segments
         if segments:
-            # Checkpointed backward: per segment, restore the wavefield state,
-            # replay the forward steps to regenerate the snapshots, then run
-            # the adjoint steps.  The adjoint state carries across segments.
-            f_vy, f_vx = z(n_shots, ny, nx), z(n_shots, ny, nx)
-            f_syy, f_sxx, f_sxy = (
-                z(n_shots, ny, nx), z(n_shots, ny, nx), z(n_shots, ny, nx),
-            )
-            f_m_vyy, f_m_vxx = z(n_shots, ny, nx), z(n_shots, ny, nx)
-            f_m_vxy, f_m_vyx = z(n_shots, ny, nx), z(n_shots, ny, nx)
-            f_m_sigmayyy, f_m_sigmaxyx = z(n_shots, ny, nx), z(n_shots, ny, nx)
-            f_m_sigmaxyy, f_m_sigmaxxx = z(n_shots, ny, nx), z(n_shots, ny, nx)
-            state_bufs = (
-                f_vy, f_vx, f_syy, f_sxx, f_sxy,
-                f_m_vyy, f_m_vxx, f_m_vxy, f_m_vyx,
-                f_m_sigmayyy, f_m_sigmaxyx, f_m_sigmaxyy, f_m_sigmaxxx,
-            )
-            ckpt = ctx.ckpt_state
-            for k in range(len(segments) - 1, -1, -1):
-                s0, s1 = segments[k]
-                if s0 > 0:
-                    c = ckpt[k - 1]
-                    for i, buf in enumerate(state_bufs):
-                        buf.copy_(c[i])
-                else:
-                    for buf in state_bufs:
-                        buf.zero_()
-                # replay the forward steps (regenerate the snapshots)
-                for t in range(s0, s1):
-                    snap_off = ((t - s0) // grad_stride) * (n_shots * ny_nx)
-                    ext.forward_step(
-                        f_vy, f_vx, f_syy, f_sxx, f_sxy,
-                        f_m_sigmayyy, f_m_sigmaxyx, f_m_sigmaxyy, f_m_sigmaxxx,
-                        buoyancy_y, buoyancy_x, dvydb_store, dvxdb_store,
-                        f_m_vyy, f_m_vxx, f_m_vxy, f_m_vyx,
-                        lamb, mu, mu_yx, dvydy_store, dvxdx_store, dvxy_store,
-                        ayh, byh, ay, by, axh, bxh, ax, bx,
-                        ctx.c, f, src_i, rec_i, grad_r,
-                        ctx.fd_pad[0], ctx.fd_pad[1],
-                        ctx.fd_pad[2], ctx.fd_pad[3],
-                        ctx.rdy, ctx.rdx, ctx.dtv, t, grad_stride, snap_off,
-                        n_shots, ny, nx, ny_nx, ctx.n_src, ctx.n_rec,
-                        ctx.model_batched, 1, 0,
-                        ctx.pml[0], ctx.pml[1], ctx.pml[2], ctx.pml[3],
-                    )
-                # adjoint steps for the segment
-                for t in range(s1 - 1, s0 - 1, -1):
-                    parity = (nt - 1 - t) % 2
-                    old = m_sig_b if parity else m_sig_a
-                    new = m_sig_a if parity else m_sig_b
-                    snap_off = ((t - s0) // grad_stride) * (n_shots * ny_nx)
-                    ext.backward_step(
-                        lamb, mu, mu_yx, buoyancy_y, buoyancy_x,
-                        l_vy, l_vx, l_syy, l_sxx, l_sxy,
-                        m_vyy, m_vxx, m_vxy, m_vyx,
-                        old[0], old[1], old[2], old[3],
-                        new[0], new[1], new[2], new[3],
-                        grad_by, grad_bx, grad_lamb, grad_mu, grad_mu_yx,
-                        dvydb_store, dvxdb_store,
-                        dvydy_store, dvxdx_store, dvxy_store,
-                        ayh, byh, ay, by, axh, bxh, ax, bx,
-                        ctx.c, grad_f, src_i, grad_r, rec_i,
-                        ctx.fd_pad[0], ctx.fd_pad[1],
-                        ctx.fd_pad[2], ctx.fd_pad[3],
-                        ctx.rdy, ctx.rdx, ctx.dtv, scale, t, grad_stride, snap_off,
-                        n_shots, ny, nx, ny_nx, ctx.n_src, ctx.n_rec,
-                        ctx.model_batched,
-                        ctx.pml[0], ctx.pml[1], ctx.pml[2], ctx.pml[3],
-                    )
+            # Checkpointed backward replays each segment's forward pass in
+            # C++; these buffers hold the replayed wavefield state (N_STATE
+            # order).  The adjoint state carries across segments.
+            fstate = [z(n_shots, ny, nx) for _ in range(N_STATE)]
+            segments_t = torch.tensor(segments, dtype=torch.int64)
         else:
-            for t in range(nt - 1, -1, -1):
-                parity = (nt - 1 - t) % 2
-                old = m_sig_b if parity else m_sig_a
-                new = m_sig_a if parity else m_sig_b
-                snap_off = storage[0].snap_offset(t // grad_stride)
-                ext.backward_step(
-                    lamb, mu, mu_yx, buoyancy_y, buoyancy_x,
-                    l_vy, l_vx, l_syy, l_sxx, l_sxy,
-                    m_vyy, m_vxx, m_vxy, m_vyx,
-                    old[0], old[1], old[2], old[3],
-                    new[0], new[1], new[2], new[3],
-                    grad_by, grad_bx, grad_lamb, grad_mu, grad_mu_yx,
-                    dvydb_store, dvxdb_store,
-                    dvydy_store, dvxdx_store, dvxy_store,
-                    ayh, byh, ay, by, axh, bxh, ax, bx,
-                    ctx.c, grad_f, src_i, grad_r, rec_i,
-                    ctx.fd_pad[0], ctx.fd_pad[1], ctx.fd_pad[2], ctx.fd_pad[3],
-                    ctx.rdy, ctx.rdx, ctx.dtv, scale, t, grad_stride, snap_off,
-                    n_shots, ny, nx, ny_nx, ctx.n_src, ctx.n_rec,
-                    ctx.model_batched,
-                    ctx.pml[0], ctx.pml[1], ctx.pml[2], ctx.pml[3],
-                )
+            fstate = []
+            segments_t = torch.empty(0, 2, dtype=torch.int64)
+        ext.adjoint_loop(
+            lamb, mu, mu_yx, buoyancy_y, buoyancy_x,
+            l_vy, l_vx, l_syy, l_sxx, l_sxy,
+            m_vyy, m_vxx, m_vxy, m_vyx,
+            m_sig_a, m_sig_b,
+            grad_by, grad_bx, grad_lamb, grad_mu, grad_mu_yx,
+            dvydy_store, dvxdx_store, dvxy_store, dvydb_store, dvxdb_store,
+            ayh, byh, ay, by, axh, bxh, ax, bx,
+            ctx.c, grad_f, src_i, grad_r, rec_i, f,
+            fstate,
+            ctx.fd_pad[0], ctx.fd_pad[1], ctx.fd_pad[2], ctx.fd_pad[3],
+            ctx.rdy, ctx.rdx, ctx.dtv, scale,
+            nt, grad_stride, ctx.model_batched,
+            ctx.pml[0], ctx.pml[1], ctx.pml[2], ctx.pml[3],
+            segments_t, ctx.ckpt_state,
+        )
 
         if not ctx.model_batched:
             grad_lamb = grad_lamb.sum(0, keepdim=True)
@@ -327,6 +274,7 @@ class Elastic2DFunc(torch.autograd.Function):
             grad_amp,
             None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None,
+            None, None, None, None,
         )
 
 
@@ -462,6 +410,10 @@ def elastic2d(
     storage="auto",
     sample_steps=1,
     ckpt_steps=None,
+    forward_callback=None,
+    callback_frequency=1,
+    return_state=False,
+    initial_state=None,
 ):
     """2D elastic wave modelling / FWI primitive (CUDA backend).
 
@@ -494,10 +446,32 @@ def elastic2d(
             ~sqrt(nt), 0 = full storage (every sampled step), N = save wavefield
             state every N steps and replay on backward.  Same gradients as full
             storage at the same sample_steps.
+        forward_callback: called every ``callback_frequency`` steps with a
+            ``CallbackState`` (deepwave-style) exposing the current padded
+            wavefields (``vy``, ``vx``, ``syy``, ``sxx``, ``sxy``) via
+            ``state.get_wavefield(name, view)`` — useful for RTM imaging
+            conditions, illumination accumulation, monitoring.
+        callback_frequency: call ``forward_callback`` every N time steps.
+        return_state: if True, return ``(r, state)`` where ``state`` is a
+            dict of the FINAL padded wavefield state (all 13 N_STATE
+            buffers, including the PML memory variables) suitable for
+            continuation via ``initial_state``.
+        initial_state: a dict of initial wavefield state (padded grid, keys
+            as in the ``return_state=True`` output) to continue a previous
+            run.  Missing keys are zero-filled; a complete state dict (every
+            key, including the PML memory variables) makes a split run
+            bitwise match a one-shot run, while a partial dict restores only
+            the given fields with the remaining state starting from zero.
+            State I/O is for forward continuation; autograd does not propagate
+            across the boundary between runs.  State dicts are ephemeral
+            runtime snapshots: they may be passed back only to the same
+            propagator with the same model layout and nami version, and are
+            not a stable long-term checkpoint format.
 
     Returns:
         receiver_amplitudes [nt, n_shots, n_rec], pressure = -(sigmayy +
-        sigmaxx) / 2, matching the elastic pressure receivers.
+        sigmaxx) / 2, matching the elastic pressure receivers (or
+        ``(r, state)`` when ``return_state=True``).
     """
     accuracy = check_accuracy(accuracy)
     if not isinstance(grid_spacing, (list, tuple)):
@@ -561,15 +535,10 @@ def elastic2d(
     # staggered parameters from the padded models (staggered-grid convention)
     mu_yx, buoyancy_y, buoyancy_x = prepare_parameters(mu_p, buoy_p)
 
-    if source_amplitudes is not None:
-        amp = source_amplitudes.to(device=device, dtype=dtype)
-        if amp.shape[0] != n_shots:
-            raise ValueError("source_amplitudes must have n_shots batches.")
-        if amp.shape[2] < nt_inner:
-            raise ValueError("source_amplitudes must have at least nt steps.")
-        amp = amp[:, :, :nt_inner].contiguous()
-    else:
-        amp = torch.zeros(n_shots, 0, nt_inner, device=device, dtype=dtype)
+    amp = prepare_source_amplitudes(
+        source_amplitudes, n_shots, sources_i.shape[1], nt_inner,
+        device=device, dtype=dtype,
+    )
 
     storage_mode = resolve_storage(storage)
     grad_stride = check_sample_steps(sample_steps)
@@ -581,14 +550,13 @@ def elastic2d(
         nt_inner, N_STATE, grad_stride, N_STREAMS, storage_enabled,
         ckpt_steps=ckpt_steps,
     )
-    # Batched flag from the *user* models (before pad).  One flag governs
-    # all three parameters, so they must share a batch form.
-    check_model_batching(
-        [lamb, mu, buoyancy], ("lamb", "mu", "buoyancy"), n_shots
+    # The native loop has one flag for this coefficient group.  Mixed user
+    # batching is normalised here by materialising only its shared members;
+    # autograd reduces their gradients back to the original shared inputs.
+    coefficients, model_batched = materialize_batched_group(
+        [lamb_p, mu_p, mu_yx, buoyancy_y, buoyancy_x], n_shots
     )
-    model_batched = 1 if (
-        lamb.ndim == 3 and lamb.shape[0] == n_shots and n_shots > 1
-    ) else 0
+    lamb_p, mu_p, mu_yx, buoyancy_y, buoyancy_x = coefficients
 
     stores = None
     ckpt_state = None
@@ -604,6 +572,26 @@ def elastic2d(
                 n_ckpt, N_STATE, n_shots, padded_ny, padded_nx,
                 device=device, dtype=dtype,
             )
+
+    # Wavefield I/O (deepwave-style): continuation initial state, optional
+    # final-state output, and the per-step forward callback.
+    state_shape = (n_shots, padded_ny, padded_nx)
+    init_state = prepare_initial_state(
+        initial_state, _WAVEFIELD_NAMES, state_shape, device=device, dtype=dtype,
+    )
+    final_state = allocate_final_state(
+        return_state, _WAVEFIELD_NAMES, state_shape, device=device, dtype=dtype,
+    )
+    callback_frequency = validate_callback_frequency(callback_frequency)
+    cb = (
+        wrap_forward_callback(
+            forward_callback,
+            _CALLBACK_FIELDS,
+            float(dt), fd_pad, list(pml_width_list),
+        )
+        if forward_callback is not None
+        else None
+    )
 
     r = Elastic2DFunc.apply(
         lamb_p,
@@ -628,5 +616,11 @@ def elastic2d(
         ckpt_state,
         checkpoint_every,
         segments,
+        init_state,
+        final_state,
+        cb,
+        callback_frequency,
     )
+    if return_state:
+        return -r / 2, unpack_state(final_state, _WAVEFIELD_NAMES)
     return -r / 2

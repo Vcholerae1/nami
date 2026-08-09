@@ -80,5 +80,16 @@ def staggered_diff1_coeffs(accuracy: int, dtype=None, device=None):
 def _to_tensor(values, length, dtype, device):
     import torch
 
-    padded = list(values) + [0.0] * (length - len(values))
-    return torch.tensor(padded, dtype=dtype, device=device)
+    # Coefficient tables depend only on (values, length, dtype, device) and
+    # are read-only for the kernels; cache them instead of re-uploading the
+    # same host list on every propagator call.
+    key = (tuple(values), length, dtype, device)
+    tensor = _COEFF_CACHE.get(key)
+    if tensor is None:
+        padded = list(values) + [0.0] * (length - len(values))
+        tensor = torch.tensor(padded, dtype=dtype, device=device)
+        _COEFF_CACHE[key] = tensor
+    return tensor
+
+
+_COEFF_CACHE: dict = {}

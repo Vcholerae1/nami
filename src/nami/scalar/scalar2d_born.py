@@ -16,21 +16,27 @@ last).
 ``receiver_amplitudes`` is the scattered wavefield recorded at
 ``receiver_locations``; ``bg_receiver_amplitudes`` is the background
 wavefield recorded at ``bg_receiver_locations``.
+
+The time-stepping loop itself runs inside the extension
+(``forward_loop`` / ``adjoint_loop``): one pybind call per pass, with
+checkpoint save/restore and snapshot offsets computed in C++.
 """
 
-import nami_born as _ext
+import nami_scalar2d_born as _ext
 import torch
 
+from ..common.callback import validate_callback_frequency, wrap_forward_callback
 from ..common.cfl import check_cfl
 from ..common.fd import diff1_coeffs, diff2_coeffs
 from ..common.pml import set_acoustic_pml_profiles, set_pml_width
+from ..common.state import allocate_final_state, prepare_initial_state, unpack_state
 from ..common.storage import (
     SnapshotStorage,
     check_sample_steps,
     resolve_storage,
     storage_plan,
 )
-from ..common.survey import extract_survey_2d
+from ..common.survey import extract_survey_2d, prepare_source_amplitudes
 
 # Checkpoint state layout for the Born wavefield (saved at t before step t):
 #   [0]  u[t % 3]         background field at time t
@@ -48,6 +54,14 @@ from ..common.survey import extract_survey_2d
 N_STATE = 12
 N_STREAMS = 2
 
+# Full N_STATE names: keys of the state dicts returned by ``return_state``
+# and accepted by ``initial_state`` (for split-run continuation).
+_WAVEFIELD_NAMES = (
+    "u", "u_prev", "u_sc", "u_sc_prev",
+    "psi_y", "psi_x", "zeta_y", "zeta_x",
+    "psi_y_sc", "psi_x_sc", "zeta_y_sc", "zeta_x_sc",
+)
+_CALLBACK_FIELDS = ("u", "u_sc")
 
 
 class Scalar2DBornFunc(torch.autograd.Function):
@@ -73,6 +87,10 @@ class Scalar2DBornFunc(torch.autograd.Function):
         ckpt_state,      # [n_ckpt, N_STATE, n_shots, ny, nx] or None
         checkpoint_every,  # 0 = full storage; N = checkpoint every N steps
         segments,        # [(s0, s1)] replay segments; [] = full storage
+        init_state,      # [N_STATE, n_shots, ny, nx] initial wavefield or None
+        final_state,     # [N_STATE, n_shots, ny, nx] output buffer or None
+        forward_callback,  # cb(t, nt, u, u_sc) or None
+        callback_frequency,  # call the callback every N steps
     ):
         ext = _ext
         device = v_p.device
@@ -82,7 +100,6 @@ class Scalar2DBornFunc(torch.autograd.Function):
         # n_shots from survey, not model batch (shared [1, ny, nx] ok).
         n_shots = int(src_i.shape[0])
         ny, nx = v_p.shape[-2:]
-        n_src = src_i.shape[1]
         n_rec = rec_i.shape[1]
         n_bg_rec = bg_rec_i.shape[1]
 
@@ -98,63 +115,33 @@ class Scalar2DBornFunc(torch.autograd.Function):
         zeta_x_sc = [torch.zeros_like(u[0]) for _ in range(2)]
         r = torch.zeros(nt, n_shots, n_rec, device=device, dtype=dtype)
         r_bg = torch.zeros(nt, n_shots, n_bg_rec, device=device, dtype=dtype)
-        ny_nx = ny * nx
 
         ay, by, dbydy, ax, bx, dbxdx = [p.contiguous() for p in profs]
-        ckpt = ckpt_state is not None
         w_store = torch.zeros(n_shots, ny, nx, device=device, dtype=dtype)
         wsc_store = torch.zeros_like(w_store)
         if storage is not None:
             w_store = storage.snap
         if storage_sc is not None:
             wsc_store = storage_sc.snap
-        for t in range(nt):
-            if ckpt and t > 0 and t % checkpoint_every == 0:
-                k = t // checkpoint_every - 1
-                ckpt_state[k, 0].copy_(u[t % 3])
-                ckpt_state[k, 1].copy_(u[(t - 1) % 3])
-                ckpt_state[k, 2].copy_(u_sc[t % 3])
-                ckpt_state[k, 3].copy_(u_sc[(t - 1) % 3])
-                ckpt_state[k, 4].copy_(psi_y[t % 2])
-                ckpt_state[k, 5].copy_(psi_x[t % 2])
-                ckpt_state[k, 6].copy_(zeta_y[t % 2])
-                ckpt_state[k, 7].copy_(zeta_x[t % 2])
-                ckpt_state[k, 8].copy_(psi_y_sc[t % 2])
-                ckpt_state[k, 9].copy_(psi_x_sc[t % 2])
-                ckpt_state[k, 10].copy_(zeta_y_sc[t % 2])
-                ckpt_state[k, 11].copy_(zeta_x_sc[t % 2])
-            store = 0 if segments else 1 if storage is not None else 0
-            snap_off = (
-                storage.snap_offset(t // grad_stride)
-                if store and storage is not None else 0
-            )
-            ext.forward_step(
-                v_p, scatter_p,
-                u[t % 3], u[(t - 1) % 3], u_sc[t % 3], u_sc[(t - 1) % 3],
-                psi_y[t % 2], psi_x[t % 2], zeta_y[t % 2], zeta_x[t % 2],
-                psi_y_sc[t % 2], psi_x_sc[t % 2], zeta_y_sc[t % 2], zeta_x_sc[t % 2],
-                u[(t + 1) % 3], u_sc[(t + 1) % 3],
-                psi_y[(t + 1) % 2], psi_x[(t + 1) % 2],
-                zeta_y[(t + 1) % 2], zeta_x[(t + 1) % 2],
-                psi_y_sc[(t + 1) % 2], psi_x_sc[(t + 1) % 2],
-                zeta_y_sc[(t + 1) % 2], zeta_x_sc[(t + 1) % 2],
-                ay, by, dbydy, ax, bx, dbxdx, w_store, wsc_store,
-                c1, c2,
-                rdy, rdx, rdy2, rdx2, t, grad_stride, dt2,
-                n_shots, ny, nx,
-                pml_y0, pml_y1, pml_x0, pml_x1,
-                v_batched, scatter_batched, store, snap_off, fd_pad,
-            )
-            if n_src > 0:
-                ext.inject(
-                    u[(t + 1) % 3], u_sc[(t + 1) % 3], f_bg, f_sc, src_i,
-                    t, n_shots, n_src, ny_nx,
-                )
-            if n_rec > 0 or n_bg_rec > 0:
-                ext.record(
-                    u[t % 3], u_sc[t % 3], r_bg, r, bg_rec_i, rec_i,
-                    t, n_shots, n_bg_rec, n_rec, ny_nx,
-                )
+        # checkpointed forward stores no snapshots (the backward replay
+        # regenerates them); full storage writes every sampled step.
+        store = 0 if segments else (1 if storage is not None else 0)
+        ext.forward_loop(
+            v_p, scatter_p,
+            u, u_sc,
+            psi_y, psi_x, zeta_y, zeta_x,
+            psi_y_sc, psi_x_sc, zeta_y_sc, zeta_x_sc,
+            ay, by, dbydy, ax, bx, dbxdx, w_store, wsc_store,
+            f_bg, f_sc, src_i,
+            r, rec_i, r_bg, bg_rec_i,
+            c1, c2,
+            rdy, rdx, rdy2, rdx2, dt2,
+            nt, grad_stride,
+            pml_y0, pml_y1, pml_x0, pml_x1,
+            v_batched, scatter_batched, store, fd_pad,
+            checkpoint_every, ckpt_state,
+            init_state, final_state, forward_callback, callback_frequency,
+        )
 
         ctx.ext = ext
         ctx.save_for_backward(
@@ -162,7 +149,6 @@ class Scalar2DBornFunc(torch.autograd.Function):
             w_store, wsc_store, c1, c2,
         )
         ctx.n_shots = n_shots
-        ctx.ny_nx = ny_nx
         ctx.rdy, ctx.rdx, ctx.rdy2, ctx.rdx2, ctx.dt2 = rdy, rdx, rdy2, rdx2, dt2
         ctx.nt = nt
         ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1 = (
@@ -179,44 +165,8 @@ class Scalar2DBornFunc(torch.autograd.Function):
         ctx.storage = storage
         ctx.storage_sc = storage_sc
         ctx.ckpt_state = ckpt_state
-        ctx.checkpoint_every = checkpoint_every
         ctx.segments = segments
         return r, r_bg
-
-    @staticmethod
-    def _replay_segment(ext, v_p, scatter_p, f_bg, f_sc, src_i, n_shots,
-                        n_src, u, u_sc, psi_y, psi_x, zeta_y, zeta_x,
-                        psi_y_sc, psi_x_sc, zeta_y_sc, zeta_x_sc, ay, by,
-                        dbydy, ax, bx, dbxdx, w_store, wsc_store, c1, c2,
-                        rdy, rdx, rdy2, rdx2, grad_stride, dt2, pml_y0,
-                        pml_y1, pml_x0, pml_x1, v_batched, scatter_batched,
-                        ny, nx, fd_pad, ny_nx, s0, s1):
-        """Re-run forward steps [s0, s1), writing segment-local snapshots."""
-        shot_count = n_shots * ny * nx
-        for t in range(s0, s1):
-            snap_off = ((t - s0) // grad_stride) * shot_count
-            ext.forward_step(
-                v_p, scatter_p,
-                u[t % 3], u[(t - 1) % 3], u_sc[t % 3], u_sc[(t - 1) % 3],
-                psi_y[t % 2], psi_x[t % 2], zeta_y[t % 2], zeta_x[t % 2],
-                psi_y_sc[t % 2], psi_x_sc[t % 2], zeta_y_sc[t % 2], zeta_x_sc[t % 2],
-                u[(t + 1) % 3], u_sc[(t + 1) % 3],
-                psi_y[(t + 1) % 2], psi_x[(t + 1) % 2],
-                zeta_y[(t + 1) % 2], zeta_x[(t + 1) % 2],
-                psi_y_sc[(t + 1) % 2], psi_x_sc[(t + 1) % 2],
-                zeta_y_sc[(t + 1) % 2], zeta_x_sc[(t + 1) % 2],
-                ay, by, dbydy, ax, bx, dbxdx, w_store, wsc_store,
-                c1, c2,
-                rdy, rdx, rdy2, rdx2, t, grad_stride, dt2,
-                n_shots, ny, nx,
-                pml_y0, pml_y1, pml_x0, pml_x1,
-                v_batched, scatter_batched, 1, snap_off, fd_pad,
-            )
-            if n_src > 0:
-                ext.inject(
-                    u[(t + 1) % 3], u_sc[(t + 1) % 3], f_bg, f_sc, src_i,
-                    t, n_shots, n_src, ny_nx,
-                )
 
     @staticmethod
     def backward(ctx, grad_r, grad_r_bg):
@@ -231,7 +181,6 @@ class Scalar2DBornFunc(torch.autograd.Function):
                 "forward with an input requiring grad (and not under "
                 "torch.no_grad())."
             )
-        storage = ctx.storage
         device = v_p.device
         if device.type == "cuda":
             torch.cuda.set_device(device)
@@ -241,12 +190,15 @@ class Scalar2DBornFunc(torch.autograd.Function):
         n_src, n_rec, n_bg_rec = src_i.shape[1], rec_i.shape[1], bg_rec_i.shape[1]
         nt = ctx.nt
         grad_stride = ctx.grad_stride
-        ny_nx = ctx.ny_nx
 
         if grad_r is None:
             grad_r = torch.zeros(nt, n_shots, n_rec, device=device, dtype=dtype)
         if grad_r_bg is None:
             grad_r_bg = torch.zeros(nt, n_shots, n_bg_rec, device=device, dtype=dtype)
+        # grad_r arrives from autograd and may be a non-contiguous broadcast
+        # view; the kernels use flat row-major indexing, so materialise it.
+        grad_r = grad_r.contiguous()
+        grad_r_bg = grad_r_bg.contiguous()
         grad_f_bg = torch.zeros(nt, n_shots, n_src, device=device, dtype=dtype)
         grad_f_sc = torch.zeros(nt, n_shots, n_src, device=device, dtype=dtype)
         # Per-shot grads; summed below when models are shared (not batched).
@@ -273,15 +225,13 @@ class Scalar2DBornFunc(torch.autograd.Function):
         scale = float(grad_stride)
         segments = ctx.segments
         if segments:
-            # Checkpointed backward: per segment, restore the wavefield
-            # state, replay the forward steps to regenerate the w
-            # snapshots, then run the adjoint steps.  The adjoint state
-            # (lam + memory variables) carries across segments.
+            # Checkpointed backward replays each segment's forward pass in
+            # C++; these rings hold the replayed wavefield state.
             u = [
                 torch.zeros(n_shots, ny, nx, device=device, dtype=dtype)
                 for _ in range(3)
             ]
-            u_sc = [torch.zeros_like(u[0]) for _ in range(3)]
+            u_sc = [torch.zeros_like(lam_bg[0]) for _ in range(3)]
             psi_y_f = [torch.zeros_like(lam_bg[0]) for _ in range(2)]
             psi_x_f = [torch.zeros_like(lam_bg[0]) for _ in range(2)]
             zeta_y_f = [torch.zeros_like(lam_bg[0]) for _ in range(2)]
@@ -290,122 +240,40 @@ class Scalar2DBornFunc(torch.autograd.Function):
             psi_x_sc_f = [torch.zeros_like(lam_bg[0]) for _ in range(2)]
             zeta_y_sc_f = [torch.zeros_like(lam_bg[0]) for _ in range(2)]
             zeta_x_sc_f = [torch.zeros_like(lam_bg[0]) for _ in range(2)]
-            ckpt = ctx.ckpt_state
-            for k in range(len(segments) - 1, -1, -1):
-                s0, s1 = segments[k]
-                if s0 > 0:
-                    c = ckpt[k - 1]
-                    u[s0 % 3].copy_(c[0])
-                    u[(s0 - 1) % 3].copy_(c[1])
-                    u_sc[s0 % 3].copy_(c[2])
-                    u_sc[(s0 - 1) % 3].copy_(c[3])
-                    psi_y_f[s0 % 2].copy_(c[4])
-                    psi_x_f[s0 % 2].copy_(c[5])
-                    zeta_y_f[s0 % 2].copy_(c[6])
-                    zeta_x_f[s0 % 2].copy_(c[7])
-                    psi_y_sc_f[s0 % 2].copy_(c[8])
-                    psi_x_sc_f[s0 % 2].copy_(c[9])
-                    zeta_y_sc_f[s0 % 2].copy_(c[10])
-                    zeta_x_sc_f[s0 % 2].copy_(c[11])
-                else:
-                    for buf in u:
-                        buf.zero_()
-                    for buf in u_sc:
-                        buf.zero_()
-                    for bufs in (
-                        psi_y_f, psi_x_f, zeta_y_f, zeta_x_f,
-                        psi_y_sc_f, psi_x_sc_f, zeta_y_sc_f, zeta_x_sc_f,
-                    ):
-                        for buf in bufs:
-                            buf.zero_()
-                Scalar2DBornFunc._replay_segment(
-                    ext, v_p, scatter_p, f_bg, f_sc, src_i, n_shots, n_src,
-                    u, u_sc, psi_y_f, psi_x_f, zeta_y_f, zeta_x_f,
-                    psi_y_sc_f, psi_x_sc_f, zeta_y_sc_f, zeta_x_sc_f,
-                    ay, by, dbydy, ax, bx, dbxdx, w_store, wsc_store,
-                    c1, c2, ctx.rdy, ctx.rdx, ctx.rdy2, ctx.rdx2, grad_stride,
-                    ctx.dt2, ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
-                    ctx.v_batched, ctx.scatter_batched, ny, nx, ctx.fd_pad,
-                    ny_nx, s0, s1,
-                )
-                for t in range(s1 - 1, s0 - 1, -1):
-                    if n_src > 0:
-                        ext.record_grad_f(
-                            lam_bg[(t + 1) % 3], lam_sc[(t + 1) % 3],
-                            grad_f_bg, grad_f_sc, src_i, t, n_shots, n_src,
-                            ny_nx,
-                        )
-                    snap_off = ((t - s0) // grad_stride) * (n_shots * ny * nx)
-                    ext.adjoint_step(
-                        v_p, scatter_p,
-                        lam_bg[(t + 1) % 3], lam_bg[(t + 2) % 3],
-                        lam_sc[(t + 1) % 3], lam_sc[(t + 2) % 3],
-                        lam_bg[t % 3], lam_sc[t % 3],
-                        psi_y[t % 2], psi_x[t % 2], zeta_y[t % 2], zeta_x[t % 2],
-                        psi_y_sc[t % 2], psi_x_sc[t % 2],
-                        zeta_y_sc[t % 2], zeta_x_sc[t % 2],
-                        psi_y[(t + 1) % 2], psi_x[(t + 1) % 2],
-                        zeta_y[(t + 1) % 2], zeta_x[(t + 1) % 2],
-                        psi_y_sc[(t + 1) % 2], psi_x_sc[(t + 1) % 2],
-                        zeta_y_sc[(t + 1) % 2], zeta_x_sc[(t + 1) % 2],
-                        ay, by, dbydy, ax, bx, dbxdx, w_store, wsc_store,
-                        grad_v, grad_scatter,
-                        c1, c2,
-                        ctx.rdy, ctx.rdx, ctx.rdy2, ctx.rdx2,
-                        t, grad_stride, scale, ctx.dt2,
-                        n_shots, ny, nx,
-                        ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
-                        ctx.pml_y0_b, ctx.pml_y1_b, ctx.pml_x0_b, ctx.pml_x1_b,
-                        ctx.v_batched, ctx.scatter_batched, snap_off, ctx.fd_pad,
-                    )
-                    if n_rec > 0 or n_bg_rec > 0:
-                        ext.record_grad_r(
-                            lam_bg[t % 3], lam_sc[t % 3],
-                            grad_r_bg, grad_r, bg_rec_i, rec_i,
-                            t, n_shots, n_bg_rec, n_rec, ny_nx,
-                        )
+            segments_t = torch.tensor(segments, dtype=torch.int64)
         else:
-            for t in range(nt - 1, -1, -1):
-                if n_src > 0:
-                    ext.record_grad_f(
-                        lam_bg[(t + 1) % 3], lam_sc[(t + 1) % 3],
-                        grad_f_bg, grad_f_sc, src_i, t, n_shots, n_src, ny_nx,
-                    )
-                snap_off = storage.snap_offset(t // grad_stride)
-                ext.adjoint_step(
-                    v_p, scatter_p,
-                    lam_bg[(t + 1) % 3], lam_bg[(t + 2) % 3],
-                    lam_sc[(t + 1) % 3], lam_sc[(t + 2) % 3],
-                    lam_bg[t % 3], lam_sc[t % 3],
-                    psi_y[t % 2], psi_x[t % 2], zeta_y[t % 2], zeta_x[t % 2],
-                    psi_y_sc[t % 2], psi_x_sc[t % 2],
-                    zeta_y_sc[t % 2], zeta_x_sc[t % 2],
-                    psi_y[(t + 1) % 2], psi_x[(t + 1) % 2],
-                    zeta_y[(t + 1) % 2], zeta_x[(t + 1) % 2],
-                    psi_y_sc[(t + 1) % 2], psi_x_sc[(t + 1) % 2],
-                    zeta_y_sc[(t + 1) % 2], zeta_x_sc[(t + 1) % 2],
-                    ay, by, dbydy, ax, bx, dbxdx, w_store, wsc_store,
-                    grad_v, grad_scatter,
-                    c1, c2,
-                    ctx.rdy, ctx.rdx, ctx.rdy2, ctx.rdx2,
-                    t, grad_stride, scale, ctx.dt2,
-                    n_shots, ny, nx,
-                    ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
-                    ctx.pml_y0_b, ctx.pml_y1_b, ctx.pml_x0_b, ctx.pml_x1_b,
-                    ctx.v_batched, ctx.scatter_batched, snap_off, ctx.fd_pad,
-                )
-                if n_rec > 0 or n_bg_rec > 0:
-                    ext.record_grad_r(
-                        lam_bg[t % 3], lam_sc[t % 3],
-                        grad_r_bg, grad_r, bg_rec_i, rec_i,
-                        t, n_shots, n_bg_rec, n_rec, ny_nx,
-                    )
+            u, u_sc = [], []
+            psi_y_f, psi_x_f, zeta_y_f, zeta_x_f = [], [], [], []
+            psi_y_sc_f, psi_x_sc_f, zeta_y_sc_f, zeta_x_sc_f = [], [], [], []
+            segments_t = torch.empty(0, 2, dtype=torch.int64)
+        ext.adjoint_loop(
+            v_p, scatter_p,
+            lam_bg, lam_sc,
+            psi_y, psi_x, zeta_y, zeta_x,
+            psi_y_sc, psi_x_sc, zeta_y_sc, zeta_x_sc,
+            ay, by, dbydy, ax, bx, dbxdx,
+            w_store, wsc_store,
+            grad_v, grad_scatter,
+            grad_r, rec_i, grad_r_bg, bg_rec_i,
+            grad_f_bg, grad_f_sc, src_i,
+            f_bg, f_sc,
+            u, u_sc,
+            psi_y_f, psi_x_f, zeta_y_f, zeta_x_f,
+            psi_y_sc_f, psi_x_sc_f, zeta_y_sc_f, zeta_x_sc_f,
+            c1, c2,
+            ctx.rdy, ctx.rdx, ctx.rdy2, ctx.rdx2, scale, ctx.dt2,
+            nt, grad_stride,
+            ctx.pml_y0, ctx.pml_y1, ctx.pml_x0, ctx.pml_x1,
+            ctx.pml_y0_b, ctx.pml_y1_b, ctx.pml_x0_b, ctx.pml_x1_b,
+            ctx.v_batched, ctx.scatter_batched, ctx.fd_pad,
+            segments_t, ctx.ckpt_state,
+        )
 
         if not ctx.v_batched:
             grad_v = grad_v.sum(0, keepdim=True)
         if not ctx.scatter_batched:
             grad_scatter = grad_scatter.sum(0, keepdim=True)
-        # 33 forward() inputs: 4 grads + 29 x None
+        # 37 forward() inputs: 4 grads + 33 x None
         return (
             grad_v,
             grad_scatter,
@@ -413,7 +281,8 @@ class Scalar2DBornFunc(torch.autograd.Function):
             grad_f_sc,      # in scalar2d_born()
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
-            None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None,
+            None, None, None,
         )
 
 
@@ -429,11 +298,14 @@ def scalar2d_born(
     accuracy=2,
     pml_width=20,
     pml_freq=25.0,
-    max_vel=None,
     nt=None,
     storage="auto",
     sample_steps=1,
     ckpt_steps=None,
+    forward_callback=None,
+    callback_frequency=1,
+    return_state=False,
+    initial_state=None,
 ):
     """2D acoustic Born forward + adjoint (torch in/out).
 
@@ -454,10 +326,32 @@ def scalar2d_born(
             ~sqrt(nt), 0 = full storage (every sampled step), N = save wavefield
             state every N steps and replay on backward.  Same gradients as full
             storage at the same sample_steps.
+        forward_callback: called every ``callback_frequency`` steps with a
+            ``CallbackState`` (deepwave-style) exposing the current padded
+            wavefields via ``state.get_wavefield(name, view)`` — useful for
+            RTM imaging conditions, illumination accumulation, monitoring.
+        callback_frequency: call ``forward_callback`` every N time steps.
+        return_state: if True, append a dict of the FINAL padded wavefield
+            state (keys ``u``, ``u_prev``, ``u_sc``, ``u_sc_prev``,
+            ``psi_y``, ``psi_x``, ``zeta_y``, ``zeta_x``, ``psi_y_sc``,
+            ``psi_x_sc``, ``zeta_y_sc``, ``zeta_x_sc``) to the return,
+            suitable for continuation via ``initial_state``.
+        initial_state: a dict of initial wavefield state (padded grid, keys
+            as in the ``return_state=True`` output) to continue a previous
+            run.  Missing keys are zero-filled; a complete state dict (every
+            key, including the PML memory variables) makes a split run
+            bitwise match a one-shot run, while a partial dict restores only
+            the given fields with the remaining state starting from zero.
+            State I/O is for forward continuation; autograd does not propagate
+            across the boundary between runs.  State dicts are ephemeral
+            runtime snapshots: they may be passed back only to the same
+            propagator with the same model layout and nami version, and are
+            not a stable long-term checkpoint format.
 
     Returns ``(receiver_amplitudes, bg_receiver_amplitudes)``
     ``[nt, n_shots, n_rec]`` when ``bg_receiver_locations`` is given, else
-    just ``receiver_amplitudes``.
+    just ``receiver_amplitudes``; with ``return_state=True`` the state
+    dict is appended as the last element.
     """
     if not isinstance(grid_spacing, (list, tuple)):
         grid_spacing = [float(grid_spacing)] * 2
@@ -495,8 +389,7 @@ def scalar2d_born(
     # Shared models stay [1, ny, nx]; kernels use *_batched=0 and backward
     # sums per-shot grads (elastic/EM style).
     ny, nx = v_p.shape[-2:]
-    if max_vel is None:
-        max_vel = float(v.detach().abs().max())
+    max_vel = float(v.detach().abs().max())
     check_cfl(grid_spacing, dt, max_vel, "scalar2d_born")
     profs = set_acoustic_pml_profiles(
         pml_w, fd_pad, dt, grid_spacing, max_vel, pml_freq, (ny, nx), dtype,
@@ -518,8 +411,11 @@ def scalar2d_born(
     else:
         bg_rec_i = torch.empty(n_shots, 0, dtype=torch.int64, device=device)
 
-    if source_amplitudes is not None and source_amplitudes.numel() > 0:
-        amp = source_amplitudes.to(device=device, dtype=dtype)[:, :, :nt_inner]
+    amp = prepare_source_amplitudes(
+        source_amplitudes, n_shots, src_i.shape[1], nt_inner,
+        device=device, dtype=dtype,
+    )
+    if amp.numel() > 0:
         src_mask = src_i != -1
         src_i_masked = src_i.masked_fill(~src_mask, 0)
         # expand flat rows for gather only (not the full model into Func).
@@ -535,7 +431,6 @@ def scalar2d_born(
             * (2 * v_at_src.unsqueeze(0) * sc_at_src.unsqueeze(0) * dt * dt)
         ).contiguous()
     else:
-        amp = torch.zeros(n_shots, 0, nt_inner, device=device, dtype=dtype)
         f_bg = torch.empty(0, device=device, dtype=dtype)
         f_sc = torch.empty(0, device=device, dtype=dtype)
 
@@ -586,6 +481,26 @@ def scalar2d_born(
                 n_ckpt, N_STATE, n_shots, ny, nx, device=device, dtype=dtype,
             )
 
+    # Wavefield I/O (deepwave-style): continuation initial state, optional
+    # final-state output, and the per-step forward callback.
+    state_shape = (n_shots, ny, nx)
+    init_state = prepare_initial_state(
+        initial_state, _WAVEFIELD_NAMES, state_shape, device=device, dtype=dtype,
+    )
+    final_state = allocate_final_state(
+        return_state, _WAVEFIELD_NAMES, state_shape, device=device, dtype=dtype,
+    )
+    callback_frequency = validate_callback_frequency(callback_frequency)
+    cb = (
+        wrap_forward_callback(
+            forward_callback,
+            _CALLBACK_FIELDS,
+            float(dt), fd_pad, list(pml_w),
+        )
+        if forward_callback is not None
+        else None
+    )
+
     r, r_bg = Scalar2DBornFunc.apply(
         v_p, scatter_p, f_bg, f_sc, src_i, rec_i, bg_rec_i,
         profs, c1, c2,
@@ -595,8 +510,14 @@ def scalar2d_born(
         pml_y0_b, pml_y1_b, pml_x0_b, pml_x1_b,
         v_batched, scatter_batched, grad_stride, fd_pad[0],
         store_obj, store_sc_obj, ckpt_state, checkpoint_every, segments,
+        init_state, final_state, cb, callback_frequency,
     )
 
+    if return_state:
+        state = unpack_state(final_state, _WAVEFIELD_NAMES)
+        if bg_receiver_locations is not None:
+            return r, r_bg, state
+        return r, state
     if bg_receiver_locations is not None:
         return r, r_bg
     return r

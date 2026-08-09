@@ -497,29 +497,72 @@ def test_multi_shot_batched_model():
         )
 
 
-def test_mixed_batch_models_raise():
-    """A batched lamb with shared mu/buoyancy raises ValueError: the kernel
-    selects the model slab with one flag for all three models, so mixed
-    batch forms would read a shared model out of bounds."""
+@pytest.mark.parametrize(
+    "batched_index", range(3), ids=("lamb", "mu", "buoyancy")
+)
+def test_multi_shot_mixed_model_batching(batched_index):
+    """Each elastic model may be per-shot while its siblings stay shared."""
     from nami.elastic.elastic2d import elastic2d
 
     dtype = torch.float64
-    c = build_case(
+    c0 = build_case(
         dtype=dtype, ny=24, nx=28, nt=12, pml=4, device="cuda:0", seed=1,
         rec_offsets=(1, 1, 1),
     )
-    dev = c["device"]
-    ny, nx = c["lamb"].shape
-    nt = c["nt"]
+    c1 = build_case(
+        dtype=dtype, ny=24, nx=28, nt=12, pml=4, device="cuda:0", seed=2,
+        rec_offsets=(1, 1, 1),
+    )
+    dev = c0["device"]
+    ny, nx = c0["lamb"].shape
+    nt = c0["nt"]
     srcs, recs, amp = _multi_shot_survey(ny, nx, nt, dtype)
-    lamb_b = torch.stack([c["lamb"], c["lamb"]]).to(dev, dtype)
-    mu = c["mu"].to(dev, dtype)
-    buoy = c["buoy"].to(dev, dtype)
-    with pytest.raises(ValueError, match="all shared|all batched"):
-        elastic2d(
-            lamb_b, mu, buoy, c["dx"], c["dt"],
-            source_amplitudes=amp.to(dev),
-            source_locations=srcs.to(dev),
-            receiver_locations=recs.to(dev),
-            accuracy=2, pml_width=c["pml"], pml_freq=25.0, nt=nt,
+
+    def run(models, shot=None):
+        sl = slice(None) if shot is None else slice(shot, shot + 1)
+        return elastic2d(
+            *models, c0["dx"], c0["dt"],
+            source_amplitudes=amp[sl].to(dev),
+            source_locations=srcs[sl].to(dev),
+            receiver_locations=recs[sl].to(dev),
+            accuracy=2, pml_width=c0["pml"], pml_freq=25.0, nt=nt,
         )
+
+    keys = ("lamb", "mu", "buoy")
+    models = [
+        (
+            torch.stack([c0[key], c1[key]])
+            if index == batched_index
+            else c0[key]
+        ).to(dev, dtype).requires_grad_(True)
+        for index, key in enumerate(keys)
+    ]
+    singles = [
+        [
+            (model[shot] if index == batched_index else model)
+            .detach().clone().requires_grad_(True)
+            for index, model in enumerate(models)
+        ]
+        for shot in range(2)
+    ]
+    result = run(models)
+    references = [run(singles[shot], shot) for shot in range(2)]
+    for shot, reference in enumerate(references):
+        torch.testing.assert_close(
+            result[:, shot], reference[:, 0], rtol=0, atol=0
+        )
+
+    gradients = torch.autograd.grad(result.square().sum(), models)
+    reference_gradients = [
+        torch.autograd.grad(reference.square().sum(), single)
+        for reference, single in zip(references, singles, strict=True)
+    ]
+    for index, (gradient, grad0, grad1) in enumerate(
+        zip(gradients, *reference_gradients, strict=True)
+    ):
+        expected = (
+            torch.stack([grad0, grad1])
+            if index == batched_index
+            else grad0 + grad1
+        )
+        torch.testing.assert_close(gradient, expected, rtol=1e-12, atol=1e-20)

@@ -84,7 +84,7 @@ def build_case(
     }
 
 
-def _run_full(c, eps, sigma, mu, amp, accuracy=2):
+def _run_full(c, eps, sigma, mu, amp, accuracy=2, recs=None):
     dev = c["device"]
     return em2d_tm(
         eps,
@@ -94,14 +94,15 @@ def _run_full(c, eps, sigma, mu, amp, accuracy=2):
         c["dt"],
         source_amplitudes=amp,
         source_locations=c["srcs"].to(dev),
-        receiver_locations=c["recs"].to(dev),
+        receiver_locations=(c["recs"] if recs is None else recs).to(dev),
         accuracy=accuracy,
         pml_width=c["pml"],
         nt=c["nt"],
     )
 
 
-def _run_born(c, eps, sigma, mu, deps, dsig, dmu, amp, accuracy=2):
+def _run_born(c, eps, sigma, mu, deps, dsig, dmu, amp, accuracy=2,
+              bg_recs=None):
     dev = c["device"]
     return em2d_tm_born(
         eps,
@@ -115,6 +116,7 @@ def _run_born(c, eps, sigma, mu, deps, dsig, dmu, amp, accuracy=2):
         source_amplitudes=amp,
         source_locations=c["srcs"].to(dev),
         receiver_locations=c["recs"].to(dev),
+        bg_receiver_locations=None if bg_recs is None else bg_recs.to(dev),
         accuracy=accuracy,
         pml_width=c["pml"],
         nt=c["nt"],
@@ -163,6 +165,28 @@ def test_born_linearity():
     assert 3.0 < ratio < 5.0, f"residual did not scale quadratically: {ratio}"
 
 
+def test_background_receiver_matches_full_solve_and_gradient():
+    c = build_case(dtype=torch.float64, ny=20, nx=20, nt=8, pml=3,
+                   device="cuda:0", seed=7)
+    dev = c["device"]
+    eps = c["eps"].to(dev).requires_grad_(True)
+    sigma = c["sigma"].to(dev).requires_grad_(True)
+    mu = c["mu"].to(dev).requires_grad_(True)
+    amp = c["amp"].to(dev).requires_grad_(True)
+    scatter = [c[k].to(dev) for k in ("deps", "dsig", "dmu")]
+    _, r_bg = _run_born(
+        c, eps, sigma, mu, *scatter, amp, bg_recs=c["recs"]
+    )
+    full_models = [x.detach().clone().requires_grad_(True) for x in (eps, sigma, mu)]
+    full_amp = amp.detach().clone().requires_grad_(True)
+    r_full = _run_full(c, *full_models, full_amp)
+    torch.testing.assert_close(r_bg, r_full, rtol=0, atol=0)
+    grads = torch.autograd.grad(r_bg.square().sum(), (eps, sigma, mu, amp))
+    refs = torch.autograd.grad(r_full.square().sum(), (*full_models, full_amp))
+    for grad, ref in zip(grads, refs, strict=True):
+        torch.testing.assert_close(grad, ref, rtol=1e-6, atol=1e-12)
+
+
 def test_gradcheck():
     """Numerical gradient check for bg + scatter models and amplitudes."""
     dtype = torch.float64
@@ -195,36 +219,28 @@ def test_gradcheck():
     assert ok
 
 
-def test_gradcheck_accuracy4():
-    """Same gradcheck at accuracy 4 (coefficient-driven stencils)."""
+def test_gradcheck_higher_order():
+    """Same gradcheck at accuracy 4, 6, and 8."""
     dtype = torch.float64
     c = build_case(dtype=dtype, ny=20, nx=20, nt=8, pml=4,
                    device="cuda:0", seed=2)
     dev = c["device"]
 
-    def fn(eps, sigma, mu, deps, dsig, dmu, amp):
-        return _run_born(c, eps, sigma, mu, deps, dsig, dmu, amp, accuracy=4)
+    for accuracy in (4, 6, 8):
+        def fn(eps, sigma, mu, deps, dsig, dmu, amp, accuracy=accuracy):
+            return _run_born(
+                c, eps, sigma, mu, deps, dsig, dmu, amp, accuracy=accuracy,
+            )
 
-    ok = torch.autograd.gradcheck(
-        fn,
-        (
-            c["eps"].to(dev, dtype).requires_grad_(True),
-            c["sigma"].to(dev, dtype).requires_grad_(True),
-            c["mu"].to(dev, dtype).requires_grad_(True),
-            c["deps"].to(dev, dtype).requires_grad_(True),
-            c["dsig"].to(dev, dtype).requires_grad_(True),
-            c["dmu"].to(dev, dtype).requires_grad_(True),
-            c["amp"].to(dev, dtype).requires_grad_(True),
-        ),
-        eps=1e-6,
-        atol=1e-5,
-        rtol=1e-3,
-        fast_mode=True,
-        nondet_tol=1e-8,
-        raise_exception=False,
-    )
-    print("gradcheck nami em2d_tm_born accuracy 4:", ok)
-    assert ok
+        args = tuple(
+            c[name].to(dev, dtype).requires_grad_(True)
+            for name in ("eps", "sigma", "mu", "deps", "dsig", "dmu", "amp")
+        )
+        ok = torch.autograd.gradcheck(
+            fn, args, eps=1e-6, atol=1e-5, rtol=1e-3, fast_mode=True,
+            nondet_tol=1e-8, raise_exception=False,
+        )
+        assert ok, f"em2d_tm_born gradcheck failed at accuracy={accuracy}"
 
 
 def test_forward_sanity():
@@ -466,3 +482,50 @@ def test_multi_shot_batched_model():
         assert rel0 < 1e-12 and rel1 < 1e-12, (
             f"batched-model grad_{name} rel err ({rel0}, {rel1})"
         )
+
+
+def test_multi_shot_mixed_derived_coefficients():
+    dtype = torch.float64
+    c0 = build_case(dtype=dtype, ny=20, nx=20, nt=10, pml=3,
+                    device="cuda:0", seed=1)
+    c1 = build_case(dtype=dtype, ny=20, nx=20, nt=10, pml=3,
+                    device="cuda:0", seed=2)
+    dev = c0["device"]
+    ny, nx = c0["eps"].shape
+    nt = c0["nt"]
+    srcs, recs, amp = _multi_shot_survey(ny, nx, nt, dtype)
+    keys = ("eps", "sigma", "mu", "deps", "dsig", "dmu")
+    batched = {"sigma", "dsig"}
+
+    def run(models, shot=None):
+        sl = slice(None) if shot is None else slice(shot, shot + 1)
+        return em2d_tm_born(
+            *models, c0["dx"], c0["dt"],
+            source_amplitudes=amp[sl].to(dev),
+            source_locations=srcs[sl].to(dev),
+            receiver_locations=recs[sl].to(dev),
+            accuracy=2, pml_width=c0["pml"], nt=nt,
+        )
+
+    models = [
+        (torch.stack([c0[k], c1[k]]) if k in batched else c0[k])
+        .to(dev, dtype).requires_grad_(True)
+        for k in keys
+    ]
+    singles = [
+        [
+            (m[i] if k in batched else m).detach().clone().requires_grad_(True)
+            for k, m in zip(keys, models, strict=True)
+        ]
+        for i in range(2)
+    ]
+    r = run(models)
+    refs = [run(singles[i], i) for i in range(2)]
+    for i in range(2):
+        torch.testing.assert_close(r[:, i], refs[i][:, 0], rtol=0, atol=0)
+    grads = torch.autograd.grad(r.square().sum(), models)
+    ref_grads = [torch.autograd.grad(ref.square().sum(), single)
+                 for ref, single in zip(refs, singles, strict=True)]
+    for k, grad, g0, g1 in zip(keys, grads, *ref_grads, strict=True):
+        expected = torch.stack([g0, g1]) if k in batched else g0 + g1
+        torch.testing.assert_close(grad, expected, rtol=1e-12, atol=1e-20)

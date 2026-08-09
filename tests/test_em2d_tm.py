@@ -602,3 +602,50 @@ def test_multi_shot_batched_model():
         assert rel0 < 1e-12 and rel1 < 1e-12, (
             f"batched-model grad_{name} rel err ({rel0}, {rel1})"
         )
+
+
+def test_multi_shot_mixed_model_batching():
+    """Derived coefficients must follow their actual broadcasted batch shape."""
+    from nami.em.em2d_tm import em2d_tm
+
+    dtype = torch.float64
+    c0 = build_case(dtype=dtype, ny=24, nx=28, nt=12, pml=4,
+                    device="cuda:0", seed=1)
+    c1 = build_case(dtype=dtype, ny=24, nx=28, nt=12, pml=4,
+                    device="cuda:0", seed=2)
+    dev = c0["device"]
+    ny, nx = c0["eps"].shape
+    nt = c0["nt"]
+    srcs, recs, amp = _multi_shot_survey(ny, nx, nt, dtype)
+
+    def run(eps, sig, mu, shot=None):
+        sl = slice(None) if shot is None else slice(shot, shot + 1)
+        return em2d_tm(
+            eps, sig, mu, c0["dx"], c0["dt"],
+            source_amplitudes=amp[sl].to(dev),
+            source_locations=srcs[sl].to(dev),
+            receiver_locations=recs[sl].to(dev),
+            accuracy=2, pml_width=c0["pml"], nt=nt,
+        )
+
+    eps = c0["eps"].to(dev, dtype).requires_grad_(True)
+    sig = torch.stack([c0["sig"], c1["sig"]]).to(dev, dtype).requires_grad_(True)
+    mu = c0["mu"].to(dev, dtype).requires_grad_(True)
+    eps0 = eps.detach().clone().requires_grad_(True)
+    eps1 = eps.detach().clone().requires_grad_(True)
+    sig0 = sig[0].detach().clone().requires_grad_(True)
+    sig1 = sig[1].detach().clone().requires_grad_(True)
+    mu0 = mu.detach().clone().requires_grad_(True)
+    mu1 = mu.detach().clone().requires_grad_(True)
+    r = run(eps, sig, mu)
+    r0 = run(eps0, sig0, mu0, 0)
+    r1 = run(eps1, sig1, mu1, 1)
+    torch.testing.assert_close(r[:, 0], r0[:, 0], rtol=0, atol=0)
+    torch.testing.assert_close(r[:, 1], r1[:, 0], rtol=0, atol=0)
+    geps, gsig, gmu = torch.autograd.grad(r.square().sum(), (eps, sig, mu))
+    g0 = torch.autograd.grad(r0.square().sum(), (eps0, sig0, mu0))
+    g1 = torch.autograd.grad(r1.square().sum(), (eps1, sig1, mu1))
+    torch.testing.assert_close(geps, g0[0] + g1[0], rtol=1e-12, atol=1e-20)
+    torch.testing.assert_close(gsig[0], g0[1], rtol=1e-12, atol=1e-20)
+    torch.testing.assert_close(gsig[1], g1[1], rtol=1e-12, atol=1e-20)
+    torch.testing.assert_close(gmu, g0[2] + g1[2], rtol=1e-12, atol=1e-20)

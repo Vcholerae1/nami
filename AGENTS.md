@@ -14,12 +14,19 @@ contracts for this repository live here.
 ```bash
 export CUDA_HOME=/usr/local/cuda   # machine-specific
 pip install "git+https://github.com/barkure/nami.git"
-# local editable: pip install -e . && python setup.py build_ext --inplace
+```
+
+For local development, install the package and development tools into the
+active Python environment:
+
+```bash
+pip install -e .[dev]
 ```
 
 After changing `src/nami/csrc/*.cu`, rebuild and sanity-check:
 
 ```bash
+python setup.py build_ext --inplace
 python -c "import torch; assert torch.cuda.is_available(); import nami; print(nami.__version__)"
 ```
 
@@ -29,18 +36,18 @@ Dev tooling and the full test command are under [Tests](#tests).
 
 ```text
 src/nami/
-  common/      # survey, PML, CFL, storage, FD coefficients
+  common/      # survey, PML, CFL, storage, callbacks/state, FD coefficients
   csrc/        # CUDA sources; listed in setup.py
   scalar/      # acoustic 2D/3D + Born
   elastic/     # elastic 2D + Born
   em/          # EM 2D TM, EM 3D + Born; _common.py shared helpers
   models.py    # nn.Module FWI wrappers
-  wavelets.py  # ricker
+  wavelets.py  # Gaussian/Ricker/Ormsby/Klauder, sine burst, chirp
 setup.py       # CUDAExtension list only (metadata in pyproject.toml)
 tests/
 ```
 
-Native extensions use top-level names (`nami_scalar2d`, `nami_born_em_el`, …)
+Native extensions use top-level names (`nami_scalar2d`, `nami_em2d_tm_born`, …)
 because `TORCH_EXTENSION_NAME` cannot contain dots. The `nami_` prefix avoids
 collisions in the process-wide module table. Public imports go through the
 Python package, not the extension names. Renames require coordinated updates
@@ -50,10 +57,22 @@ Extension map (Born):
 
 | Kernel package | Source | Python callers |
 |---|---|---|
-| `nami_born` | `born.cu` | `scalar2d_born` |
+| `nami_scalar2d_born` | `scalar2d_born.cu` | `scalar2d_born` |
 | `nami_scalar3d_born` | `scalar3d_born.cu` | `scalar3d_born` |
-| `nami_born_em_el` | `born_em_el.cu` | `em2d_tm_born`, `elastic2d_born` |
+| `nami_elastic2d_born` | `elastic2d_born.cu` | `elastic2d_born` |
+| `nami_em2d_tm_born` | `em2d_tm_born.cu` | `em2d_tm_born` |
 | `nami_em3d_born` | `em3d_born.cu` | `em3d_born` |
+
+## Time-stepping contract
+
+Each forward or adjoint pass runs in one native-extension call. Keep the
+per-step extension exports available when extending the propagators.
+
+When changing time loops or storage, preserve ring-buffer ordering,
+global-time indexing, exact-adjoint behaviour, checkpoint/full-storage
+parity, and existing numerical results. C++ ring-buffer indices must never
+use a modulo expression that can produce a negative value. CUDA-specific
+implementation contracts live in `src/nami/csrc/AGENTS.md`.
 
 ## Public imports
 
@@ -64,7 +83,18 @@ Extension map (Born):
 | EM 2D TM / 3D | `from nami.em.em2d_tm import em2d_tm` / `from nami.em.em3d import em3d` |
 | Born | e.g. `from nami.em import em3d_born` (each physics subpackage re-exports its `*_born`) |
 | Class API | `from nami import Scalar, Scalar3D, Elastic, TM2D, EM3D` |
-| Ricker | `from nami.wavelets import ricker` |
+| Source waveforms | `from nami.wavelets import chirp, gaussian, gaussian_derivative, klauder, ormsby, ricker, sine_burst` |
+
+## Source waveforms
+
+Waveform helpers return one-dimensional tensors on PyTorch's default device;
+move or reshape them for the target survey. `gaussian_derivative` supports
+normalized orders 1 and 2,
+with order 2 opposite in sign to `ricker`. `ormsby` takes four increasing
+corner frequencies, and `sine_burst` produces a finite Hann-tapered burst by
+default. `chirp` generates a finite linear sweep; `klauder` generates its
+normalized zero-phase autocorrelation. Propagators also accept arbitrary
+sampled source amplitudes directly.
 
 ## Minimal example (acoustic 2D forward)
 
@@ -73,14 +103,14 @@ import torch
 from nami.scalar.scalar2d import scalar2d
 from nami.wavelets import ricker
 
-device, ny, nx, nt, dx, dt = "cuda", 100, 100, 300, 5.0, 1e-3
+device, ny, nx, nt, grid_spacing, dt = "cuda", 100, 100, 300, 5.0, 1e-3
 v = 1500 * torch.ones(ny, nx, device=device)
 v[ny // 2 :] = 2000
 amp = ricker(25.0, nt, dt, 0.06).reshape(1, 1, -1).to(device)
 srcs = torch.tensor([[[10, 10]]], device=device)
 recs = torch.tensor([[[10, 90]]], device=device)
 out = scalar2d(
-    v, dx, dt,
+    v, grid_spacing, dt,
     source_amplitudes=amp,
     source_locations=srcs,
     receiver_locations=recs,
@@ -91,9 +121,14 @@ out = scalar2d(
 )  # out: [nt, n_shots, n_rec]
 ```
 
-Class API: `Scalar(v, dx, dt, ...)`, then `.forward(...)`. Wrappers also
-accept `storage` / `sample_steps` / `ckpt_steps` (`EM3D` additionally takes
-`source_component` / `receiver_component`). For FWI, enable grad on the
+Class API: construct `Scalar(v, grid_spacing, dt, ...)`, then call
+`.forward(...)`.
+Wrapper constructors accept `storage` / `sample_steps` / `ckpt_steps`;
+`EM3D` additionally takes `source_component` / `receiver_component`.
+`.forward(...)` accepts `forward_callback` / `callback_frequency` /
+`return_state` / `initial_state` and passes them to the underlying
+propagator. With `return_state=True`, it returns `(receiver_amplitudes,
+state)` and caches the state on `.last_state`. For FWI, enable grad on the
 model, use `storage="auto"`, and call `.backward(loss)` (writes `param.grad`).
 
 ## Propagator parameters
@@ -102,36 +137,30 @@ model, use `storage="auto"`, and call `.backward(loss)` (writes `param.grad`).
 |---|---|---|
 | `storage` | `"auto"` | `"auto"`: retain GPU snapshots when inputs need grad; `"none"`: forward-only (backward raises) |
 | `sample_steps` | `1` | Sample snapshots / model grads every N steps (receivers stay exact). For `N > 1`, model grads use the rectangle rule: each sampled imaging term is scaled by `N` (`scale = float(sample_steps)` into every kernel). `N = 1` is bitwise identical on every path |
-| `ckpt_steps` | `None` | `None` selects $\sim\sqrt{n_t}$; `0` full snapshot storage; `N > 0` checkpoint every N steps (same grads as full storage at the same `sample_steps`) |
+| `ckpt_steps` | `None` | `None` automatically selects a square-root-scale interval based on `nt`, state size, and `sample_steps`; `0` full snapshot storage; `N > 0` checkpoint every N steps (same grads as full storage at the same `sample_steps`) |
 | `accuracy` | `2` | Spatial FD order: 2, 4, 6, or 8 |
 | `pml_width` | `20` | Scalar width or per-side list; `0` disables that side |
 | `pml_freq` | `25.0` | Acoustic/elastic C-PML design frequency (Hz); unused for EM |
 | `nt` | from sources | Time steps when not implied by `source_amplitudes` |
+| `forward_callback` | `None` | Called during forward propagation with a `CallbackState`; use `get_wavefield(name, view)` to inspect `"inner"`, `"pml"`, or `"full"` wavefields. Returned wavefields are live views of reused CUDA buffers — `.clone()` to keep a snapshot |
+| `callback_frequency` | `1` | Invoke `forward_callback` every N time steps |
+| `return_state` | `False` | Include a dict of the final padded wavefield state in the return value; keys are documented by each propagator. State dicts are ephemeral runtime snapshots (same propagator / model layout / nami version only), not a stable checkpoint format |
+| `initial_state` | `None` | Restore state for forward continuation: missing keys are zero-filled, while the complete `return_state=True` result makes a split run bitwise match a one-shot run; gradients do not propagate across this boundary |
+| `bg_receiver_locations` | `None` | Born-only optional background-field receivers; adds `r_bg` after the scattered gather in the return tuple |
 
 dtype and device follow the input models (CUDA `float32` / `float64`).
 
-## Multi-shot and indexing
+## Multi-shot contract
 
 Contract for every full-wave and Born propagator (scalar, elastic, EM).
 
 - **`n_shots`** comes from the survey (`source_amplitudes` /
   `source_locations`). Shared models stay `[spatial]` or `[1, spatial]`;
   wavefields are still `n_shots`-wide.
-- **`*_batched`** is derived in Python from the *user* model before pad
-  (`shape[0] == n_shots > 1`). Kernels use slab `s` when batched, else
-  slab `0`. Unbatched model grads are `sum(0)`-reduced after the adjoint.
-  Scalar/EM: one flag per tensor (mixed forms allowed). Elastic: one flag
-  per group via `check_model_batching` on `lamb`/`mu`/`buoyancy` and on the
-  scatter triple (`None` scatter = shared zeros).
-- **Indexing:** wavefields use `off = s * n_cells + spatial`; models use
-  `slab(s_m) + spatial` with `spatial = y*nx+x` (3D: `z*(ny*nx)+…`).
-  `off - off_s` is the same spatial index (handy after a stencil step).
-- **Snapshots:** `snap_off + spatial`. Full storage:
-  `storage.snap_offset(t // sample_steps)`; checkpoint replay:
-  `((t - s0) // sample_steps) * (n_shots * n_cells)`. Inject/record use
-  global `t`.
-- **Survey replicate pad** is `cat`/`expand` in `common.survey` (values
-  match `F.pad(mode="replicate")`, deterministic backward).
+- Shared/per-shot layout follows each user model independently. Every
+  multi-parameter propagator may mix shared and per-shot model tensors.
+- Gradients for shared models are reduced across shots after the adjoint;
+  gradients for per-shot models retain their shot dimension.
 - **Outputs:** receiver gathers are `[nt, n_shots, n_rec]`.
 
 ## Physics coverage
@@ -146,7 +175,8 @@ raises a CFL error (`nami.common.cfl`).
 
 - Keep changes Linux/CUDA-oriented
 - Rebuild extensions after `.cu` edits and run the matching `tests/test_*.py`
-- Preserve exact-adjoint and checkpoint-parity tests when touching storage or kernels
+- Preserve exact-adjoint, checkpoint-parity, and wavefield-continuation tests
+  when touching time loops, storage, or kernels
 - Prefer `storage="none"` for forward-only work
 
 **Do not**
@@ -159,11 +189,13 @@ raises a CFL error (`nami.common.cfl`).
 ## Tests
 
 ```bash
-# optional: pip install -e .[dev]  |  pixi install -e dev
 pytest                          # full suite (CUDA required)
 pytest tests/test_scalar2d.py   # single module
-pixi run -e dev pytest
+ruff check
 ```
 
-The dev extra also carries `ruff` — lint with `ruff check` (config in
-`pyproject.toml`).
+The optional checked-in pixi environment provides the same development
+commands: run `pixi install -e dev` once, then prefix commands with
+`pixi run -e dev` (for example, `pixi run -e dev pytest`). Its CUDA PyTorch
+pin is machine-specific and may need adjustment. Ruff configuration lives in
+`pyproject.toml`.
