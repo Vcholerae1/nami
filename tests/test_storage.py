@@ -14,6 +14,12 @@ def test_auto_plan_scales_with_snapshot_stream_memory():
     assert first[0] > 0
 
 
+def test_auto_plan_shortens_interval_when_snapshot_streams_increase():
+    few = storage_plan(10000, 18, 1, 1, True)
+    many = storage_plan(10000, 18, 1, 24, True)
+    assert few[0] > many[0] > 0
+
+
 @pytest.mark.parametrize("sample_steps", [7, 20], ids=["larger", "equal"])
 def test_auto_plan_falls_back_when_full_storage_is_no_larger(sample_steps):
     # Cover both a strictly larger checkpoint plan and an equal-cost plan.
@@ -36,3 +42,9 @@ def test_explicit_interval_only_allocates_for_actual_steps():
     assert segments == [(0, 100)]
     assert n_snap == 34
     assert n_ckpt == 0
+
+
+@pytest.mark.parametrize("n_streams", [0, -1], ids=["zero", "negative"])
+def test_n_streams_must_be_positive(n_streams):
+    with pytest.raises(ValueError, match="n_streams"):
+        storage_plan(100, 6, 1, n_streams, True)
