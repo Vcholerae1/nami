@@ -15,12 +15,12 @@ Public knobs on each propagator (defaults in parentheses):
   approximate the model gradient.
 * ``ckpt_steps`` (``None``): checkpoint schedule.  ``None`` auto-selects
   a square-root-scale interval from ``nt``, state size, snapshot-stream
-  count, and ``sample_steps``, falling back to full storage when that
-  would not save memory; ``0`` keeps every sampled snapshot (full
-  storage); ``N > 0`` saves full wavefield state every N steps and
-  replays the segment on backward.  Snapshot capacity is capped by the
-  run length.  Checkpointing does not change gradients relative to full
-  storage at the same ``sample_steps``.
+  count, and ``sample_steps``, falling back to full storage when checkpoint
+  states plus snapshot buffers would not be smaller; ``0`` keeps every
+  sampled snapshot (full storage); ``N > 0`` saves full wavefield state
+  every N steps and replays the segment on backward.  Snapshot capacity is
+  capped by the run length.  Checkpointing does not change gradients
+  relative to full storage at the same ``sample_steps``.
 
 ``compute_checkpoint_plan`` / ``storage_plan`` turn those knobs into
 ``(checkpoint_every, segments, n_snap, n_ckpt)`` for the front ends.
